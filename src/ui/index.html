@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CBWorkBench - 多 Agent 开发工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <!-- Header / Navigation -->
+  <header class="navbar">
+    <div class="nav-container">
+      <div class="nav-brand">
+        <a href="/" class="brand-link">
+          <span class="brand-icon">⚡</span>
+          <span class="brand-title">CBWorkBench</span>
+          <span class="brand-subtitle">多 Agent 开发工作台</span>
+        </a>
+      </div>
+      <div class="nav-status" id="system-status-pills">
+        <span class="status-pill pill-node" id="pill-node">Node 24 SQLite</span>
+        <span class="status-pill pill-wb" id="pill-wb">WorkBuddy: deepseek-v4-flash</span>
+        <span class="status-pill pill-codex" id="pill-codex">Codex: gpt-5.6-sol</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="main-container">
+    <!-- View 1: Task List View -->
+    <section id="view-task-list" class="view-section">
+      <div class="section-header">
+        <div class="title-group">
+          <h2>开发任务看板</h2>
+          <p class="subtitle">单机串行执行 · WorkBuddy 开发修复 · Codex 自动验收 · 用户终审门禁</p>
+        </div>
+        <div class="action-group">
+          <button class="btn btn-secondary" onclick="app.refreshTaskList()">刷新列表</button>
+        </div>
+      </div>
+
+      <!-- Filter Tabs -->
+      <div class="filter-tabs">
+        <button class="tab-btn active" data-filter="all" onclick="app.setFilter('all')">全部 (<span id="count-all">0</span>)</button>
+        <button class="tab-btn" data-filter="pending_confirm" onclick="app.setFilter('pending_confirm')">待启动确认 (<span id="count-pending">0</span>)</button>
+        <button class="tab-btn" data-filter="running" onclick="app.setFilter('running')">执行中 (<span id="count-running">0</span>)</button>
+        <button class="tab-btn" data-filter="human_review" onclick="app.setFilter('human_review')">最终人工审核 (<span id="count-review">0</span>)</button>
+        <button class="tab-btn" data-filter="blocked" onclick="app.setFilter('blocked')">异常待处理 (<span id="count-blocked">0</span>)</button>
+        <button class="tab-btn" data-filter="completed" onclick="app.setFilter('completed')">已完成 (<span id="count-completed">0</span>)</button>
+      </div>
+
+      <!-- Task Card Grid -->
+      <div id="task-grid" class="task-grid">
+        <div class="loading-state">正在加载任务列表...</div>
+      </div>
+    </section>
+
+    <!-- View 2: Task Details View -->
+    <section id="view-task-details" class="view-section" style="display: none;">
+      <div class="details-topbar">
+        <button class="btn btn-back" onclick="app.showTaskList()">← 返回任务列表</button>
+        <div class="auto-refresh-indicator">
+          <span class="pulse-dot"></span>
+          <span id="refresh-status-text">实时同步中</span>
+        </div>
+      </div>
+
+      <!-- Task Header Card -->
+      <div class="card task-summary-card">
+        <div class="summary-main">
+          <div class="task-title-line">
+            <span class="badge" id="detail-status-badge">待启动确认</span>
+            <h1 id="detail-task-title">任务标题</h1>
+          </div>
+          <div class="task-meta-line">
+            <span>任务标识：<code id="detail-task-key">key</code></span>
+            <span>材料版本：<code id="detail-task-rev">r1</code></span>
+            <span>轮次：<b id="detail-current-round">0</b> / <span id="detail-max-rounds">10</span></span>
+            <span>提交时间：<span id="detail-created-at">--</span></span>
+          </div>
+        </div>
+        <div class="summary-actions" id="detail-actions-container">
+          <!-- Dynamic action buttons injected by JS -->
+        </div>
+      </div>
+
+      <!-- Gate 2: Confirmation Card (Visible when pending_confirm) -->
+      <div class="card confirmation-card" id="gate2-card" style="display: none;">
+        <h3>门禁 2：用户确认并开始执行</h3>
+        <p class="desc">聊天中的同意、模型提交任务或 MCP 调用均不能代替此页面操作。请核对工作目录与代码基准后点击确认。</p>
+        <div class="form-row">
+          <label for="input-confirmed-cwd">执行目录 (工作台识别的真实项目路径)：</label>
+          <div class="input-with-button">
+            <input type="text" id="input-confirmed-cwd" class="form-control" placeholder="D:/CODE/..." />
+            <button class="btn btn-primary" onclick="app.handleConfirmStart()">确认并开始</button>
+          </div>
+        </div>
+        <div class="workspace-check-result" id="gate2-git-info">
+          <!-- Git info -->
+        </div>
+      </div>
+
+      <!-- Gate 3: Human Review Banner (Visible when human_review) -->
+      <div class="card review-gate-card" id="gate3-card" style="display: none;">
+        <div class="review-header">
+          <span class="gate-icon">⚖️</span>
+          <div>
+            <h3>门禁 3：最终人工审核</h3>
+            <p>Codex 自动验收已通过！请核对以下代码差异与测试证据，给出最终人工审核结论。</p>
+          </div>
+        </div>
+        <div class="review-actions">
+          <button class="btn btn-success" onclick="app.handleHumanDecision('approve')">审核通过 (完成任务)</button>
+          <button class="btn btn-danger" onclick="app.showRejectModal()">退回修改 (继续循环)</button>
+        </div>
+      </div>
+
+      <!-- Blocked Alert (Visible when blocked) -->
+      <div class="alert alert-blocked" id="blocked-alert" style="display: none;">
+        <strong>⚠️ 异常待处理：</strong>
+        <span id="blocked-reason-text">无</span>
+        <button class="btn btn-sm btn-outline" onclick="app.handleResumeBlocked()">重试并继续</button>
+      </div>
+
+      <!-- Tab Navigation for Detail Content -->
+      <div class="detail-tabs">
+        <button class="dtab-btn active" onclick="app.setDetailTab('overview')">执行现场与进度</button>
+        <button class="dtab-btn" onclick="app.setDetailTab('diff')">代码变更 Diff</button>
+        <button class="dtab-btn" onclick="app.setDetailTab('rounds')">轮次与验证证据</button>
+        <button class="dtab-btn" onclick="app.setDetailTab('materials')">冻结任务材料</button>
+      </div>
+
+      <!-- Tab Content 1: Overview & Stages -->
+      <div id="dtab-overview" class="dtab-content active">
+        <!-- Stage Flow Progress -->
+        <div class="card stage-flow-card">
+          <h4>执行流水线阶段</h4>
+          <div class="stage-stepper">
+            <div class="step-item" id="step-worker">
+              <div class="step-icon">1</div>
+              <div class="step-label">Worker 开发修复</div>
+              <div class="step-sub">deepseek-v4-flash</div>
+            </div>
+            <div class="step-arrow">→</div>
+            <div class="step-item" id="step-tests">
+              <div class="step-icon">2</div>
+              <div class="step-label">独立测试执行</div>
+              <div class="step-sub">工作台自动运行</div>
+            </div>
+            <div class="step-arrow">→</div>
+            <div class="step-item" id="step-codex">
+              <div class="step-icon">3</div>
+              <div class="step-label">Codex 自动验收</div>
+              <div class="step-sub">只读沙箱验证</div>
+            </div>
+            <div class="step-arrow">→</div>
+            <div class="step-item" id="step-review">
+              <div class="step-icon">4</div>
+              <div class="step-label">最终人工审核</div>
+              <div class="step-sub">用户终审门禁</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Git & Workspace Baseline Card -->
+        <div class="card">
+          <h4>工作区基准与代码状态</h4>
+          <div class="git-status-grid">
+            <div class="git-meta-item">
+              <span class="label">项目根目录：</span>
+              <span class="value" id="git-root">--</span>
+            </div>
+            <div class="git-meta-item">
+              <span class="label">当前分支：</span>
+              <span class="value" id="git-branch">--</span>
+            </div>
+            <div class="git-meta-item">
+              <span class="label">基准提交 HEAD：</span>
+              <span class="value" id="git-commit">--</span>
+            </div>
+            <div class="git-meta-item">
+              <span class="label">工作区状态：</span>
+              <span class="value" id="git-status">--</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab Content 2: Git Diff View -->
+      <div id="dtab-diff" class="dtab-content">
+        <div class="card">
+          <div class="diff-header">
+            <h4>工作区代码修改快照</h4>
+            <span class="diff-files-count" id="diff-changed-files">0 个修改文件</span>
+          </div>
+          <pre class="code-block diff-viewer" id="diff-code-content">暂无修改内容</pre>
+        </div>
+      </div>
+
+      <!-- Tab Content 3: Rounds & Evidence -->
+      <div id="dtab-rounds" class="dtab-content">
+        <div id="rounds-timeline" class="rounds-container">
+          <!-- Dynamically filled with round cards -->
+        </div>
+      </div>
+
+      <!-- Tab Content 4: Task Materials -->
+      <div id="dtab-materials" class="dtab-content">
+        <div class="card material-card">
+          <h4>task.md (任务说明)</h4>
+          <div class="markdown-preview" id="mat-task-md">--</div>
+        </div>
+        <div class="card material-card">
+          <h4>development.md (开发清单)</h4>
+          <div class="markdown-preview" id="mat-dev-md">--</div>
+        </div>
+        <div class="card material-card">
+          <h4>tests.md (测试用例与标准)</h4>
+          <div class="markdown-preview" id="mat-tests-md">--</div>
+        </div>
+        <div class="card material-card">
+          <h4>acceptance.md (验收标准)</h4>
+          <div class="markdown-preview" id="mat-acceptance-md">--</div>
+        </div>
+        <div class="card material-card">
+          <h4>Worker 独立提示词</h4>
+          <div id="mat-worker-prompts">--</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Modal for Reject / Rework Feedback -->
+  <div id="modal-reject" class="modal-backdrop" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>退回修改 (填写审核反馈)</h3>
+        <button class="close-btn" onclick="app.closeRejectModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <p>退回后将再次调用 Worker 修复，并重新通过自动化测试与 Codex 验收方可再次审核。</p>
+        <textarea id="reject-reason-input" class="form-control" rows="5" placeholder="请详细说明退回原因、未达标的事项或业务修改意见..."></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="app.closeRejectModal()">取消</button>
+        <button class="btn btn-danger" onclick="app.confirmReject()">确认退回</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

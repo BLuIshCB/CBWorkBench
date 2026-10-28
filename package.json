@@ -1,0 +1,19 @@
+{
+  "name": "cb-workbench",
+  "version": "0.1.0",
+  "description": "Multi-agent development workbench with WorkBuddy worker and Codex automated acceptance",
+  "type": "module",
+  "bin": {
+    "cb-workbench": "./bin/cb-workbench.js",
+    "cb-workbench-mcp": "./bin/cb-workbench-mcp.js"
+  },
+  "scripts": {
+    "start": "node bin/cb-workbench.js",
+    "mcp": "node bin/cb-workbench-mcp.js",
+    "test": "node bin/test-runner.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "zod": "^3.24.2"
+  }
+}

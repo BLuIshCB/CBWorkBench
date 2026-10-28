@@ -1,0 +1,4 @@
+interface:
+  display_name: "cb-flow"
+  short_description: "生成任务、测试与无上下文执行提示词，经用户同意后上传开发工作台"
+  default_prompt: "使用 $cb-flow 为当前项目生成完整任务包，包含 Worker 与验收者的独立提示词；展示材料并经我同意后再通过 MCP 上传，等待我在工作台手动启动。"
