@@ -35,8 +35,7 @@ if (hasSqlite) {
   }
 
   // Forward to target node with native strip-types
-  const entry = path.join(rootDir, 'src', 'server', 'httpServer.ts');
-  const args = ['--experimental-strip-types', entry, ...process.argv.slice(2)];
+  const args = ['--experimental-strip-types', __filename, ...process.argv.slice(2)];
 
   const child = spawn(targetNode, args, {
     stdio: 'inherit',

@@ -1,9 +1,9 @@
-import { db, TaskRecord, TaskRevisionRecord } from '../storage/db.ts';
+import { db, type TaskRecord, type TaskRevisionRecord } from '../storage/db.ts';
 import { taskFileStore } from '../storage/fileStore.ts';
 import { GitService } from './gitService.ts';
-import { TestRunner, TestCaseItem } from './testRunner.ts';
+import { TestRunner, type TestCaseItem } from './testRunner.ts';
 import { WorkBuddyClient } from './workbuddyClient.ts';
-import { CodexVerifier, VerificationOutput } from './codexVerifier.ts';
+import { CodexVerifier, type VerificationOutput } from './codexVerifier.ts';
 import { TaskStatus, RoundStage, DEFAULT_BUDGET_MAX_ROUNDS, DEFAULT_BUDGET_TIMEOUT_SECONDS } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
 
@@ -106,7 +106,7 @@ export class WorkflowEngine {
       return { success: false, message: `Task is not in human review state (current: ${task.status})` };
     }
 
-    db.saveHumanDecision({ taskId, action, reason });
+    db.saveHumanDecision({ task_id: taskId, action, reason });
 
     if (action === 'approve') {
       db.updateTaskStatus(taskId, TaskStatus.COMPLETED, {

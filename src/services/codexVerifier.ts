@@ -218,7 +218,7 @@ export class CodexVerifier {
           outputFilePath,
           '-C',
           params.confirmedCwd,
-          fullPrompt,
+          '-',
         ],
         {
           shell: true,
@@ -245,7 +245,8 @@ export class CodexVerifier {
       child.stdout.on('data', (d) => stdoutChunks.push(Buffer.from(d)));
       child.stderr.on('data', (d) => stderrChunks.push(Buffer.from(d)));
 
-      // Close child stdin immediately so Codex doesn't wait for terminal stdin
+      // Feed prompt via stdin to avoid Windows 8191-character command line limit
+      child.stdin.write(fullPrompt, 'utf8');
       child.stdin.end();
 
       child.on('close', (code) => {

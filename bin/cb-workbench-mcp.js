@@ -31,8 +31,7 @@ if (hasSqlite) {
     process.exit(1);
   }
 
-  const entry = path.join(rootDir, 'src', 'server', 'mcpServer.ts');
-  const args = ['--experimental-strip-types', entry, ...process.argv.slice(2)];
+  const args = ['--experimental-strip-types', __filename, ...process.argv.slice(2)];
 
   const child = spawn(targetNode, args, {
     stdio: 'inherit',
