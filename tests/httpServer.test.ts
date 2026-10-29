@@ -30,6 +30,14 @@ try {
   const jsRes = await fetch(`${baseUrl}/app.js`);
   assert.strictEqual(jsRes.status, 200);
 
+  const mainModuleRes = await fetch(`${baseUrl}/js/main.js`);
+  assert.strictEqual(mainModuleRes.status, 200);
+  assert.ok((await mainModuleRes.text()).includes('export class App'));
+
+  const utilsModuleRes = await fetch(`${baseUrl}/js/utils.js`);
+  assert.strictEqual(utilsModuleRes.status, 200);
+  assert.ok((await utilsModuleRes.text()).includes('export function escapeHtml'));
+
   // 2. System Status API
   const sysRes = await fetch(`${baseUrl}/api/system/status`);
   assert.strictEqual(sysRes.status, 200);

@@ -288,6 +288,16 @@ export function createHttpServer(): http.Server {
         return;
       }
 
+      // Modular JS Files under /js/
+      if (pathname.startsWith('/js/') && pathname.endsWith('.js')) {
+        const safePath = path.normalize(pathname).replace(/^(\.\.[\/\\])+/, '');
+        const fullPath = path.join(UI_DIR, safePath);
+        if (fullPath.startsWith(UI_DIR) && fs.existsSync(fullPath)) {
+          sendFile(res, fullPath, 'application/javascript');
+          return;
+        }
+      }
+
       // 404
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('Not Found');
@@ -308,6 +318,16 @@ export async function startServer(
   process.on('unhandledRejection', (reason) => {
     logger.error('[App] Unhandled promise rejection:', reason);
   });
+
+  // Crash recovery check for unfinalized tasks from previous process
+  try {
+    const recovery = db.recoverPendingTasks();
+    if (recovery.recoveredCount > 0) {
+      logger.info(`[HttpServer] Startup crash recovery: recovered ${recovery.recoveredCount} tasks stuck in running/queued state.`);
+    }
+  } catch (e: any) {
+    logger.error(`[HttpServer] Error during recovery check:`, e);
+  }
 
   const server = createHttpServer();
 

@@ -56,45 +56,47 @@ export function createWorkbenchMcpServer(): McpServer {
           };
         }
 
-        // Save into DB
-        const task = db.createTask({
-          id: taskId,
-          task_key: args.task_key,
-          revision,
-          title: args.title,
-          status: TaskStatus.PENDING_CONFIRM,
-          target_cwd: args.target_cwd,
-          git_root: gitInfo.gitRoot,
-          git_commit: gitInfo.headCommit,
-          git_status: gitInfo.statusText,
-          budget_max_rounds: args.budget_max_rounds,
-          budget_timeout_sec: args.budget_timeout_sec,
-        });
+        // Save into DB atomically via transaction
+        db.transaction(() => {
+          db.createTask({
+            id: taskId,
+            task_key: args.task_key,
+            revision,
+            title: args.title,
+            status: TaskStatus.PENDING_CONFIRM,
+            target_cwd: args.target_cwd,
+            git_root: gitInfo.gitRoot,
+            git_commit: gitInfo.headCommit,
+            git_status: gitInfo.statusText,
+            budget_max_rounds: args.budget_max_rounds,
+            budget_timeout_sec: args.budget_timeout_sec,
+          });
 
-        // Save Revision
-        db.saveRevision({
-          task_id: taskId,
-          revision,
-          manifest_json: args.manifest_json,
-          task_md: args.task_md,
-          development_md: args.development_md,
-          tests_md: args.tests_md,
-          acceptance_md: args.acceptance_md,
-          verifier_prompt_md: args.verifier_prompt_md,
-        });
-
-        // Save Worker Prompts
-        for (const [workerId, promptText] of Object.entries(args.worker_prompts)) {
-          db.saveWorkerPrompt({
+          // Save Revision
+          db.saveRevision({
             task_id: taskId,
             revision,
-            worker_id: workerId,
-            role: workerId.includes('review') ? 'reviewer' : 'developer',
-            prompt_text: promptText,
+            manifest_json: args.manifest_json,
+            task_md: args.task_md,
+            development_md: args.development_md,
+            tests_md: args.tests_md,
+            acceptance_md: args.acceptance_md,
+            verifier_prompt_md: args.verifier_prompt_md,
           });
-        }
 
-        // Save to File Store
+          // Save Worker Prompts
+          for (const [workerId, promptText] of Object.entries(args.worker_prompts)) {
+            db.saveWorkerPrompt({
+              task_id: taskId,
+              revision,
+              worker_id: workerId,
+              role: workerId.includes('review') ? 'reviewer' : 'developer',
+              prompt_text: promptText,
+            });
+          }
+        });
+
+        // Save to File Store (projection)
         taskFileStore.saveTaskPackage(taskId, revision, {
           manifest_json: args.manifest_json,
           task_md: args.task_md,
@@ -169,26 +171,29 @@ export function createWorkbenchMcpServer(): McpServer {
 
         const newRevision = task.revision + 1;
 
-        db.saveRevision({
-          task_id: args.task_id,
-          revision: newRevision,
-          manifest_json: args.manifest_json,
-          task_md: args.task_md,
-          development_md: args.development_md,
-          tests_md: args.tests_md,
-          acceptance_md: args.acceptance_md,
-          verifier_prompt_md: args.verifier_prompt_md,
-        });
-
-        for (const [workerId, promptText] of Object.entries(args.worker_prompts)) {
-          db.saveWorkerPrompt({
+        // Atomically save revision and worker prompts
+        db.transaction(() => {
+          db.saveRevision({
             task_id: args.task_id,
             revision: newRevision,
-            worker_id: workerId,
-            role: 'worker',
-            prompt_text: promptText,
+            manifest_json: args.manifest_json,
+            task_md: args.task_md,
+            development_md: args.development_md,
+            tests_md: args.tests_md,
+            acceptance_md: args.acceptance_md,
+            verifier_prompt_md: args.verifier_prompt_md,
           });
-        }
+
+          for (const [workerId, promptText] of Object.entries(args.worker_prompts)) {
+            db.saveWorkerPrompt({
+              task_id: args.task_id,
+              revision: newRevision,
+              worker_id: workerId,
+              role: 'worker',
+              prompt_text: promptText,
+            });
+          }
+        });
 
         taskFileStore.saveTaskPackage(args.task_id, newRevision, {
           manifest_json: args.manifest_json,

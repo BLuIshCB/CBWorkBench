@@ -95,7 +95,54 @@ const clearResult = testDb.deleteAllTasks();
 assert.ok(clearResult.deletedCount >= 2);
 assert.strictEqual(testDb.listTasks().length, 0);
 
+// 6. Test native transaction & rollback
+let caught = false;
+try {
+  testDb.transaction(() => {
+    testDb.createTask({
+      id: 'task-rollback-test',
+      task_key: 'rollback',
+      revision: 1,
+      title: 'Rollback Test',
+      target_cwd: 'D:\\Test',
+    });
+    // Throw error to trigger rollback
+    throw new Error('Forced error inside transaction');
+  });
+} catch (e: any) {
+  caught = true;
+  assert.strictEqual(e.message, 'Forced error inside transaction');
+}
+assert.strictEqual(caught, true);
+assert.strictEqual(testDb.getTask('task-rollback-test'), null, 'Transaction must rollback completely on error');
+
+// 7. Test crash recovery
+testDb.createTask({
+  id: 'task-stuck-running',
+  task_key: 'stuck-1',
+  revision: 1,
+  title: 'Stuck Running Task',
+  target_cwd: 'D:\\Test',
+  status: TaskStatus.RUNNING,
+});
+testDb.createTask({
+  id: 'task-stuck-queued',
+  task_key: 'stuck-2',
+  revision: 1,
+  title: 'Stuck Queued Task',
+  target_cwd: 'D:\\Test',
+  status: TaskStatus.QUEUED,
+});
+const recoveryResult = testDb.recoverPendingTasks();
+assert.strictEqual(recoveryResult.recoveredCount, 2);
+const rec1 = testDb.getTask('task-stuck-running');
+const rec2 = testDb.getTask('task-stuck-queued');
+assert.strictEqual(rec1?.status, TaskStatus.BLOCKED);
+assert.strictEqual(rec2?.status, TaskStatus.BLOCKED);
+assert.ok(rec1?.blocked_reason?.includes('服务意外终止或重启'));
+
 // Clean up
+testDb.deleteAllTasks();
 try {
   fs.unlinkSync(testDbPath);
 } catch {}

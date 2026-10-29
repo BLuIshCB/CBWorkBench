@@ -126,6 +126,54 @@ export class WorkbenchDatabase {
     this.initTables();
   }
 
+  /**
+   * Execute operations within a native SQLite transaction
+   */
+  transaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const result = fn();
+      this.db.exec('COMMIT;');
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {}
+      throw err;
+    }
+  }
+
+  /**
+   * Crash Recovery: on startup, detect and recover any tasks stuck in 'running' or 'queued'
+   */
+  recoverPendingTasks(): { recoveredCount: number; taskIds: string[] } {
+    const unfinalized = this.db.prepare(`
+      SELECT id, status, current_round, current_stage FROM tasks 
+      WHERE status IN ('running', 'queued')
+    `).all() as unknown as Array<{ id: string; status: string; current_round: number; current_stage: string | null }>;
+
+    if (!unfinalized || unfinalized.length === 0) {
+      return { recoveredCount: 0, taskIds: [] };
+    }
+
+    const taskIds: string[] = [];
+    this.transaction(() => {
+      const now = Date.now();
+      for (const t of unfinalized) {
+        taskIds.push(t.id);
+        const reason = `服务意外终止或重启：任务在第 ${t.current_round || 1} 轮 [${t.current_stage || t.status}] 中断。系统已安全挂起现场，请核对工作区 Git 状态后重新确认开始。`;
+        this.db.prepare(`
+          UPDATE tasks 
+          SET status = ?, blocked_reason = ?, updated_at = ?
+          WHERE id = ?
+        `).run(TaskStatus.BLOCKED, reason, now, t.id);
+      }
+    });
+
+    logger.info(`[WorkbenchDatabase] Crash recovery check: recovered ${taskIds.length} unfinished tasks: ${taskIds.join(', ')}`);
+    return { recoveredCount: taskIds.length, taskIds };
+  }
+
   private initTables(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
@@ -660,8 +708,7 @@ export class WorkbenchDatabase {
     const task = this.getTask(taskId);
     if (!task) return false;
 
-    this.db.exec('BEGIN TRANSACTION;');
-    try {
+    return this.transaction(() => {
       this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
       this.db.prepare('DELETE FROM task_revisions WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM worker_prompts WHERE task_id = ?').run(taskId);
@@ -669,20 +716,14 @@ export class WorkbenchDatabase {
       this.db.prepare('DELETE FROM test_runs WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM acceptance_runs WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM human_decisions WHERE task_id = ?').run(taskId);
-      this.db.exec('COMMIT;');
       return true;
-    } catch (err) {
-      this.db.exec('ROLLBACK;');
-      throw err;
-    }
+    });
   }
 
   deleteAllTasks(): { deletedCount: number } {
-    const row = this.db.prepare('SELECT count(*) as count FROM tasks').get() as { count: number };
-    const deletedCount = row ? Number(row.count) : 0;
-
-    this.db.exec('BEGIN TRANSACTION;');
-    try {
+    return this.transaction(() => {
+      const row = this.db.prepare('SELECT count(*) as count FROM tasks').get() as { count: number };
+      const deletedCount = row ? Number(row.count) : 0;
       this.db.exec('DELETE FROM tasks;');
       this.db.exec('DELETE FROM task_revisions;');
       this.db.exec('DELETE FROM worker_prompts;');
@@ -690,12 +731,8 @@ export class WorkbenchDatabase {
       this.db.exec('DELETE FROM test_runs;');
       this.db.exec('DELETE FROM acceptance_runs;');
       this.db.exec('DELETE FROM human_decisions;');
-      this.db.exec('COMMIT;');
       return { deletedCount };
-    } catch (err) {
-      this.db.exec('ROLLBACK;');
-      throw err;
-    }
+    });
   }
 }
 
