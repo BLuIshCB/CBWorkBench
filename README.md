@@ -210,6 +210,16 @@ CBWorkBench 提供了标准 Stdio MCP 服务 `bin/cb-workbench-mcp.js`。
 
 ---
 
+## 📖 工程文档与开发边界
+
+本项目将所有 Markdown 文档集中收敛至 [`docs/`](./docs/README.md) 目录，并在工程上严格实施单分支策略：
+
+* **追踪分支**：本仓库唯一主干分支为 `master`，直接追踪远端 `origin/master`。开发过程**不需要也不切分多个分支**。
+* **开发边界规范**：详细约定了系统定位边界、三道硬门禁、Worker 工作区读写边界与 Codex 只读沙箱原则，详见 [**`docs/BOUNDARIES.md`**](./docs/BOUNDARIES.md)。
+* **总体架构与流程**：详见 [**`docs/ARCHITECTURE.md`**](./docs/ARCHITECTURE.md)。
+
+---
+
 ## 📂 项目工程结构
 
 ```text
@@ -218,7 +228,12 @@ CBWorkBench/
 │   ├── cb-workbench.js       # 工作台后台服务与 Web 站点启动器
 │   ├── cb-workbench-mcp.js   # Stdio MCP 服务启动器
 │   └── test-runner.js        # 自动化测试套件执行器
+├── docs/                     # 集中存放所有 Markdown 文档与规范
+│   ├── README.md             # 文档目录索引与工程指南
+│   ├── BOUNDARIES.md         # 开发边界与追踪分支规范 (单分支策略/三道门禁/权限边界)
+│   └── ARCHITECTURE.md       # 从零版总体架构与使用流程完整说明
 ├── src/
+│   ├── adapters/             # 多 Agent 多态适配器中心 (WorkBuddy CLI / Codex CLI)
 │   ├── config/
 │   │   └── constants.ts      # 常量、状态枚举与默认配置定义
 │   ├── server/
@@ -229,12 +244,13 @@ CBWorkBench/
 │   │   ├── testRunner.ts     # 独立自动化测试解析器与超时熔断执行器
 │   │   ├── workbuddyClient.ts# WorkBuddy MCP 客户端 (deepseek-v4-flash)
 │   │   ├── codexVerifier.ts  # Codex CLI 验收客户端 (gpt-5.6-sol / read-only)
+│   │   ├── runtimeService.ts # 适配器状态检测与提示词即时探测服务
 │   │   └── workflowEngine.ts # 核心串行循环状态机、预算控制与门禁调度
 │   ├── storage/
 │   │   ├── db.ts             # 基于 node:sqlite 的关系数据存储层
 │   │   └── fileStore.ts      # 任务包 Markdown 材料与 Artifacts 文件系统
 │   ├── ui/
-│   │   ├── index.html        # 现代 Web 控制台 HTML5 结构
+│   │   ├── index.html        # 现代 Web 控制台 HTML5 结构 (包含适配器中心)
 │   │   ├── styles.css        # 深色主题现代化 CSS
 │   │   └── app.js            # 响应式轮询与交互业务逻辑
 │   └── utils/
@@ -242,7 +258,7 @@ CBWorkBench/
 │       └── nodeResolver.js   # 跨环境 Node.js 运行时探测器
 ├── skills/
 │   └── cb-flow/              # 主 Agent 专用的任务包制作与上传 Skill
-├── tests/                    # 完整单元与集成测试套件 (PASS 7/7)
+├── tests/                    # 完整单元与集成测试套件 (PASS 11/11)
 ├── data/                     # 运行时 SQLite 数据库与任务包持久化目录 (已清空测试数据)
 └── package.json
 ```

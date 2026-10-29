@@ -11,10 +11,10 @@ export const WORKER_FIXED_MODEL = 'deepseek-v4-flash';
 export const VERIFIER_DEFAULT_MODEL = process.env.CB_VERIFIER_MODEL || 'gpt-5.6-sol';
 
 export const DEFAULT_BUDGET_MAX_ROUNDS = 10;
-export const DEFAULT_BUDGET_TIMEOUT_SECONDS = 1800; // 30 minutes
-export const DEFAULT_WORKER_TIMEOUT_MS = 900000; // 15 minutes
-export const DEFAULT_VERIFIER_TIMEOUT_MS = 300000; // 5 minutes
-export const DEFAULT_TEST_TIMEOUT_MS = 120000; // 2 minutes
+export const DEFAULT_BUDGET_TIMEOUT_SECONDS = Number(process.env.CB_BUDGET_TIMEOUT_SECONDS) || 3600; // 60 minutes
+export const DEFAULT_WORKER_TIMEOUT_MS = Number(process.env.CB_WORKER_TIMEOUT_MS) || 1800000; // 30 minutes
+export const DEFAULT_VERIFIER_TIMEOUT_MS = Number(process.env.CB_VERIFIER_TIMEOUT_MS) || 600000; // 10 minutes
+export const DEFAULT_TEST_TIMEOUT_MS = Number(process.env.CB_TEST_TIMEOUT_MS) || 180000; // 3 minutes
 
 export const ROOT_DIR = path.resolve(__dirname, '../../');
 export const DATA_DIR = path.resolve(process.env.CB_DATA_DIR || path.join(ROOT_DIR, 'data'));

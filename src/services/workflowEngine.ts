@@ -4,7 +4,7 @@ import { GitService } from './gitService.ts';
 import { TestRunner, type TestCaseItem } from './testRunner.ts';
 import { WorkBuddyClient } from './workbuddyClient.ts';
 import { adapterRegistry } from '../adapters/registry.ts';
-import { TaskStatus, RoundStage, DEFAULT_BUDGET_MAX_ROUNDS, DEFAULT_BUDGET_TIMEOUT_SECONDS } from '../config/constants.ts';
+import { TaskStatus, RoundStage, DEFAULT_BUDGET_MAX_ROUNDS, DEFAULT_BUDGET_TIMEOUT_SECONDS, DEFAULT_WORKER_TIMEOUT_MS } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
 
 export class WorkflowEngine {
@@ -293,7 +293,12 @@ export class WorkflowEngine {
           input_prompt: fullWorkerPrompt,
         });
 
-        // Run Worker via Adapter
+        // Run Worker via Adapter (保底使用 DEFAULT_WORKER_TIMEOUT_MS，避免被短超时硬性截断)
+        const policyWorkerTimeout = manifest.executionPolicy?.workerTimeoutMs || manifest.executionPolicy?.timeoutMs;
+        const effectiveWorkerTimeoutMs = policyWorkerTimeout
+          ? Math.max(policyWorkerTimeout, DEFAULT_WORKER_TIMEOUT_MS)
+          : DEFAULT_WORKER_TIMEOUT_MS;
+
         const workerResult = await workerAdapter.executeDevTask({
           taskId,
           roundNumber: currentRound,
@@ -301,7 +306,7 @@ export class WorkflowEngine {
           model: workerModel,
           prompt: fullWorkerPrompt,
           cwd: confirmedCwd,
-          timeoutMs: manifest.executionPolicy?.timeoutMs,
+          timeoutMs: effectiveWorkerTimeoutMs,
         });
 
         if (!workerResult.ok) {
