@@ -128,6 +128,10 @@ node bin/test-runner.js tests/workbuddyLiveSmoke.ts
 诊断命令不会启动、完成或审核已有业务任务。
 
 ### 3. 启动 Web 控制台与后台服务
+
+可以通过一键启动脚本快速运行：
+- **Windows (双击或终端运行)**: `start.bat` 或 `.\start.ps1`
+- **npm 命令**:
 ```bash
 npm start
 # 服务默认常驻端口: 3721
