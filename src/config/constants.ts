@@ -1,4 +1,8 @@
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export const DEFAULT_PORT = Number(process.env.CB_PORT) || 3721;
 export const DEFAULT_HOST = process.env.CB_HOST || '127.0.0.1';
@@ -12,7 +16,7 @@ export const DEFAULT_WORKER_TIMEOUT_MS = 900000; // 15 minutes
 export const DEFAULT_VERIFIER_TIMEOUT_MS = 300000; // 5 minutes
 export const DEFAULT_TEST_TIMEOUT_MS = 120000; // 2 minutes
 
-export const ROOT_DIR = path.resolve('.');
+export const ROOT_DIR = path.resolve(__dirname, '../../');
 export const DATA_DIR = path.resolve(process.env.CB_DATA_DIR || path.join(ROOT_DIR, 'data'));
 export const TASKS_DATA_DIR = path.join(DATA_DIR, 'tasks');
 export const DB_PATH = path.join(DATA_DIR, 'workbench.db');

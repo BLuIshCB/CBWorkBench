@@ -25,6 +25,7 @@ export class WorkBuddyAdapter implements IWorkerAdapter, IReviewerAdapter {
   readonly supportedRoles = ['worker', 'reviewer'] as const;
   readonly supportedModels = ['deepseek-v4-flash'] as const;
   readonly defaultModel = WORKER_FIXED_MODEL;
+  readonly connectionType = 'Windows 具名管道 (Named Pipe) -> 桌面 ACP Sidecar / Stdio MCP';
 
   healthCheck(): Promise<{ healthy: boolean; message?: string }> {
     return WorkBuddyClient.healthCheck();

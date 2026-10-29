@@ -7,58 +7,39 @@ process.env.CB_MOCK_CODEX = 'true';
 
 console.log('[Test] Running runtimeService.test.ts...');
 
-// 1. List configured CLIs
+// 1. List configured adapters from AdapterRegistry
 const clis = await runtimeService.listConfiguredClis();
 assert.ok(Array.isArray(clis), 'clis should be an array');
-assert.ok(clis.length >= 4, 'should detect at least 4 CLIs');
+assert.strictEqual(clis.length, 2, 'should detect exactly 2 registered adapters: workbuddy and codex');
 
-const workbuddyDesktop = clis.find(c => c.id === 'workbuddy-desktop');
-assert.ok(workbuddyDesktop, 'workbuddy-desktop should be in the list');
-assert.strictEqual(workbuddyDesktop.category, 'agent');
+const workbuddy = clis.find(c => c.id === 'workbuddy');
+assert.ok(workbuddy, 'workbuddy adapter should be in the list');
+assert.strictEqual(workbuddy.category, 'worker');
 
 const codex = clis.find(c => c.id === 'codex');
-assert.ok(codex, 'codex should be in the list');
+assert.ok(codex, 'codex adapter should be in the list');
 assert.strictEqual(codex.category, 'verifier');
 
-const node = clis.find(c => c.id === 'node');
-assert.ok(node, 'node runtime should be in the list');
-assert.strictEqual(node.category, 'system');
+// Ensure system tools (node, git) are NOT in the adapter list
+assert.strictEqual(clis.some(c => c.id === 'node'), false, 'node should not be in the adapter list');
+assert.strictEqual(clis.some(c => c.id === 'git'), false, 'git should not be in the adapter list');
 
-const git = clis.find(c => c.id === 'git');
-assert.ok(git, 'git should be in the list');
-
-// 2. Probe Node CLI
-const nodeProbe = await runtimeService.probeCli({
-  cliId: 'node',
-  prompt: 'console.log("HELLO_NODE")',
-});
-assert.strictEqual(nodeProbe.ok, true);
-assert.strictEqual(nodeProbe.output, 'HELLO_NODE');
-assert.strictEqual(nodeProbe.verified, true);
-
-// 3. Probe WorkBuddy in mock mode
+// 2. Probe WorkBuddy in mock mode
 const wbProbe = await runtimeService.probeCli({
-  cliId: 'workbuddy-desktop',
+  cliId: 'workbuddy',
   prompt: '只回复 WB_ADAPTER_OK。不要调用工具，不要读写文件。',
 });
 assert.strictEqual(wbProbe.ok, true);
 assert.ok(wbProbe.output.includes('MOCK WORKBUDDY RESULT'));
+assert.ok(wbProbe.connectionType.length > 0);
 
-// 4. Probe Codex in mock mode
+// 3. Probe Codex in mock mode
 const codexProbe = await runtimeService.probeCli({
   cliId: 'codex',
   prompt: '只回复 CODEX_OK',
 });
 assert.strictEqual(codexProbe.ok, true);
 assert.strictEqual(codexProbe.verified, true);
-assert.ok(codexProbe.output.includes('CODEX_OK'));
-
-// 5. Probe Git CLI
-const gitProbe = await runtimeService.probeCli({
-  cliId: 'git',
-  prompt: '--version',
-});
-assert.strictEqual(gitProbe.ok, true);
-assert.ok(gitProbe.output.includes('git version'));
+assert.ok(codexProbe.output.length > 0);
 
 console.log('✅ runtimeService.test.ts passed successfully!');

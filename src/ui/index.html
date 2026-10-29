@@ -22,7 +22,7 @@
           <span class="tab-icon">📋</span> 任务看板
         </a>
         <a href="/runtime" class="nav-tab" id="nav-tab-runtime" onclick="app.navigateTo('/runtime'); return false;">
-          <span class="tab-icon">⚙️</span> CLI 运行环境
+          <span class="tab-icon">🧩</span> 适配器中心 (Workers)
         </a>
       </nav>
       <div class="nav-status" id="system-status-pills">
@@ -256,59 +256,59 @@
       </div>
     </section>
 
-    <!-- View 3: Runtime & CLI Diagnostics View -->
+    <!-- View 3: Adapters & Workers Diagnostics View -->
     <section id="view-runtime" class="view-section" style="display: none;">
       <div class="section-header">
         <div class="title-group">
-          <h2>运行环境与 CLI 探测</h2>
-          <p class="subtitle">查看当前已配置的各类 CLI 协同工具、版本与配置来源，支持即时发送提示词探测可用性</p>
+          <h2>🧩 适配器中心 (Adapters & Workers)</h2>
+          <p class="subtitle">适配器即 Worker。工作台所有执行者均基于 IAgentAdapter 注册中心统一接入，每开发一个适配器即对应一个 Worker，支持即时发送提示词探测连通性</p>
         </div>
         <div class="action-group">
-          <button class="btn btn-secondary" onclick="app.fetchRuntimeClis()">刷新 CLI 配置</button>
+          <button class="btn btn-secondary" onclick="app.fetchRuntimeClis()">刷新适配器状态</button>
         </div>
       </div>
 
       <!-- Quick Summary Row -->
       <div class="runtime-summary-bar">
         <div class="summary-stat-item">
-          <span class="stat-label">已检测 CLI 工具</span>
+          <span class="stat-label">已注册适配器总数</span>
           <span class="stat-value" id="runtime-stat-total">--</span>
         </div>
         <div class="summary-stat-item">
-          <span class="stat-label">Worker / Reviewer</span>
-          <span class="stat-value text-blue" id="runtime-stat-wb">WorkBuddy</span>
+          <span class="stat-label">当前活跃 Worker</span>
+          <span class="stat-value text-blue" id="runtime-stat-wb" style="font-size: 15px;">WorkBuddy CLI</span>
         </div>
         <div class="summary-stat-item">
-          <span class="stat-label">Verifier 验收工具</span>
-          <span class="stat-value text-purple" id="runtime-stat-codex">Codex CLI</span>
+          <span class="stat-label">核心模型</span>
+          <span class="stat-value text-green" id="runtime-stat-wb-model">deepseek-v4-flash</span>
         </div>
         <div class="summary-stat-item">
-          <span class="stat-label">系统执行引擎</span>
-          <span class="stat-value text-green" id="runtime-stat-node">Node 24 (SQLite)</span>
+          <span class="stat-label">架构解耦特性</span>
+          <span class="stat-value text-purple" style="font-size: 14px;">无沙箱直连 · 热插拔注册</span>
         </div>
       </div>
 
-      <!-- Configured CLIs Grid -->
+      <!-- Configured Adapters Grid -->
       <div class="runtime-section-title">
-        <h3>已配置的 CLI 与系统工具清单</h3>
+        <h3>已注册的 Agent 适配器清单 (Registered Adapters)</h3>
         <span class="badge badge-secondary" id="runtime-cli-count">加载中...</span>
       </div>
       <div id="runtime-cli-grid" class="runtime-cli-grid">
-        <div class="loading-state">正在探测已配置的 CLI 工具...</div>
+        <div class="loading-state">正在探测已注册适配器...</div>
       </div>
 
       <!-- Interactive Prompt Probe Console -->
       <div class="card probe-card" id="probe-console-card">
         <div class="probe-header">
           <div class="probe-title-group">
-            <h3>🎯 CLI 提示词即时探测控制台</h3>
-            <p class="desc">向选定的 Agent CLI 发送提示词，即时验证可执行性、会话连通性、身份凭证与模型回包能力。</p>
+            <h3>🎯 适配器提示词即时探测控制台</h3>
+            <p class="desc">向选定的适配器实例发送提示词，直接测试底层 executeDevTask() 或 executeReview() 连通性与模型回包能力。</p>
           </div>
         </div>
 
         <div class="probe-form-grid">
           <div class="form-group">
-            <label for="probe-target-cli">目标 CLI：</label>
+            <label for="probe-target-cli">目标适配器 (Worker/Reviewer)：</label>
             <select id="probe-target-cli" class="form-control" onchange="app.handleProbeTargetChange()">
               <!-- Injected by JS -->
             </select>
@@ -338,10 +338,9 @@
 
         <div class="prompt-preset-bar">
           <span class="preset-label">快捷预设：</span>
-          <button type="button" class="preset-btn" onclick="app.setProbePreset('wb_echo')">⚡ 适配器标准回声</button>
-          <button type="button" class="preset-btn" onclick="app.setProbePreset('pong')">🏓 极简响应 (PONG)</button>
+          <button type="button" class="preset-btn" onclick="app.setProbePreset('wb_echo')">⚡ WorkBuddy 标准回声</button>
           <button type="button" class="preset-btn" onclick="app.setProbePreset('codex')">⚖️ Codex 验收探测</button>
-          <button type="button" class="preset-btn" onclick="app.setProbePreset('identity')">🤖 身份与模型问答</button>
+          <button type="button" class="preset-btn" onclick="app.setProbePreset('pong')">🏓 极简响应 (PONG)</button>
         </div>
 
         <div class="form-row" style="margin-top: 8px;">

@@ -1034,24 +1034,31 @@ class App {
         const countEl = document.getElementById('runtime-cli-count');
         if (countEl) countEl.textContent = `共 ${data.clis.length} 个组件`;
 
-        const wbCli = data.clis.find((c) => c.id.startsWith('workbuddy'));
+        const wbDesktop = data.clis.find((c) => c.id === 'workbuddy-desktop');
+        const wbCli = data.clis.find((c) => c.id === 'workbuddy-cli');
         const wbEl = document.getElementById('runtime-stat-wb');
-        if (wbEl && wbCli) {
-          wbEl.textContent = wbCli.available ? '就绪 (可用)' : '待配置';
-          wbEl.className = wbCli.available ? 'stat-value text-green' : 'stat-value text-muted';
+        if (wbEl) {
+          if (wbDesktop && wbDesktop.available) {
+            wbEl.textContent = '桌面 ACP 具名管道直连';
+            wbEl.className = 'stat-value text-blue';
+          } else if (wbCli && wbCli.available) {
+            wbEl.textContent = '命令行 Stdio MCP';
+            wbEl.className = 'stat-value text-purple';
+          } else {
+            wbEl.textContent = '待配置';
+            wbEl.className = 'stat-value text-muted';
+          }
+        }
+
+        const wbModelEl = document.getElementById('runtime-stat-wb-model');
+        if (wbModelEl && wbDesktop) {
+          wbModelEl.textContent = wbDesktop.defaultModel || 'deepseek-v4-flash';
         }
 
         const codexCli = data.clis.find((c) => c.id === 'codex');
-        const codexEl = document.getElementById('runtime-stat-codex');
-        if (codexEl && codexCli) {
-          codexEl.textContent = codexCli.available ? '就绪 (可用)' : '未找到';
-          codexEl.className = codexCli.available ? 'stat-value text-green' : 'stat-value text-muted';
-        }
-
-        const nodeCli = data.clis.find((c) => c.id === 'node');
-        const nodeEl = document.getElementById('runtime-stat-node');
-        if (nodeEl && nodeCli) {
-          nodeEl.textContent = nodeCli.version || 'Node 24';
+        const codexModelEl = document.getElementById('runtime-stat-codex-model');
+        if (codexModelEl && codexCli) {
+          codexModelEl.textContent = codexCli.defaultModel || 'gpt-5.6-sol';
         }
       }
     } catch (e) {
@@ -1068,36 +1075,33 @@ class App {
     if (!grid) return;
 
     if (!clis || !clis.length) {
-      grid.innerHTML = '<div class="empty-state">暂未检测到任何 CLI 配置</div>';
+      grid.innerHTML = '<div class="empty-state">暂未检测到任何 Worker CLI 配置</div>';
       return;
     }
 
     const icons = {
+      'workbuddy': '🤖',
       'workbuddy-desktop': '🖥️',
       'workbuddy-cli': '💻',
       'codex': '⚖️',
-      'node': '🟢',
-      'git': '🐙',
     };
 
     grid.innerHTML = clis.map((cli) => {
-      const icon = icons[cli.id] || '⚡';
+      const icon = icons[cli.id] || '🧩';
       const statusBadge = cli.available
         ? '<span class="badge badge-completed">就绪 / 可用</span>'
         : cli.configured
         ? '<span class="badge badge-pending_confirm">已声明 (待检测)</span>'
-        : '<span class="badge badge-secondary">未配置</span>';
+        : '<span class="badge badge-secondary">未就绪</span>';
 
-      const roleBadge = cli.category === 'agent'
-        ? '<span class="badge badge-running">Agent 协同</span>'
-        : cli.category === 'verifier'
-        ? '<span class="badge badge-human_review">验收者</span>'
-        : '<span class="badge badge-secondary">系统宿主</span>';
+      const roleBadge = cli.category === 'verifier'
+        ? '<span class="badge badge-human_review">Reviewer 验收者</span>'
+        : '<span class="badge badge-running">Worker 执行者</span>';
 
-      const envHtml = cli.environmentPreview && Object.keys(cli.environmentPreview).length > 0
-        ? `<div class="cli-env-preview">
-            <div class="env-title">关键环境变量：</div>
-            ${Object.entries(cli.environmentPreview).map(([k, v]) => `<div><code>${this.escapeHtml(k)}=${this.escapeHtml(v)}</code></div>`).join('')}
+      const connHtml = cli.connectionType
+        ? `<div class="cli-meta-item">
+             <span class="label">连接通道：</span>
+             <span class="value font-mono text-blue" style="font-size: 11px;">${this.escapeHtml(cli.connectionType)}</span>
            </div>`
         : '';
 
@@ -1105,13 +1109,6 @@ class App {
         ? `<div class="cli-meta-item">
              <span class="label">支持模型：</span>
              <span class="value"><code class="code-pill">${this.escapeHtml(cli.supportedModels.join(', '))}</code></span>
-           </div>`
-        : '';
-
-      const versionHtml = cli.version
-        ? `<div class="cli-meta-item">
-             <span class="label">检测版本：</span>
-             <span class="value font-mono">${this.escapeHtml(cli.version)}</span>
            </div>`
         : '';
 
@@ -1132,21 +1129,17 @@ class App {
           </div>
 
           <div class="cli-card-body">
-            <div class="cli-meta-item">
-              <span class="label">可执行路径：</span>
-              <span class="value"><code class="path-code" title="${this.escapeHtml(cli.executablePath)}">${this.escapeHtml(cli.executablePath)}</code></span>
-            </div>
-            <div class="cli-meta-item">
-              <span class="label">配置来源：</span>
-              <span class="value font-mono text-muted" title="${this.escapeHtml(cli.configSource)}">${this.escapeHtml(cli.configSource)}</span>
-            </div>
-            ${versionHtml}
+            <p style="color: #8b949e; font-size: 12px; margin-bottom: 8px;">${this.escapeHtml(cli.description || '')}</p>
+            ${connHtml}
             ${modelsHtml}
             <div class="cli-meta-item">
-              <span class="label">状态诊断：</span>
+              <span class="label">适配器标识：</span>
+              <span class="value"><code class="path-code">${this.escapeHtml(cli.id)}</code></span>
+            </div>
+            <div class="cli-meta-item">
+              <span class="label">健康诊断：</span>
               <span class="value ${cli.available ? 'text-green' : 'text-muted'}">${this.escapeHtml(cli.statusMessage || '--')}</span>
             </div>
-            ${envHtml}
           </div>
 
           <div class="cli-card-footer">
@@ -1173,8 +1166,8 @@ class App {
 
     if (previousValue && clis.some((c) => c.id === previousValue)) {
       cliSelect.value = previousValue;
-    } else if (clis.some((c) => c.id === 'workbuddy-desktop')) {
-      cliSelect.value = 'workbuddy-desktop';
+    } else if (clis.some((c) => c.id === 'workbuddy')) {
+      cliSelect.value = 'workbuddy';
     }
 
     const cwdInput = document.getElementById('probe-cwd-input');
@@ -1222,17 +1215,14 @@ class App {
     switch (presetKey) {
       case 'wb_echo':
         promptInput.value = '只回复 WB_ADAPTER_OK。不要调用工具，不要读写文件。';
-        this.selectCliDropdown('workbuddy-desktop');
-        break;
-      case 'pong':
-        promptInput.value = '只回复 PONG';
+        this.selectCliDropdown('workbuddy');
         break;
       case 'codex':
         promptInput.value = '只回复 CODEX_OK，不要多余字符。';
         this.selectCliDropdown('codex');
         break;
-      case 'identity':
-        promptInput.value = '请用一句话介绍你自己，说明你的模型版本并回答: 1+1等于几？';
+      case 'pong':
+        promptInput.value = '只回复 PONG';
         break;
     }
   }
@@ -1336,6 +1326,9 @@ class App {
       let displayOutput = '';
       if (r.commandPreview) {
         displayOutput += `[命令执行] ${r.commandPreview}\n`;
+      }
+      if (r.connectionType) {
+        displayOutput += `[连接通道] ${r.connectionType}\n`;
       }
       displayOutput += `[执行状态] ${r.ok ? '✅ 成功' : '❌ 失败'}`;
       if (r.errorCode) displayOutput += ` (错误代码: ${r.errorCode})`;

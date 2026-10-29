@@ -29,6 +29,9 @@ export interface IAgentAdapter {
   /** 该适配器的默认推荐模型 */
   readonly defaultModel: string;
 
+  /** 适配器通信与连接方式说明（如 桌面具名管道直连、标准 HTTP API 直连、只读沙箱子进程等） */
+  readonly connectionType?: string;
+
   /**
    * 连通性与健康检查（例如验证 CLI 工具存在、服务端口可达等）
    */
@@ -151,6 +154,12 @@ export interface AdapterMetaDto {
   id: string;
   name: string;
   description: string;
+  supportedRoles: ('worker' | 'reviewer')[];
   defaultModel: string;
   supportedModels: string[];
+  connectionType?: string;
+  healthy?: boolean;
+  statusMessage?: string;
+  isWorker?: boolean;
+  isReviewer?: boolean;
 }

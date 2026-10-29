@@ -115,21 +115,24 @@ try {
   const clisData = await clisRes.json();
   assert.strictEqual(clisData.success, true);
   assert.ok(Array.isArray(clisData.clis));
-  assert.ok(clisData.clis.some((c: any) => c.id === 'node'));
+  assert.ok(clisData.clis.some((c: any) => c.id === 'workbuddy'));
+  assert.ok(clisData.clis.some((c: any) => c.id === 'codex'));
+  assert.strictEqual(clisData.clis.some((c: any) => c.id === 'node'), false);
 
+  process.env.CB_MOCK_WORKBUDDY = 'true';
   const probeRes = await fetch(`${baseUrl}/api/runtime/probe`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      cliId: 'node',
-      prompt: 'console.log("SERVER_PROBE_OK")',
+      cliId: 'workbuddy',
+      prompt: '只回复 WB_ADAPTER_OK。不要调用工具，不要读写文件。',
     }),
   });
   assert.strictEqual(probeRes.status, 200);
   const probeData = await probeRes.json();
   assert.strictEqual(probeData.success, true);
   assert.strictEqual(probeData.result.ok, true);
-  assert.strictEqual(probeData.result.output, 'SERVER_PROBE_OK');
+  assert.ok(probeData.result.output.includes('MOCK WORKBUDDY RESULT'));
 
   console.log('✅ httpServer.test.ts passed successfully!');
 } finally {

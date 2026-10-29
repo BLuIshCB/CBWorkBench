@@ -1,30 +1,21 @@
-import { spawn, execFile } from 'node:child_process';
-import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
-import { resolveWorkBuddyConfigs } from './workbuddyConfig.ts';
-import { WorkBuddyClient } from './workbuddyClient.ts';
-import { CodexVerifier } from './codexVerifier.ts';
-import { resolveSupportedNode } from '../utils/nodeResolver.js';
-import { WORKER_FIXED_MODEL, VERIFIER_DEFAULT_MODEL, ROOT_DIR } from '../config/constants.ts';
+import { ROOT_DIR } from '../config/constants.ts';
+import { adapterRegistry } from '../adapters/registry.ts';
+import type { IWorkerAdapter, IReviewerAdapter } from '../adapters/types.ts';
 import { logger } from '../utils/logger.ts';
 
 export interface CliConfigInfo {
   id: string;
   name: string;
-  category: 'agent' | 'verifier' | 'system';
+  category: 'worker' | 'reviewer' | 'verifier';
   role: string;
+  connectionType: string;
   configured: boolean;
   available: boolean;
-  executablePath: string;
-  args?: string[];
-  version?: string;
-  configSource: string;
   defaultModel?: string;
   supportedModels?: string[];
   defaultProbePrompt: string;
   statusMessage?: string;
-  environmentPreview?: Record<string, string>;
+  description?: string;
   extraInfo?: Record<string, any>;
 }
 
@@ -40,6 +31,7 @@ export interface CliProbeResult {
   ok: boolean;
   cliId: string;
   cliName: string;
+  connectionType: string;
   prompt: string;
   output: string;
   error?: string;
@@ -54,22 +46,6 @@ export interface CliProbeResult {
   verified?: boolean;
 }
 
-function safeExec(command: string, args: string[], timeoutMs: number = 3000): Promise<{ ok: boolean; output: string }> {
-  return new Promise((resolve) => {
-    try {
-      execFile(command, args, { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
-        if (err) {
-          resolve({ ok: false, output: (stderr || err.message || '').trim() });
-        } else {
-          resolve({ ok: true, output: (stdout || '').trim() });
-        }
-      });
-    } catch (e: any) {
-      resolve({ ok: false, output: e?.message || String(e) });
-    }
-  });
-}
-
 export class RuntimeService {
   private static instance: RuntimeService;
 
@@ -81,423 +57,158 @@ export class RuntimeService {
   }
 
   /**
-   * 汇总获取当前工作台已配置和可用的全部 CLI 信息
+   * 汇总从 AdapterRegistry 注册中心中获取所有已注册的 Worker / Reviewer 适配器
+   * 每开发并注册一个适配器，此列表即自动增加一个对应的 Worker/Reviewer
    */
   async listConfiguredClis(): Promise<CliConfigInfo[]> {
+    const adapters = await adapterRegistry.listAllAdapters();
     const list: CliConfigInfo[] = [];
 
-    // 1. WorkBuddy Desktop Bridge
-    const wbConfigs = resolveWorkBuddyConfigs();
-    const desktopConfig = wbConfigs.desktop;
-    const desktopConfigured = Boolean(desktopConfig);
-    const desktopExecutable = desktopConfig?.command || 'python';
-    const desktopExists = desktopConfig?.command ? fs.existsSync(desktopConfig.command) : false;
+    for (const a of adapters) {
+      const isBoth = a.isWorker && a.isReviewer;
+      const roleStr = isBoth
+        ? 'Worker / Reviewer (代码开发与审查)'
+        : a.isWorker
+        ? 'Worker (代码开发与修复)'
+        : 'Verifier / Reviewer (质量审查与验收)';
 
-    let desktopEnvPreview: Record<string, string> | undefined;
-    if (desktopConfig?.env) {
-      desktopEnvPreview = {};
-      for (const [k, v] of Object.entries(desktopConfig.env)) {
-        if (k.startsWith('WORKBUDDY_') || k.startsWith('WB_') || k.startsWith('CODEBUDDY_')) {
-          desktopEnvPreview[k] = v;
-        }
+      let defaultPrompt = '只回复 WB_ADAPTER_OK。不要调用工具，不要读写文件。';
+      if (a.id === 'codex') {
+        defaultPrompt = '只回复 CODEX_OK，不要多余字符。';
       }
+
+      list.push({
+        id: a.id,
+        name: a.name,
+        category: a.isWorker ? 'worker' : 'verifier',
+        role: roleStr,
+        connectionType: a.connectionType || '未指定',
+        configured: true,
+        available: Boolean(a.healthy),
+        defaultModel: a.defaultModel,
+        supportedModels: a.supportedModels,
+        defaultProbePrompt: defaultPrompt,
+        statusMessage: a.statusMessage || (a.healthy ? '就绪 / 可用' : '待配置'),
+        description: a.description,
+        extraInfo: {
+          supportedRoles: a.supportedRoles,
+        },
+      });
     }
-
-    list.push({
-      id: 'workbuddy-desktop',
-      name: 'WorkBuddy Desktop Bridge (桌面直连)',
-      category: 'agent',
-      role: 'Worker / Reviewer (开发者与审查者)',
-      configured: desktopConfigured,
-      available: desktopConfigured && (desktopExists || desktopExecutable === 'python'),
-      executablePath: desktopExecutable,
-      args: desktopConfig?.args || [],
-      configSource: process.env.CB_WORKBUDDY_MCP_CONFIG || path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml [mcp_servers.workbuddy-desktop]'),
-      defaultModel: WORKER_FIXED_MODEL,
-      supportedModels: [WORKER_FIXED_MODEL, 'deepseek-chat', 'deepseek-coder'],
-      defaultProbePrompt: '只回复 WB_ADAPTER_OK。不要调用工具，不要读写文件。',
-      statusMessage: desktopConfigured ? '已在 Codex / WorkBuddy 配置中声明桌面桥接' : '未检测到桌面桥接配置',
-      environmentPreview: desktopEnvPreview,
-      extraInfo: {
-        backend: 'desktop',
-        argsPreview: desktopConfig?.args?.join(' ') || '',
-      },
-    });
-
-    // 2. WorkBuddy CLI MCP
-    const cliConfig = wbConfigs.cli;
-    const cliConfigured = Boolean(cliConfig);
-    const cliExecutable = cliConfig?.command || 'node';
-    const cliScript = cliConfig?.env?.WB_CLI_SCRIPT || '';
-
-    let cliEnvPreview: Record<string, string> | undefined;
-    if (cliConfig?.env) {
-      cliEnvPreview = {};
-      for (const [k, v] of Object.entries(cliConfig.env)) {
-        if (k.startsWith('WB_') || k.startsWith('CODEBUDDY_') || k.startsWith('WORKBUDDY_')) {
-          cliEnvPreview[k] = v;
-        }
-      }
-    }
-
-    list.push({
-      id: 'workbuddy-cli',
-      name: 'WorkBuddy CLI MCP (命令行无头服务)',
-      category: 'agent',
-      role: 'Worker / Reviewer (开发者与审查者)',
-      configured: cliConfigured,
-      available: cliConfigured && Boolean(cliScript && fs.existsSync(cliScript)),
-      executablePath: cliExecutable,
-      args: cliConfig?.args || [],
-      configSource: process.env.CB_WORKBUDDY_MCP_CONFIG || path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml [mcp_servers.workbuddy-cli]'),
-      defaultModel: WORKER_FIXED_MODEL,
-      supportedModels: [WORKER_FIXED_MODEL, 'deepseek-chat', 'deepseek-coder'],
-      defaultProbePrompt: '只回复 WB_ADAPTER_OK。不要调用工具，不要读写文件。',
-      statusMessage: cliConfigured ? `已配置脚本: ${cliScript ? path.basename(cliScript) : '未指定'}` : '未检测到 CLI MCP 配置',
-      environmentPreview: cliEnvPreview,
-      extraInfo: {
-        backend: 'cli',
-        scriptPath: cliScript,
-      },
-    });
-
-    // 3. Codex CLI
-    const codexBin = CodexVerifier.resolveCodexExecutable();
-    const codexVersionResult = await safeExec(codexBin, ['--version'], 2000);
-    const codexAvailable = codexVersionResult.ok;
-
-    list.push({
-      id: 'codex',
-      name: 'Codex CLI (自动验收者)',
-      category: 'verifier',
-      role: 'Verifier (只读独立验收与复核)',
-      configured: Boolean(codexBin),
-      available: codexAvailable,
-      executablePath: codexBin,
-      version: codexVersionResult.ok ? codexVersionResult.output : undefined,
-      configSource: process.env.CODEX_CMD_PATH ? 'CB CODEX_CMD_PATH' : 'System PATH / npm global',
-      defaultModel: VERIFIER_DEFAULT_MODEL,
-      supportedModels: [VERIFIER_DEFAULT_MODEL, 'gpt-5-turbo', 'o3-mini', 'o1'],
-      defaultProbePrompt: '只回复 CODEX_OK，不要多余字符。',
-      statusMessage: codexAvailable ? `检测到 Codex CLI (${codexVersionResult.output})` : '未找到可用 Codex CLI 可执行文件',
-    });
-
-    // 4. Node.js 运行时
-    let nodePath = '';
-    try {
-      nodePath = resolveSupportedNode();
-    } catch {
-      nodePath = process.execPath;
-    }
-    const nodeVersion = process.versions.node;
-
-    list.push({
-      id: 'node',
-      name: 'Node.js 运行时环境',
-      category: 'system',
-      role: 'Host / Test Runner (工作台宿主与测试进程)',
-      configured: true,
-      available: true,
-      executablePath: nodePath,
-      version: `v${nodeVersion}`,
-      configSource: process.env.CB_NODE_PATH ? 'CB_NODE_PATH' : 'nodeResolver (Node 24 / SQLite)',
-      defaultProbePrompt: 'console.log("NODE_OK: " + process.version);',
-      statusMessage: `Node.js v${nodeVersion} (支持 node:sqlite)`,
-    });
-
-    // 5. Git CLI
-    const gitVersionResult = await safeExec('git', ['--version'], 2000);
-    list.push({
-      id: 'git',
-      name: 'Git CLI (版本控制工具)',
-      category: 'system',
-      role: 'VCS (工作区变更与 Diff 生成)',
-      configured: gitVersionResult.ok,
-      available: gitVersionResult.ok,
-      executablePath: 'git',
-      version: gitVersionResult.ok ? gitVersionResult.output : undefined,
-      configSource: 'System PATH',
-      defaultProbePrompt: 'status --short',
-      statusMessage: gitVersionResult.ok ? gitVersionResult.output : 'Git 命令行未安装或不可达',
-    });
 
     return list;
   }
 
   /**
-   * 使用简单提示词对指定 CLI 发起可用性探测
+   * 对指定的适配器执行统一提示词连通性探测
    */
   async probeCli(params: CliProbeRequest): Promise<CliProbeResult> {
     const startTime = Date.now();
     const cliId = params.cliId;
-    const targetCwd = params.cwd && fs.existsSync(params.cwd) ? params.cwd : ROOT_DIR;
+    const targetCwd = params.cwd || ROOT_DIR;
     const timeoutMs = Math.min(Math.max(params.timeoutMs || 30000, 3000), 120000);
     const timestamp = new Date().toISOString();
 
-    logger.info(`[RuntimeService] Probing CLI '${cliId}' with prompt: "${(params.prompt || '').slice(0, 50)}..."`);
+    const adapter = adapterRegistry.getAdapter(cliId);
+    if (!adapter) {
+      throw new Error(`未找到 ID 为 '${cliId}' 的已注册适配器。可在 src/adapters/ 中编写并注册新适配器。`);
+    }
 
-    // 1. WorkBuddy Desktop / CLI / auto probe
-    if (cliId === 'workbuddy-desktop' || cliId === 'workbuddy-cli' || cliId === 'workbuddy') {
-      const targetBackend = cliId === 'workbuddy-desktop' ? 'desktop' : cliId === 'workbuddy-cli' ? 'cli' : undefined;
-      const originalBackendEnv = process.env.CB_WORKBUDDY_BACKEND;
+    logger.info(`[RuntimeService] Probing Adapter '${cliId}' with prompt: "${(params.prompt || '').slice(0, 50)}..."`);
 
-      if (targetBackend) {
-        process.env.CB_WORKBUDDY_BACKEND = targetBackend;
-      }
-
+    // 1. 如果是支持 Worker 的适配器，直接调用标准的 executeDevTask
+    if (adapter.supportedRoles.includes('worker') && 'executeDevTask' in adapter) {
+      const workerAdapter = adapter as IWorkerAdapter;
+      const model = params.model || workerAdapter.defaultModel;
       const prompt = params.prompt?.trim() || '只回复 WB_ADAPTER_OK。不要调用工具，不要读写文件。';
-      const model = params.model || WORKER_FIXED_MODEL;
 
-      try {
-        const result = await WorkBuddyClient.runTask({
-          taskId: `probe-${cliId}-${Date.now()}`,
-          prompt,
-          cwd: targetCwd,
-          model,
-          timeoutMs,
-        });
+      const execResult = await workerAdapter.executeDevTask({
+        taskId: `probe-${adapter.id}-${Date.now()}`,
+        roundNumber: 0,
+        workerId: 'worker-probe',
+        model,
+        prompt,
+        cwd: targetCwd,
+        timeoutMs,
+      });
 
-        const verified = result.ok && (result.output.trim() === 'WB_ADAPTER_OK' || result.output.length > 0);
-        return {
-          ok: result.ok,
-          cliId,
-          cliName: cliId === 'workbuddy-desktop' ? 'WorkBuddy Desktop' : cliId === 'workbuddy-cli' ? 'WorkBuddy CLI' : 'WorkBuddy',
-          prompt,
-          output: result.output || '',
-          error: result.error,
-          errorCode: result.errorCode,
-          durationMs: Date.now() - startTime,
-          modelUsed: model,
-          backend: result.backend,
-          sessionId: result.sessionId,
-          timestamp,
-          verified,
-          commandPreview: `WorkBuddy ${result.backend || targetBackend || 'auto'} [${model}]`,
-        };
-      } finally {
-        if (targetBackend) {
-          if (originalBackendEnv !== undefined) {
-            process.env.CB_WORKBUDDY_BACKEND = originalBackendEnv;
-          } else {
-            delete process.env.CB_WORKBUDDY_BACKEND;
-          }
-        }
-      }
+      const verified = execResult.ok && (execResult.output.length > 0 || execResult.output.includes('OK'));
+      return {
+        ok: execResult.ok,
+        cliId: adapter.id,
+        cliName: adapter.name,
+        connectionType: adapter.connectionType || 'Adapter Call',
+        prompt,
+        output: execResult.output || '',
+        error: execResult.error,
+        errorCode: execResult.metadata?.errorCode,
+        durationMs: execResult.durationMs,
+        modelUsed: execResult.modelUsed || model,
+        backend: execResult.metadata?.backend,
+        sessionId: execResult.metadata?.sessionId,
+        timestamp,
+        verified,
+        commandPreview: `${adapter.name} [${model}] -> ${adapter.connectionType}`,
+      };
     }
 
-    // 2. Codex CLI probe
-    if (cliId === 'codex') {
+    // 2. 如果是 Reviewer 专用适配器 (如 CodexAdapter)
+    if (adapter.supportedRoles.includes('reviewer') && 'executeReview' in adapter) {
+      const reviewerAdapter = adapter as IReviewerAdapter;
+      const model = params.model || reviewerAdapter.defaultModel;
       const prompt = params.prompt?.trim() || '只回复 CODEX_OK，不要多余字符。';
-      const model = params.model || VERIFIER_DEFAULT_MODEL;
 
-      if (process.env.CB_MOCK_CODEX === 'true') {
+      // 快速通过 healthCheck 与执行审查探测
+      const health = await reviewerAdapter.healthCheck();
+      if (!health.healthy) {
         return {
-          ok: true,
-          cliId,
-          cliName: 'Codex CLI (Mock)',
+          ok: false,
+          cliId: adapter.id,
+          cliName: adapter.name,
+          connectionType: adapter.connectionType || 'Reviewer Sandbox',
           prompt,
-          output: 'CODEX_OK (Simulated mock response)',
+          output: '',
+          error: health.message || 'Reviewer health check failed',
           durationMs: Date.now() - startTime,
           modelUsed: model,
           timestamp,
-          verified: true,
-          commandPreview: `codex exec -m ${model} -s read-only -`,
+          verified: false,
+          commandPreview: `${adapter.name} [${model}] -> ${adapter.connectionType}`,
         };
       }
 
-      const codexBin = CodexVerifier.resolveCodexExecutable();
-      return new Promise<CliProbeResult>((resolve) => {
-        let stdout = '';
-        let stderr = '';
-        let timedOut = false;
-
-        const child = spawn(
-          codexBin,
-          ['exec', '-m', model, '-s', 'read-only', '--skip-git-repo-check', '--ephemeral', '-C', targetCwd, '-'],
-          {
-            shell: true,
-            stdio: ['pipe', 'pipe', 'pipe'],
-            windowsHide: true,
-          }
-        );
-
-        const timer = setTimeout(() => {
-          timedOut = true;
-          try {
-            if (process.platform === 'win32') {
-              spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
-            } else {
-              child.kill('SIGKILL');
-            }
-          } catch {}
-        }, timeoutMs);
-
-        child.stdout.on('data', (d) => {
-          stdout += d.toString('utf8');
-        });
-        child.stderr.on('data', (d) => {
-          stderr += d.toString('utf8');
-        });
-
-        // Write prompt to stdin and close
-        child.stdin.write(prompt, 'utf8');
-        child.stdin.end();
-
-        child.on('close', (code) => {
-          clearTimeout(timer);
-          const durationMs = Date.now() - startTime;
-          const cleanOutput = stdout.trim();
-          const cleanErr = stderr.trim();
-
-          const ok = code === 0 && !timedOut;
-          resolve({
-            ok,
-            cliId,
-            cliName: 'Codex CLI',
-            prompt,
-            output: cleanOutput || (ok ? 'CODEX_OK' : ''),
-            error: timedOut ? `Codex CLI 超时 (${timeoutMs}ms)` : !ok ? (cleanErr || cleanOutput || `Exit code ${code}`) : undefined,
-            exitCode: code,
-            durationMs,
-            modelUsed: model,
-            timestamp,
-            verified: ok && (cleanOutput.includes('CODEX_OK') || cleanOutput.length > 0),
-            commandPreview: `${codexBin} exec -m ${model} -s read-only`,
-          });
-        });
-
-        child.on('error', (err) => {
-          clearTimeout(timer);
-          resolve({
-            ok: false,
-            cliId,
-            cliName: 'Codex CLI',
-            prompt,
-            output: '',
-            error: err.message,
-            durationMs: Date.now() - startTime,
-            modelUsed: model,
-            timestamp,
-            verified: false,
-            commandPreview: `${codexBin} exec`,
-          });
-        });
+      // 如果有 mock codex 或者直接通过 review 验证
+      const reviewResult = await reviewerAdapter.executeReview({
+        taskId: `probe-${adapter.id}-${Date.now()}`,
+        roundNumber: 0,
+        revision: 1,
+        model,
+        confirmedCwd: targetCwd,
+        taskPackageDir: targetCwd,
+        testRunsSummary: 'Health probe',
+        gitDiff: '',
+        verifierPrompt: prompt,
+        definedWorkerIds: ['worker-probe'],
+        timeoutMs,
       });
+
+      const ok = reviewResult.decision !== 'blocked';
+      return {
+        ok,
+        cliId: adapter.id,
+        cliName: adapter.name,
+        connectionType: adapter.connectionType || 'Reviewer Sandbox',
+        prompt,
+        output: reviewResult.summary || reviewResult.rawOutput || JSON.stringify(reviewResult, null, 2),
+        durationMs: reviewResult.durationMs || (Date.now() - startTime),
+        modelUsed: reviewResult.modelUsed || model,
+        timestamp,
+        verified: ok,
+        commandPreview: `${adapter.name} [${model}] -> ${adapter.connectionType}`,
+      };
     }
 
-    // 3. Node.js runtime probe
-    if (cliId === 'node') {
-      const prompt = params.prompt?.trim() || 'console.log("NODE_OK: " + process.version);';
-      const nodePath = resolveSupportedNode();
-
-      return new Promise<CliProbeResult>((resolve) => {
-        let stdout = '';
-        let stderr = '';
-        const child = spawn(nodePath, ['-e', prompt], {
-          cwd: targetCwd,
-          windowsHide: true,
-        });
-
-        const timer = setTimeout(() => {
-          child.kill('SIGKILL');
-        }, timeoutMs);
-
-        child.stdout.on('data', (d) => (stdout += d.toString()));
-        child.stderr.on('data', (d) => (stderr += d.toString()));
-
-        child.on('close', (code) => {
-          clearTimeout(timer);
-          const durationMs = Date.now() - startTime;
-          const ok = code === 0;
-          resolve({
-            ok,
-            cliId,
-            cliName: 'Node.js 运行时',
-            prompt,
-            output: stdout.trim(),
-            error: ok ? undefined : (stderr.trim() || `Exit code ${code}`),
-            exitCode: code,
-            durationMs,
-            timestamp,
-            verified: ok,
-            commandPreview: `${nodePath} -e "${prompt.slice(0, 30)}..."`,
-          });
-        });
-
-        child.on('error', (err) => {
-          clearTimeout(timer);
-          resolve({
-            ok: false,
-            cliId,
-            cliName: 'Node.js 运行时',
-            prompt,
-            output: '',
-            error: err.message,
-            durationMs: Date.now() - startTime,
-            timestamp,
-            verified: false,
-          });
-        });
-      });
-    }
-
-    // 4. Git CLI probe
-    if (cliId === 'git') {
-      const prompt = params.prompt?.trim() || 'status --short';
-      const args = prompt.split(/\s+/).filter(Boolean);
-
-      return new Promise<CliProbeResult>((resolve) => {
-        let stdout = '';
-        let stderr = '';
-        const child = spawn('git', args, {
-          cwd: targetCwd,
-          windowsHide: true,
-        });
-
-        const timer = setTimeout(() => {
-          child.kill('SIGKILL');
-        }, timeoutMs);
-
-        child.stdout.on('data', (d) => (stdout += d.toString()));
-        child.stderr.on('data', (d) => (stderr += d.toString()));
-
-        child.on('close', (code) => {
-          clearTimeout(timer);
-          const durationMs = Date.now() - startTime;
-          const ok = code === 0;
-          resolve({
-            ok,
-            cliId,
-            cliName: 'Git CLI',
-            prompt,
-            output: stdout.trim() || (ok ? '(Git clean status / output)' : ''),
-            error: ok ? undefined : (stderr.trim() || `Exit code ${code}`),
-            exitCode: code,
-            durationMs,
-            timestamp,
-            verified: ok,
-            commandPreview: `git ${args.join(' ')}`,
-          });
-        });
-
-        child.on('error', (err) => {
-          clearTimeout(timer);
-          resolve({
-            ok: false,
-            cliId,
-            cliName: 'Git CLI',
-            prompt,
-            output: '',
-            error: err.message,
-            durationMs: Date.now() - startTime,
-            timestamp,
-            verified: false,
-          });
-        });
-      });
-    }
-
-    throw new Error(`Unsupported CLI id for probe: '${cliId}'`);
+    throw new Error(`适配器 '${cliId}' 不支持执行探测`);
   }
 }
 
