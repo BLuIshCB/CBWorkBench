@@ -27,7 +27,9 @@ export class Logger {
       }
     }
 
-    if (level === 'ERROR') {
+    if (process.env.MCP_MODE === 'true' || process.env.IS_MCP === 'true') {
+      console.error(formatted);
+    } else if (level === 'ERROR') {
       console.error(formatted);
     } else if (level === 'WARN') {
       console.warn(formatted);

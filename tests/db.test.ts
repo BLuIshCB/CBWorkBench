@@ -69,6 +69,32 @@ assert.strictEqual(updatedTask?.status, TaskStatus.RUNNING);
 assert.strictEqual(updatedTask?.current_round, 1);
 assert.strictEqual(updatedTask?.current_stage, RoundStage.WORKER_DEV);
 
+// 4. Test deleteTask
+const deleteResult = testDb.deleteTask('task-test-001');
+assert.strictEqual(deleteResult, true);
+assert.strictEqual(testDb.getTask('task-test-001'), null);
+assert.strictEqual(testDb.getLatestRevision('task-test-001'), null);
+assert.strictEqual(testDb.getWorkerPrompts('task-test-001', 1).length, 0);
+
+// 5. Test deleteAllTasks
+testDb.createTask({
+  id: 'task-test-002',
+  task_key: 'test-2',
+  revision: 1,
+  title: 'Task 2',
+  target_cwd: 'D:\\Test',
+});
+testDb.createTask({
+  id: 'task-test-003',
+  task_key: 'test-3',
+  revision: 1,
+  title: 'Task 3',
+  target_cwd: 'D:\\Test',
+});
+const clearResult = testDb.deleteAllTasks();
+assert.ok(clearResult.deletedCount >= 2);
+assert.strictEqual(testDb.listTasks().length, 0);
+
 // Clean up
 try {
   fs.unlinkSync(testDbPath);

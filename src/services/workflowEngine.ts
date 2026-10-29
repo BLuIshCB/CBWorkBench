@@ -3,7 +3,7 @@ import { taskFileStore } from '../storage/fileStore.ts';
 import { GitService } from './gitService.ts';
 import { TestRunner, type TestCaseItem } from './testRunner.ts';
 import { WorkBuddyClient } from './workbuddyClient.ts';
-import { CodexVerifier, type VerificationOutput } from './codexVerifier.ts';
+import { adapterRegistry } from '../adapters/registry.ts';
 import { TaskStatus, RoundStage, DEFAULT_BUDGET_MAX_ROUNDS, DEFAULT_BUDGET_TIMEOUT_SECONDS } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
 
@@ -30,7 +30,16 @@ export class WorkflowEngine {
   /**
    * Called by Web UI to manually confirm and start a task (Gate 2).
    */
-  async confirmAndStartTask(taskId: string, confirmedCwd?: string): Promise<{ success: boolean; message: string }> {
+  async confirmAndStartTask(
+    taskId: string,
+    confirmedCwd?: string,
+    options?: {
+      workerExecutor?: string;
+      workerModel?: string;
+      reviewerExecutor?: string;
+      reviewerModel?: string;
+    }
+  ): Promise<{ success: boolean; message: string }> {
     const task = db.getTask(taskId);
     if (!task) {
       return { success: false, message: `Task not found: ${taskId}` };
@@ -52,13 +61,19 @@ export class WorkflowEngine {
       return { success: false, message: `Invalid workspace path: ${e.message}` };
     }
 
-    // Update confirmed cwd and git info in DB
+    // Update confirmed cwd, chosen executors and git info in DB
     db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
       confirmed_cwd: targetCwd,
       started_at: Date.now(),
+      worker_executor: options?.workerExecutor || task.worker_executor || 'workbuddy',
+      worker_model: options?.workerModel || task.worker_model || 'deepseek-v4-flash',
+      reviewer_executor: options?.reviewerExecutor || task.reviewer_executor || 'workbuddy',
+      reviewer_model: options?.reviewerModel || task.reviewer_model || 'deepseek-v4-flash',
     });
 
-    logger.info(`[WorkflowEngine] Task ${taskId} confirmed and queued for execution. Target cwd: ${targetCwd}`);
+    logger.info(
+      `[WorkflowEngine] Task ${taskId} confirmed and queued. Worker: ${options?.workerExecutor || task.worker_executor || 'workbuddy'}(${options?.workerModel || task.worker_model || 'deepseek-v4-flash'}), Reviewer: ${options?.reviewerExecutor || task.reviewer_executor || 'workbuddy'}(${options?.reviewerModel || task.reviewer_model || 'deepseek-v4-flash'}), Target cwd: ${targetCwd}`
+    );
 
     // Trigger execution asynchronously
     setImmediate(() => {
@@ -89,6 +104,34 @@ export class WorkflowEngine {
 
     logger.info(`[WorkflowEngine] Stop requested for task ${taskId}`);
     return { success: true, message: 'Stop requested. Current operation will finish or terminate.' };
+  }
+
+  /**
+   * Handle task deletion during active execution.
+   */
+  handleTaskDeleted(taskId: string): void {
+    if (this.activeTaskId === taskId) {
+      try {
+        this.stopTask(taskId);
+      } catch {}
+      this.activeTaskId = null;
+      this.isProcessing = false;
+      logger.info(`[WorkflowEngine] Active task ${taskId} was deleted; reset engine state.`);
+    }
+  }
+
+  /**
+   * Handle all tasks deletion.
+   */
+  handleAllTasksDeleted(): void {
+    if (this.activeTaskId) {
+      try {
+        this.stopTask(this.activeTaskId);
+      } catch {}
+      this.activeTaskId = null;
+      this.isProcessing = false;
+      logger.info('[WorkflowEngine] All tasks cleared; reset engine state.');
+    }
   }
 
   /**
@@ -237,16 +280,25 @@ export class WorkflowEngine {
         }
 
         const fullWorkerPrompt = promptLines.join('\n');
+        const workerAdapter = adapterRegistry.getWorkerAdapter(task.worker_executor);
+        const workerModel = task.worker_model || workerAdapter.defaultModel;
+
         const roundDbId = db.createExecutionRound({
           task_id: taskId,
           round_number: currentRound,
           stage: RoundStage.WORKER_DEV,
           worker_id: nextWorkerId,
+          adapter_id: workerAdapter.id,
+          model_name: workerModel,
           input_prompt: fullWorkerPrompt,
         });
 
-        // Run Worker
-        const workerResult = await WorkBuddyClient.runTask({
+        // Run Worker via Adapter
+        const workerResult = await workerAdapter.executeDevTask({
+          taskId,
+          roundNumber: currentRound,
+          workerId: nextWorkerId,
+          model: workerModel,
           prompt: fullWorkerPrompt,
           cwd: confirmedCwd,
           timeoutMs: manifest.executionPolicy?.timeoutMs,
@@ -257,6 +309,7 @@ export class WorkflowEngine {
             status: 'failed',
             output_text: workerResult.output,
             error_message: workerResult.error,
+            duration_ms: workerResult.durationMs,
           });
 
           // If auth error or user stop
@@ -271,6 +324,7 @@ export class WorkflowEngine {
         db.completeExecutionRound(roundDbId, {
           status: 'passed',
           output_text: workerResult.output,
+          duration_ms: workerResult.durationMs,
         });
 
         // Save worker output artifact
@@ -344,8 +398,13 @@ export class WorkflowEngine {
           return;
         }
 
-        // --- STAGE 3: CODEX AUTOMATED ACCEPTANCE ---
-        logger.info(`[WorkflowEngine] Round ${currentRound}: Running Codex automated acceptance...`);
+        // --- STAGE 3: REVIEWER ACCEPTANCE (VIA ADAPTER, NO SANDBOX) ---
+        const reviewerAdapter = adapterRegistry.getReviewerAdapter(task.reviewer_executor);
+        const reviewerModel = task.reviewer_model || reviewerAdapter.defaultModel;
+
+        logger.info(
+          `[WorkflowEngine] Round ${currentRound}: Running acceptance review via ${reviewerAdapter.name} (model: ${reviewerModel})...`
+        );
         db.updateTaskStatus(taskId, TaskStatus.RUNNING, {
           current_stage: RoundStage.CODEX_ACCEPTANCE,
         });
@@ -354,7 +413,10 @@ export class WorkflowEngine {
           task_id: taskId,
           round_number: currentRound,
           stage: RoundStage.CODEX_ACCEPTANCE,
-          input_prompt: 'Codex CLI automated acceptance verification.',
+          worker_id: null,
+          adapter_id: reviewerAdapter.id,
+          model_name: reviewerModel,
+          input_prompt: `${reviewerAdapter.name} automated acceptance verification (model: ${reviewerModel}).`,
         });
 
         // Get diff snapshot
@@ -363,8 +425,10 @@ export class WorkflowEngine {
           .map((t) => `Test ${t.testCaseId} [${t.command}]: Exit code ${t.exitCode}`)
           .join('\n');
 
-        const verification = await CodexVerifier.verify({
+        const verification = await reviewerAdapter.executeReview({
           taskId,
+          roundNumber: currentRound,
+          model: reviewerModel,
           revision: revisionRecord.revision,
           confirmedCwd,
           taskPackageDir: taskFileStore.getRevisionDir(taskId, revisionRecord.revision),
@@ -392,11 +456,12 @@ export class WorkflowEngine {
             status: 'blocked',
             output_text: verification.summary,
             issues_json: JSON.stringify(verification.issues),
+            duration_ms: verification.durationMs,
           });
           db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
-            blocked_reason: `Codex acceptance blocked: ${verification.summary}`,
+            blocked_reason: `Reviewer acceptance blocked: ${verification.summary}`,
           });
-          logger.warn(`[WorkflowEngine] Task ${taskId} blocked by Codex: ${verification.summary}`);
+          logger.warn(`[WorkflowEngine] Task ${taskId} blocked by Reviewer: ${verification.summary}`);
           return;
         }
 
@@ -405,9 +470,10 @@ export class WorkflowEngine {
             status: 'failed',
             output_text: verification.summary,
             issues_json: JSON.stringify(verification.issues),
+            duration_ms: verification.durationMs,
           });
 
-          // Find target worker assigned by Codex or default
+          // Find target worker assigned by Reviewer or default
           const firstIssue = verification.issues[0];
           if (firstIssue?.targetWorkerId && definedWorkerIds.includes(firstIssue.targetWorkerId)) {
             nextWorkerId = firstIssue.targetWorkerId;
@@ -419,14 +485,15 @@ export class WorkflowEngine {
             .map((i) => `Issue ${i.id}: ${i.description}\nEvidence: ${i.evidence || 'N/A'}`)
             .join('\n\n');
 
-          logger.info(`[WorkflowEngine] Codex rejected (needs_changes). Assigned to ${nextWorkerId}. Cycling to next round.`);
+          logger.info(`[WorkflowEngine] Reviewer rejected (needs_changes). Assigned to ${nextWorkerId}. Cycling to next round.`);
           continue;
         }
 
-        // --- STAGE 4: CODEX PASSED -> TRANSITION TO FINAL HUMAN REVIEW (GATE 3) ---
+        // --- STAGE 4: REVIEWER PASSED -> TRANSITION TO FINAL HUMAN REVIEW (GATE 3) ---
         db.completeExecutionRound(codexRoundDbId, {
           status: 'passed',
           output_text: verification.summary,
+          duration_ms: verification.durationMs,
         });
 
         logger.info(`[WorkflowEngine] Codex acceptance passed! Transitioning task ${taskId} to HUMAN_REVIEW (Gate 3).`);

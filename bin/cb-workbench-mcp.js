@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+process.env.MCP_MODE = 'true';
+// In MCP stdio mode, ensure stdout is strictly reserved for JSON-RPC messages.
+console.log = (...args) => console.error(...args);
+
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

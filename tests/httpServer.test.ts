@@ -77,6 +77,60 @@ try {
   });
   assert.strictEqual(invalidReviewRes.status, 400);
 
+  // 6.1 Test Delete Single Task API
+  const deleteRes = await fetch(`${baseUrl}/api/tasks/${testTaskId}`, {
+    method: 'DELETE',
+  });
+  assert.strictEqual(deleteRes.status, 200);
+  const deleteData = await deleteRes.json();
+  assert.strictEqual(deleteData.success, true);
+  assert.strictEqual(db.getTask(testTaskId), null);
+
+  // 6.2 Test Clear All API with dummy tasks
+  const dummyId = `http-dummy-${Date.now()}`;
+  db.createTask({
+    id: dummyId,
+    task_key: 'dummy-task',
+    revision: 1,
+    title: 'Dummy Task',
+    target_cwd: process.cwd(),
+  });
+  const clearRes = await fetch(`${baseUrl}/api/tasks/clear-all`, {
+    method: 'POST',
+  });
+  assert.strictEqual(clearRes.status, 200);
+  const clearData = await clearRes.json();
+  assert.strictEqual(clearData.success, true);
+  assert.ok(typeof clearData.deletedCount === 'number');
+  assert.strictEqual(db.getTask(dummyId), null);
+
+  // 7. Runtime Static Route & APIs
+  const runtimePageRes = await fetch(`${baseUrl}/runtime`);
+  assert.strictEqual(runtimePageRes.status, 200);
+  const runtimeHtml = await runtimePageRes.text();
+  assert.ok(runtimeHtml.includes('CBWorkBench'));
+
+  const clisRes = await fetch(`${baseUrl}/api/runtime/clis`);
+  assert.strictEqual(clisRes.status, 200);
+  const clisData = await clisRes.json();
+  assert.strictEqual(clisData.success, true);
+  assert.ok(Array.isArray(clisData.clis));
+  assert.ok(clisData.clis.some((c: any) => c.id === 'node'));
+
+  const probeRes = await fetch(`${baseUrl}/api/runtime/probe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      cliId: 'node',
+      prompt: 'console.log("SERVER_PROBE_OK")',
+    }),
+  });
+  assert.strictEqual(probeRes.status, 200);
+  const probeData = await probeRes.json();
+  assert.strictEqual(probeData.success, true);
+  assert.strictEqual(probeData.result.ok, true);
+  assert.strictEqual(probeData.result.output, 'SERVER_PROBE_OK');
+
   console.log('✅ httpServer.test.ts passed successfully!');
 } finally {
   await new Promise<void>((resolve) => {

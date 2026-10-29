@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { db } from '../storage/db.ts';
 import { taskFileStore } from '../storage/fileStore.ts';
 import { GitService } from '../services/gitService.ts';
+import { workflowEngine } from '../services/workflowEngine.ts';
 import { DEFAULT_PORT, DEFAULT_HOST, TaskStatus } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
 
@@ -310,6 +311,44 @@ export function createWorkbenchMcpServer(): McpServer {
                 diffSnapshot: diff,
                 testRuns,
                 latestAcceptance,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // 5. Tool: workbench_delete_task
+  server.tool(
+    'workbench_delete_task',
+    '从工作台中删除指定任务，一并删除该任务相关的方案和文件。',
+    {
+      task_id: z.string().describe('要删除的任务 ID'),
+    },
+    async (args) => {
+      const task = db.getTask(args.task_id);
+      if (!task) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `未找到任务: ${args.task_id}` }],
+        };
+      }
+      workflowEngine.handleTaskDeleted(args.task_id);
+      db.deleteTask(args.task_id);
+      taskFileStore.deleteTaskFiles(args.task_id);
+      logger.info(`[WorkbenchMCP] Task deleted: ${args.task_id}`);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                taskId: args.task_id,
+                message: `任务 ${args.task_id} 及其相关方案和文件已成功删除`,
               },
               null,
               2

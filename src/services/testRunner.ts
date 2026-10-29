@@ -59,11 +59,28 @@ export class TestRunner {
 
     if (items.length > 0) return items;
 
-    // 2. Parse from testsMd markdown blocks:
-    // Looks for:
-    // `command` or code blocks with commands or lines like:
-    // - 命令: `npm test` or **执行命令**: `node ...`
-    const regex = /(?:命令|执行命令|Command|cmd)\s*[:：]\s*`([^`]+)`/gi;
+    // 2. Parse from testsMd markdown sections (e.g. "### TC-AUTO-01: ..." and "- **执行命令**: `...`")
+    const sectionRegex = /###\s+([A-Za-z0-9_-]+)(?::\s*([^\n]+))?([\s\S]*?)(?=(?:###|$))/g;
+    let secMatch: RegExpExecArray | null;
+    while ((secMatch = sectionRegex.exec(testsMd)) !== null) {
+      const tcId = secMatch[1].trim();
+      const tcName = secMatch[2]?.trim();
+      const tcBody = secMatch[3] || '';
+      const cmdMatch = tcBody.match(/(?:\*{0,2})(?:命令|执行命令|Command|cmd)(?:\*{0,2})\s*[:：]\s*`([^`\r\n]+)`/i);
+      if (cmdMatch) {
+        items.push({
+          id: tcId,
+          name: tcName,
+          command: cmdMatch[1].trim(),
+          isRequired: true,
+        });
+      }
+    }
+
+    if (items.length > 0) return items;
+
+    // 3. Fallback: line-by-line regex with support for markdown bold formatting
+    const regex = /(?:\*{0,2})(?:命令|执行命令|Command|cmd)(?:\*{0,2})\s*[:：]\s*`([^`\r\n]+)`/gi;
     let match: RegExpExecArray | null;
     let count = 1;
     while ((match = regex.exec(testsMd)) !== null) {

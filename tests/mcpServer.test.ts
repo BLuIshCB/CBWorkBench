@@ -18,11 +18,12 @@ try {
   const toolsResult = await client.listTools();
   const toolNames = toolsResult.tools.map((t) => t.name);
 
-  assert.strictEqual(toolNames.length, 4);
+  assert.strictEqual(toolNames.length, 5);
   assert.ok(toolNames.includes('workbench_submit_task'));
   assert.ok(toolNames.includes('workbench_revise_task'));
   assert.ok(toolNames.includes('workbench_get_task_status'));
   assert.ok(toolNames.includes('workbench_get_task_artifacts'));
+  assert.ok(toolNames.includes('workbench_delete_task'));
 
   // Strict Gate check: MCP MUST NOT have start or approve tools
   assert.strictEqual(toolNames.some((n) => n.includes('start') || n.includes('confirm')), false);
@@ -94,6 +95,15 @@ try {
   assert.strictEqual(artifactsData.taskId, taskId);
   assert.strictEqual(artifactsData.revision, 2);
   assert.ok(artifactsData.diffSnapshot !== undefined);
+
+  // 6. Delete task via MCP
+  const deleteRes = await client.callTool({
+    name: 'workbench_delete_task',
+    arguments: { task_id: taskId },
+  });
+  const deleteData = JSON.parse((deleteRes.content as any)[0].text);
+  assert.strictEqual(deleteData.success, true);
+  assert.strictEqual(deleteData.taskId, taskId);
 
   console.log('✅ mcpServer.test.ts passed successfully!');
 } finally {

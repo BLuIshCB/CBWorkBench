@@ -6,6 +6,8 @@ import { db } from '../storage/db.ts';
 import { taskFileStore } from '../storage/fileStore.ts';
 import { GitService } from '../services/gitService.ts';
 import { workflowEngine } from '../services/workflowEngine.ts';
+import { adapterRegistry } from '../adapters/registry.ts';
+import { runtimeService } from '../services/runtimeService.ts';
 import {
   DEFAULT_PORT,
   DEFAULT_HOST,
@@ -51,7 +53,7 @@ export function sendJson(res: http.ServerResponse, statusCode: number, data: any
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(jsonStr),
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   });
   res.end(jsonStr);
@@ -82,7 +84,7 @@ export function createHttpServer(): http.Server {
     if (method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type',
       });
       res.end();
@@ -95,6 +97,47 @@ export function createHttpServer(): http.Server {
         const statusFilter = url.searchParams.get('status') as TaskStatus | undefined;
         const tasks = db.listTasks(statusFilter);
         sendJson(res, 200, { success: true, tasks });
+        return;
+      }
+
+      // Clear all tasks and associated files
+      if (
+        (pathname === '/api/tasks/clear-all' && method === 'POST') ||
+        (pathname === '/api/tasks' && method === 'DELETE')
+      ) {
+        workflowEngine.handleAllTasksDeleted();
+        const { deletedCount } = db.deleteAllTasks();
+        taskFileStore.deleteAllTaskFiles();
+        logger.info(`[HttpServer] Cleared all tasks (${deletedCount} tasks) and deleted associated files`);
+        sendJson(res, 200, {
+          success: true,
+          message: `已成功清空所有任务（共 ${deletedCount} 个）及其相关方案和文件`,
+          deletedCount,
+        });
+        return;
+      }
+
+      // Delete single task and associated files
+      const deleteTaskMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)(\/delete)?$/);
+      if (
+        deleteTaskMatch &&
+        (method === 'DELETE' || (method === 'POST' && pathname.endsWith('/delete')))
+      ) {
+        const taskId = deleteTaskMatch[1];
+        const task = db.getTask(taskId);
+        if (!task) {
+          sendJson(res, 404, { success: false, message: `Task not found: ${taskId}` });
+          return;
+        }
+
+        workflowEngine.handleTaskDeleted(taskId);
+        db.deleteTask(taskId);
+        taskFileStore.deleteTaskFiles(taskId);
+        logger.info(`[HttpServer] Deleted task ${taskId} and its files`);
+        sendJson(res, 200, {
+          success: true,
+          message: `任务 ${taskId} 及其相关方案和文件已成功删除`,
+        });
         return;
       }
 
@@ -141,7 +184,12 @@ export function createHttpServer(): http.Server {
       if (confirmStartMatch && method === 'POST') {
         const taskId = confirmStartMatch[1];
         const body = await parseJsonBody(req);
-        const result = await workflowEngine.confirmAndStartTask(taskId, body.confirmed_cwd);
+        const result = await workflowEngine.confirmAndStartTask(taskId, body.confirmed_cwd, {
+          workerExecutor: body.worker_executor,
+          workerModel: body.worker_model,
+          reviewerExecutor: body.reviewer_executor,
+          reviewerModel: body.reviewer_model,
+        });
         sendJson(res, result.success ? 200 : 400, result);
         return;
       }
@@ -167,6 +215,42 @@ export function createHttpServer(): http.Server {
         return;
       }
 
+      if (pathname === '/api/runtime/clis' && method === 'GET') {
+        const clis = await runtimeService.listConfiguredClis();
+        sendJson(res, 200, { success: true, clis });
+        return;
+      }
+
+      if (pathname === '/api/runtime/probe' && method === 'POST') {
+        const body = await parseJsonBody(req);
+        if (!body.cliId) {
+          sendJson(res, 400, { success: false, message: 'cliId is required' });
+          return;
+        }
+        try {
+          const result = await runtimeService.probeCli({
+            cliId: body.cliId,
+            prompt: body.prompt,
+            model: body.model,
+            timeoutMs: body.timeoutMs,
+            cwd: body.cwd,
+          });
+          sendJson(res, 200, { success: true, result });
+        } catch (err: any) {
+          sendJson(res, 500, { success: false, message: err?.message || 'Probe execution failed' });
+        }
+        return;
+      }
+
+      if (pathname === '/api/system/executors' && method === 'GET') {
+        sendJson(res, 200, {
+          success: true,
+          workers: adapterRegistry.listWorkers(),
+          reviewers: adapterRegistry.listReviewers(),
+        });
+        return;
+      }
+
       if (pathname === '/api/system/status' && method === 'GET') {
         let nodeExec = '';
         try {
@@ -189,7 +273,7 @@ export function createHttpServer(): http.Server {
       }
 
       // Static UI Files
-      if (pathname === '/' || pathname.startsWith('/tasks/')) {
+      if (pathname === '/' || pathname === '/runtime' || pathname.startsWith('/tasks/')) {
         sendFile(res, path.join(UI_DIR, 'index.html'), 'text/html');
         return;
       }
@@ -218,6 +302,13 @@ export async function startServer(
   port: number = DEFAULT_PORT,
   host: string = DEFAULT_HOST
 ): Promise<http.Server> {
+  process.on('uncaughtException', (err) => {
+    logger.error('[App] Uncaught exception:', err);
+  });
+  process.on('unhandledRejection', (reason) => {
+    logger.error('[App] Unhandled promise rejection:', reason);
+  });
+
   const server = createHttpServer();
 
   return new Promise((resolve, reject) => {

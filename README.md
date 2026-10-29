@@ -64,6 +64,69 @@ CBWorkBench 内置跨运行时自检测引擎（`nodeResolver.js`）：
 npm install
 ```
 
+### WorkBuddy 适配器与登录诊断
+
+Worker 和 Reviewer 共用 `WorkBuddyAdapter`。默认 `CB_WORKBUDDY_BACKEND=auto`：优先连接
+`workbuddy-desktop`，连接或工具检查失败且尚未派发任务时才尝试 `workbuddy-cli`。
+任务已经派发后不会自动换后端重跑，防止重复改动工作区。可显式设为 `desktop` 或 `cli`。
+
+适配器从 `%CODEX_HOME%/config.toml`（默认 `~/.codex/config.toml`）读取对应 MCP 表中的
+`command`、`args`、`cwd`、`env`，不再从其他服务误取 `server.js`。支持普通/字面量字符串、
+多行字符串数组和 `enabled`；不支持的配置语法会明确报错。代理环境保持原配置，进程中显式
+设置的 `WB_*`、`WORKBUDDY_*`、`CODEBUDDY_*` 优先于 MCP 配置。
+
+也可设置 `CB_WORKBUDDY_MCP_CONFIG` 指向独立 JSON 文件，避免依赖 Codex 配置：
+
+```json
+{
+  "desktop": {
+    "command": "C:/path/to/python.exe",
+    "args": ["-u", "C:/path/to/Codex-WorkBuddy-Desktop-Bridge/launch.py"],
+    "cwd": "C:/path/to/tasks",
+    "env": { "WORKBUDDY_CONFIG_DIR": "C:/Users/your-name/.workbuddy" }
+  },
+  "cli": {
+    "command": "C:/path/to/node.exe",
+    "args": ["C:/path/to/workbuddy-mcp/server.js"],
+    "env": {
+      "WB_COMMAND": "C:/path/to/node.exe",
+      "WB_CLI_SCRIPT": "C:/path/to/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy",
+      "CODEBUDDY_CONFIG_DIR": "C:/Users/your-name/.workbuddy"
+    }
+  }
+}
+```
+
+桌面模式依赖已安装的 `Codex-WorkBuddy-Desktop-Bridge` 及其 Python 依赖。本项目的兼容启动器
+在当前进程中加载桥接器，支持空闲桌面尚无 ACP Host 的情况、仅包含 `lite-wb` 的安装包，并
+保留底层拒绝原因。任务以 `port=0` 请求 sidecar 分配端口，触发原生加密凭据握手；固定端口
+会绕过该握手，导致已有登录态仍因 `missing-key` 被当成未登录。适配器不读取或复制认证文件、
+令牌或加密密钥，也不修改桥接器安装目录。该兼容层基于现有桥接器内部接口，升级桥接器后
+应重新运行真实验证；`CB_WORKBUDDY_IDLE_COMPAT=false` 可使用原始启动方式。
+
+```powershell
+# 只验证 MCP 工具和桌面 sidecar 连接，不证明模型登录态有效
+node bin/workbuddy.js status
+
+# 真实调用，只要求返回标记；退出码 0 且 verified=true 才表示执行成功
+node bin/workbuddy.js verify
+
+# 完整 CLI 的交互式登录，使用任务相同的配置目录
+node bin/workbuddy.js login
+
+# 真实 Worker 写文件、Reviewer 验收及错误产物退回验证（只修改 data 下新建的测试目录）
+node bin/test-runner.js tests/workbuddyLiveSmoke.ts
+```
+
+如果返回 `AUTH_REQUIRED`，需要完成登录或修复当前配置目录对应的登录态。
+桌面端登录不保证独立 CLI 登录态可用。仅含 `lite-wb` 的 WorkBuddy 安装没有交互式 CLI，
+登录命令会明确提示使用桌面端或完整 CLI，不能用强制 bundle 环境变量补出缺失的交互界面。
+鉴权失败、超时、取消、协议异常都会如实返回；Reviewer 仅接受符合结构的 JSON 判定，
+不会根据测试摘要或“通过”等文本自动放行，也不会生成替代业务产物。
+
+修复配置或登录后重启工作台进程加载新代码，再由用户在控制台重新确认启动受阻任务。
+诊断命令不会启动、完成或审核已有业务任务。
+
 ### 3. 启动 Web 控制台与后台服务
 ```bash
 npm start
@@ -126,6 +189,9 @@ CBWorkBench 提供了标准 Stdio MCP 服务 `bin/cb-workbench-mcp.js`。
    - 原生语法着色（绿增红删），展示项目自任务启动以来的代码全量变动。
 6. **执行轮次与详细材料查阅**：
    - 折叠时间轴查阅每一轮的 Worker 提示词、Worker 实际输出、自动化测试输出、Codex 判定理由及全量任务材料。
+7. **运行环境与 CLI 探测页面 (`/runtime`)**：
+   - 查看工作台检测到的所有 CLI（WorkBuddy Desktop 桌面桥接、WorkBuddy CLI MCP、Codex CLI、Node.js 运行时与 Git）。
+   - **交互式提示词探测控制台**：支持自选 CLI 与模型，使用简单提示词或一键预设（标准回声、PONG、身份问答等）即时探测连通性，秒级输出回包响应、耗时指标及鉴权诊断建议。
 
 ---
 
@@ -134,6 +200,8 @@ CBWorkBench 提供了标准 Stdio MCP 服务 `bin/cb-workbench-mcp.js`。
 | 端点 | 方法 | 说明 |
 | :--- | :---: | :--- |
 | `/api/system/status` | `GET` | 查询工作台系统状态、Node 版本、Worker/Verifier 模型及并发占用 |
+| `/api/runtime/clis` | `GET` | 查询当前工作台检测并配置的各类 CLI 工具与就绪状态 |
+| `/api/runtime/probe` | `POST` | 使用自定义或预设提示词对指定 CLI 发起可用性与连通性即时探测 |
 | `/api/tasks` | `GET` | 获取任务列表（支持 `?status=` 过滤） |
 | `/api/tasks/:id` | `GET` | 获取指定任务详情、版本材料、轮次、测试记录、验收记录与 Diff 快照 |
 | `/api/tasks/:id/confirm-start` | `POST` | 门禁二：手动确认并启动任务（可选入参 `{ confirmed_cwd }`） |

@@ -98,6 +98,25 @@ export class TaskFileStore {
     return fs.readFileSync(filePath, 'utf8');
   }
 
+  deleteTaskFiles(taskId: string): boolean {
+    const taskDir = path.join(this.baseDir, taskId);
+    if (fs.existsSync(taskDir)) {
+      fs.rmSync(taskDir, { recursive: true, force: true });
+      return true;
+    }
+    return false;
+  }
+
+  deleteAllTaskFiles(): void {
+    if (fs.existsSync(this.baseDir)) {
+      const entries = fs.readdirSync(this.baseDir);
+      for (const entry of entries) {
+        const fullPath = path.join(this.baseDir, entry);
+        fs.rmSync(fullPath, { recursive: true, force: true });
+      }
+    }
+  }
+
   static computeSha256(content: string): string {
     return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
   }

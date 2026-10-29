@@ -26,6 +26,10 @@ export interface TaskRecord {
   updated_at: number;
   started_at: number | null;
   completed_at: number | null;
+  worker_executor?: string;
+  worker_model?: string;
+  reviewer_executor?: string;
+  reviewer_model?: string;
 }
 
 export interface TaskRevisionRecord {
@@ -56,6 +60,9 @@ export interface ExecutionRoundRecord {
   round_number: number;
   stage: RoundStage;
   worker_id: string | null;
+  adapter_id?: string | null;
+  model_name?: string | null;
+  duration_ms?: number | null;
   input_prompt: string | null;
   output_text: string | null;
   issues_json: string | null;
@@ -111,6 +118,11 @@ export class WorkbenchDatabase {
       fs.mkdirSync(dir, { recursive: true });
     }
     this.db = new DatabaseSync(dbPath);
+    this.db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
+      PRAGMA synchronous = NORMAL;
+    `);
     this.initTables();
   }
 
@@ -137,7 +149,11 @@ export class WorkbenchDatabase {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         started_at INTEGER,
-        completed_at INTEGER
+        completed_at INTEGER,
+        worker_executor TEXT NOT NULL DEFAULT 'workbuddy',
+        worker_model TEXT NOT NULL DEFAULT 'deepseek-v4-flash',
+        reviewer_executor TEXT NOT NULL DEFAULT 'workbuddy',
+        reviewer_model TEXT NOT NULL DEFAULT 'deepseek-v4-flash'
       );
 
       CREATE TABLE IF NOT EXISTS task_revisions (
@@ -170,6 +186,9 @@ export class WorkbenchDatabase {
         round_number INTEGER NOT NULL,
         stage TEXT NOT NULL,
         worker_id TEXT,
+        adapter_id TEXT,
+        model_name TEXT,
+        duration_ms INTEGER,
         input_prompt TEXT,
         output_text TEXT,
         issues_json TEXT,
@@ -220,6 +239,25 @@ export class WorkbenchDatabase {
       CREATE INDEX IF NOT EXISTS idx_task_revisions_task_id ON task_revisions(task_id);
       CREATE INDEX IF NOT EXISTS idx_execution_rounds_task_id ON execution_rounds(task_id);
     `);
+
+    // Gracefully apply schema migrations for existing databases
+    const migrations = [
+      "ALTER TABLE tasks ADD COLUMN worker_executor TEXT NOT NULL DEFAULT 'workbuddy'",
+      "ALTER TABLE tasks ADD COLUMN worker_model TEXT NOT NULL DEFAULT 'deepseek-v4-flash'",
+      "ALTER TABLE tasks ADD COLUMN reviewer_executor TEXT NOT NULL DEFAULT 'workbuddy'",
+      "ALTER TABLE tasks ADD COLUMN reviewer_model TEXT NOT NULL DEFAULT 'deepseek-v4-flash'",
+      "ALTER TABLE execution_rounds ADD COLUMN adapter_id TEXT",
+      "ALTER TABLE execution_rounds ADD COLUMN model_name TEXT",
+      "ALTER TABLE execution_rounds ADD COLUMN duration_ms INTEGER",
+    ];
+
+    for (const sql of migrations) {
+      try {
+        this.db.exec(sql);
+      } catch {
+        // Column already exists or duplicate column; ignore
+      }
+    }
   }
 
   // --- Task Methods ---
@@ -236,20 +274,29 @@ export class WorkbenchDatabase {
     git_status?: string | null;
     budget_max_rounds?: number;
     budget_timeout_sec?: number;
+    worker_executor?: string;
+    worker_model?: string;
+    reviewer_executor?: string;
+    reviewer_model?: string;
   }): TaskRecord {
     const now = Date.now();
     const revision = data.revision ?? 1;
     const status = data.status ?? TaskStatus.PENDING_CONFIRM;
     const budgetRounds = data.budget_max_rounds ?? 10;
     const budgetTimeout = data.budget_timeout_sec ?? 1800;
+    const workerExecutor = data.worker_executor || 'workbuddy';
+    const workerModel = data.worker_model || 'deepseek-v4-flash';
+    const reviewerExecutor = data.reviewer_executor || 'workbuddy';
+    const reviewerModel = data.reviewer_model || 'deepseek-v4-flash';
 
     const stmt = this.db.prepare(`
       INSERT INTO tasks (
         id, task_key, revision, title, status, target_cwd,
         git_root, git_commit, git_status,
         budget_max_rounds, budget_timeout_sec, current_round,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        created_at, updated_at,
+        worker_executor, worker_model, reviewer_executor, reviewer_model
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -265,7 +312,11 @@ export class WorkbenchDatabase {
       budgetRounds,
       budgetTimeout,
       now,
-      now
+      now,
+      workerExecutor,
+      workerModel,
+      reviewerExecutor,
+      reviewerModel
     );
 
     return this.getTask(data.id)!;
@@ -297,6 +348,10 @@ export class WorkbenchDatabase {
       confirmed_cwd?: string;
       started_at?: number;
       completed_at?: number;
+      worker_executor?: string;
+      worker_model?: string;
+      reviewer_executor?: string;
+      reviewer_model?: string;
     }
   ): void {
     const now = Date.now();
@@ -330,6 +385,22 @@ export class WorkbenchDatabase {
     if (extra?.completed_at !== undefined) {
       updates.push('completed_at = ?');
       params.push(extra.completed_at);
+    }
+    if (extra?.worker_executor !== undefined) {
+      updates.push('worker_executor = ?');
+      params.push(extra.worker_executor);
+    }
+    if (extra?.worker_model !== undefined) {
+      updates.push('worker_model = ?');
+      params.push(extra.worker_model);
+    }
+    if (extra?.reviewer_executor !== undefined) {
+      updates.push('reviewer_executor = ?');
+      params.push(extra.reviewer_executor);
+    }
+    if (extra?.reviewer_model !== undefined) {
+      updates.push('reviewer_model = ?');
+      params.push(extra.reviewer_model);
     }
 
     params.push(id);
@@ -416,19 +487,25 @@ export class WorkbenchDatabase {
     round_number: number;
     stage: RoundStage;
     worker_id?: string | null;
+    adapter_id?: string | null;
+    model_name?: string | null;
+    duration_ms?: number | null;
     input_prompt?: string | null;
   }): number {
     const stmt = this.db.prepare(`
       INSERT INTO execution_rounds (
-        task_id, round_number, stage, worker_id, input_prompt,
+        task_id, round_number, stage, worker_id, adapter_id, model_name, duration_ms, input_prompt,
         status, started_at
-      ) VALUES (?, ?, ?, ?, ?, 'running', ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
     `);
     const result = stmt.run(
       data.task_id,
       data.round_number,
       data.stage,
       data.worker_id || null,
+      data.adapter_id || null,
+      data.model_name || null,
+      data.duration_ms || null,
       data.input_prompt || null,
       Date.now()
     );
@@ -442,21 +519,26 @@ export class WorkbenchDatabase {
       output_text?: string | null;
       issues_json?: string | null;
       error_message?: string | null;
+      duration_ms?: number | null;
     }
   ): void {
-    const stmt = this.db.prepare(`
-      UPDATE execution_rounds
-      SET status = ?, output_text = ?, issues_json = ?, error_message = ?, finished_at = ?
-      WHERE id = ?
-    `);
-    stmt.run(
+    const updates: string[] = ['status = ?', 'output_text = ?', 'issues_json = ?', 'error_message = ?', 'finished_at = ?'];
+    const params: unknown[] = [
       data.status,
       data.output_text || null,
       data.issues_json || null,
       data.error_message || null,
       Date.now(),
-      roundId
-    );
+    ];
+
+    if (data.duration_ms !== undefined && data.duration_ms !== null) {
+      updates.push('duration_ms = ?');
+      params.push(data.duration_ms);
+    }
+
+    params.push(roundId);
+    const sql = `UPDATE execution_rounds SET ${updates.join(', ')} WHERE id = ?`;
+    this.db.prepare(sql).run(...params);
   }
 
   getRounds(taskId: string): ExecutionRoundRecord[] {
@@ -570,6 +652,50 @@ export class WorkbenchDatabase {
       SELECT * FROM human_decisions WHERE task_id = ? ORDER BY decided_at ASC
     `);
     return stmt.all(taskId) as unknown as HumanDecisionRecord[];
+  }
+
+  // --- Delete Tasks ---
+
+  deleteTask(taskId: string): boolean {
+    const task = this.getTask(taskId);
+    if (!task) return false;
+
+    this.db.exec('BEGIN TRANSACTION;');
+    try {
+      this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+      this.db.prepare('DELETE FROM task_revisions WHERE task_id = ?').run(taskId);
+      this.db.prepare('DELETE FROM worker_prompts WHERE task_id = ?').run(taskId);
+      this.db.prepare('DELETE FROM execution_rounds WHERE task_id = ?').run(taskId);
+      this.db.prepare('DELETE FROM test_runs WHERE task_id = ?').run(taskId);
+      this.db.prepare('DELETE FROM acceptance_runs WHERE task_id = ?').run(taskId);
+      this.db.prepare('DELETE FROM human_decisions WHERE task_id = ?').run(taskId);
+      this.db.exec('COMMIT;');
+      return true;
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+  }
+
+  deleteAllTasks(): { deletedCount: number } {
+    const row = this.db.prepare('SELECT count(*) as count FROM tasks').get() as { count: number };
+    const deletedCount = row ? Number(row.count) : 0;
+
+    this.db.exec('BEGIN TRANSACTION;');
+    try {
+      this.db.exec('DELETE FROM tasks;');
+      this.db.exec('DELETE FROM task_revisions;');
+      this.db.exec('DELETE FROM worker_prompts;');
+      this.db.exec('DELETE FROM execution_rounds;');
+      this.db.exec('DELETE FROM test_runs;');
+      this.db.exec('DELETE FROM acceptance_runs;');
+      this.db.exec('DELETE FROM human_decisions;');
+      this.db.exec('COMMIT;');
+      return { deletedCount };
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
   }
 }
 

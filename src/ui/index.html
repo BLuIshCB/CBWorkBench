@@ -11,12 +11,20 @@
   <header class="navbar">
     <div class="nav-container">
       <div class="nav-brand">
-        <a href="/" class="brand-link">
+        <a href="/" class="brand-link" onclick="app.navigateTo('/'); return false;">
           <span class="brand-icon">⚡</span>
           <span class="brand-title">CBWorkBench</span>
           <span class="brand-subtitle">多 Agent 开发工作台</span>
         </a>
       </div>
+      <nav class="nav-menu">
+        <a href="/" class="nav-tab active" id="nav-tab-tasks" onclick="app.navigateTo('/'); return false;">
+          <span class="tab-icon">📋</span> 任务看板
+        </a>
+        <a href="/runtime" class="nav-tab" id="nav-tab-runtime" onclick="app.navigateTo('/runtime'); return false;">
+          <span class="tab-icon">⚙️</span> CLI 运行环境
+        </a>
+      </nav>
       <div class="nav-status" id="system-status-pills">
         <span class="status-pill pill-node" id="pill-node">Node 24 SQLite</span>
         <span class="status-pill pill-wb" id="pill-wb">WorkBuddy: deepseek-v4-flash</span>
@@ -35,7 +43,8 @@
           <p class="subtitle">单机串行执行 · WorkBuddy 开发修复 · Codex 自动验收 · 用户终审门禁</p>
         </div>
         <div class="action-group">
-          <button class="btn btn-secondary" onclick="app.refreshTaskList()">刷新列表</button>
+          <button class="btn btn-secondary" onclick="app.refreshTaskList()">🔄 刷新列表</button>
+          <button class="btn btn-danger" onclick="app.showClearAllModal()">🗑️ 一键删除所有任务</button>
         </div>
       </div>
 
@@ -76,6 +85,8 @@
             <span>任务标识：<code id="detail-task-key">key</code></span>
             <span>材料版本：<code id="detail-task-rev">r1</code></span>
             <span>轮次：<b id="detail-current-round">0</b> / <span id="detail-max-rounds">10</span></span>
+            <span>Worker：<code id="detail-worker-info">workbuddy</code></span>
+            <span>Reviewer：<code id="detail-reviewer-info">workbuddy</code></span>
             <span>提交时间：<span id="detail-created-at">--</span></span>
           </div>
         </div>
@@ -87,7 +98,43 @@
       <!-- Gate 2: Confirmation Card (Visible when pending_confirm) -->
       <div class="card confirmation-card" id="gate2-card" style="display: none;">
         <h3>门禁 2：用户确认并开始执行</h3>
-        <p class="desc">聊天中的同意、模型提交任务或 MCP 调用均不能代替此页面操作。请核对工作目录与代码基准后点击确认。</p>
+        <p class="desc">聊天中的同意、模型提交任务或 MCP 调用均不能代替此页面操作。请选择执行者与模型，核对工作目录后点击确认。</p>
+        
+        <!-- Executor & Model Selection -->
+        <div class="form-row-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; background: #0d1117; padding: 14px; border-radius: 6px; border: 1px solid var(--surface-border);">
+          <div class="form-group">
+            <label for="select-worker-executor" style="font-weight: 600; color: #58a6ff; display: block; margin-bottom: 6px; font-size: 13px;">
+              👨‍💻 WORKER (开发执行者)：
+            </label>
+            <div style="display: flex; gap: 8px;">
+              <select id="select-worker-executor" class="form-control" style="flex: 1;" onchange="app.handleWorkerExecutorChange()">
+                <option value="workbuddy">WorkBuddy (本地执行 · 无沙箱)</option>
+              </select>
+              <select id="select-worker-model" class="form-control" style="flex: 1;">
+                <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+                <option value="deepseek-chat">deepseek-chat</option>
+                <option value="deepseek-coder">deepseek-coder</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="select-reviewer-executor" style="font-weight: 600; color: #bc8cff; display: block; margin-bottom: 6px; font-size: 13px;">
+              ⚖️ REVIEWER (审查验收者)：
+            </label>
+            <div style="display: flex; gap: 8px;">
+              <select id="select-reviewer-executor" class="form-control" style="flex: 1;" onchange="app.handleReviewerExecutorChange()">
+                <option value="workbuddy">WorkBuddy (质量审查 · 无沙箱)</option>
+              </select>
+              <select id="select-reviewer-model" class="form-control" style="flex: 1;">
+                <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+                <option value="deepseek-chat">deepseek-chat</option>
+                <option value="deepseek-coder">deepseek-coder</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
         <div class="form-row">
           <label for="input-confirmed-cwd">执行目录 (工作台识别的真实项目路径)：</label>
           <div class="input-with-button">
@@ -106,7 +153,7 @@
           <span class="gate-icon">⚖️</span>
           <div>
             <h3>门禁 3：最终人工审核</h3>
-            <p>Codex 自动验收已通过！请核对以下代码差异与测试证据，给出最终人工审核结论。</p>
+            <p>Reviewer 自动验收已通过！请核对轮次执行与测试证据，给出最终人工审核结论。</p>
           </div>
         </div>
         <div class="review-actions">
@@ -122,12 +169,11 @@
         <button class="btn btn-sm btn-outline" onclick="app.handleResumeBlocked()">重试并继续</button>
       </div>
 
-      <!-- Tab Navigation for Detail Content -->
+      <!-- Tab Navigation for Detail Content (Diff Tab removed for streamlined UI) -->
       <div class="detail-tabs">
         <button class="dtab-btn active" onclick="app.setDetailTab('overview')">执行现场与进度</button>
-        <button class="dtab-btn" onclick="app.setDetailTab('diff')">代码变更 Diff</button>
-        <button class="dtab-btn" onclick="app.setDetailTab('rounds')">轮次与验证证据</button>
-        <button class="dtab-btn" onclick="app.setDetailTab('materials')">冻结任务材料</button>
+        <button class="dtab-btn" onclick="app.setDetailTab('rounds')">轮次与模型调试 (Debugger)</button>
+        <button class="dtab-btn" onclick="app.setDetailTab('materials')">冻结任务材料阅读</button>
       </div>
 
       <!-- Tab Content 1: Overview & Stages -->
@@ -139,7 +185,7 @@
             <div class="step-item" id="step-worker">
               <div class="step-icon">1</div>
               <div class="step-label">Worker 开发修复</div>
-              <div class="step-sub">deepseek-v4-flash</div>
+              <div class="step-sub" id="stepper-worker-sub">WorkBuddy (直连)</div>
             </div>
             <div class="step-arrow">→</div>
             <div class="step-item" id="step-tests">
@@ -150,8 +196,8 @@
             <div class="step-arrow">→</div>
             <div class="step-item" id="step-codex">
               <div class="step-icon">3</div>
-              <div class="step-label">Codex 自动验收</div>
-              <div class="step-sub">只读沙箱验证</div>
+              <div class="step-label">Reviewer 自动验收</div>
+              <div class="step-sub" id="stepper-reviewer-sub">无沙箱直连审查</div>
             </div>
             <div class="step-arrow">→</div>
             <div class="step-item" id="step-review">
@@ -186,45 +232,142 @@
         </div>
       </div>
 
-      <!-- Tab Content 2: Git Diff View -->
-      <div id="dtab-diff" class="dtab-content">
-        <div class="card">
-          <div class="diff-header">
-            <h4>工作区代码修改快照</h4>
-            <span class="diff-files-count" id="diff-changed-files">0 个修改文件</span>
-          </div>
-          <pre class="code-block diff-viewer" id="diff-code-content">暂无修改内容</pre>
-        </div>
-      </div>
-
-      <!-- Tab Content 3: Rounds & Evidence -->
+      <!-- Tab Content 2: Rounds & Model Debugger -->
       <div id="dtab-rounds" class="dtab-content">
         <div id="rounds-timeline" class="rounds-container">
-          <!-- Dynamically filled with round cards -->
+          <!-- Dynamically filled with debugger cards -->
         </div>
       </div>
 
-      <!-- Tab Content 4: Task Materials -->
+      <!-- Tab Content 3: Task Materials (Markdown Reading View) -->
       <div id="dtab-materials" class="dtab-content">
-        <div class="card material-card">
-          <h4>task.md (任务说明)</h4>
-          <div class="markdown-preview" id="mat-task-md">--</div>
+        <div class="card">
+          <div class="material-subtabs" style="display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid var(--surface-border); padding-bottom: 10px;">
+            <button class="mat-subtab-btn active" id="mat-btn-task" onclick="app.setMaterialSubtab('task')">task.md (任务说明)</button>
+            <button class="mat-subtab-btn" id="mat-btn-dev" onclick="app.setMaterialSubtab('dev')">development.md (开发清单)</button>
+            <button class="mat-subtab-btn" id="mat-btn-tests" onclick="app.setMaterialSubtab('tests')">tests.md (测试用例)</button>
+            <button class="mat-subtab-btn" id="mat-btn-acceptance" onclick="app.setMaterialSubtab('acceptance')">acceptance.md (验收标准)</button>
+            <button class="mat-subtab-btn" id="mat-btn-worker" onclick="app.setMaterialSubtab('worker')">Worker 独立提示词</button>
+          </div>
+          <div class="markdown-body" id="mat-rendered-content" style="min-height: 240px; padding: 12px 16px;">
+            <!-- Rendered rich markdown HTML -->
+          </div>
         </div>
-        <div class="card material-card">
-          <h4>development.md (开发清单)</h4>
-          <div class="markdown-preview" id="mat-dev-md">--</div>
+      </div>
+    </section>
+
+    <!-- View 3: Runtime & CLI Diagnostics View -->
+    <section id="view-runtime" class="view-section" style="display: none;">
+      <div class="section-header">
+        <div class="title-group">
+          <h2>运行环境与 CLI 探测</h2>
+          <p class="subtitle">查看当前已配置的各类 CLI 协同工具、版本与配置来源，支持即时发送提示词探测可用性</p>
         </div>
-        <div class="card material-card">
-          <h4>tests.md (测试用例与标准)</h4>
-          <div class="markdown-preview" id="mat-tests-md">--</div>
+        <div class="action-group">
+          <button class="btn btn-secondary" onclick="app.fetchRuntimeClis()">刷新 CLI 配置</button>
         </div>
-        <div class="card material-card">
-          <h4>acceptance.md (验收标准)</h4>
-          <div class="markdown-preview" id="mat-acceptance-md">--</div>
+      </div>
+
+      <!-- Quick Summary Row -->
+      <div class="runtime-summary-bar">
+        <div class="summary-stat-item">
+          <span class="stat-label">已检测 CLI 工具</span>
+          <span class="stat-value" id="runtime-stat-total">--</span>
         </div>
-        <div class="card material-card">
-          <h4>Worker 独立提示词</h4>
-          <div id="mat-worker-prompts">--</div>
+        <div class="summary-stat-item">
+          <span class="stat-label">Worker / Reviewer</span>
+          <span class="stat-value text-blue" id="runtime-stat-wb">WorkBuddy</span>
+        </div>
+        <div class="summary-stat-item">
+          <span class="stat-label">Verifier 验收工具</span>
+          <span class="stat-value text-purple" id="runtime-stat-codex">Codex CLI</span>
+        </div>
+        <div class="summary-stat-item">
+          <span class="stat-label">系统执行引擎</span>
+          <span class="stat-value text-green" id="runtime-stat-node">Node 24 (SQLite)</span>
+        </div>
+      </div>
+
+      <!-- Configured CLIs Grid -->
+      <div class="runtime-section-title">
+        <h3>已配置的 CLI 与系统工具清单</h3>
+        <span class="badge badge-secondary" id="runtime-cli-count">加载中...</span>
+      </div>
+      <div id="runtime-cli-grid" class="runtime-cli-grid">
+        <div class="loading-state">正在探测已配置的 CLI 工具...</div>
+      </div>
+
+      <!-- Interactive Prompt Probe Console -->
+      <div class="card probe-card" id="probe-console-card">
+        <div class="probe-header">
+          <div class="probe-title-group">
+            <h3>🎯 CLI 提示词即时探测控制台</h3>
+            <p class="desc">向选定的 Agent CLI 发送提示词，即时验证可执行性、会话连通性、身份凭证与模型回包能力。</p>
+          </div>
+        </div>
+
+        <div class="probe-form-grid">
+          <div class="form-group">
+            <label for="probe-target-cli">目标 CLI：</label>
+            <select id="probe-target-cli" class="form-control" onchange="app.handleProbeTargetChange()">
+              <!-- Injected by JS -->
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="probe-model-select">执行模型 (可选)：</label>
+            <select id="probe-model-select" class="form-control">
+              <!-- Injected by JS -->
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="probe-timeout-select">超时时限：</label>
+            <select id="probe-timeout-select" class="form-control">
+              <option value="15000">15 秒 (轻量探针)</option>
+              <option value="30000" selected>30 秒 (标准推荐)</option>
+              <option value="60000">60 秒 (慢速模型)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row" style="margin-top: 12px;">
+          <label for="probe-cwd-input">工作区执行目录 (CWD)：</label>
+          <input type="text" id="probe-cwd-input" class="form-control" placeholder="D:/CODE/..." />
+        </div>
+
+        <div class="prompt-preset-bar">
+          <span class="preset-label">快捷预设：</span>
+          <button type="button" class="preset-btn" onclick="app.setProbePreset('wb_echo')">⚡ 适配器标准回声</button>
+          <button type="button" class="preset-btn" onclick="app.setProbePreset('pong')">🏓 极简响应 (PONG)</button>
+          <button type="button" class="preset-btn" onclick="app.setProbePreset('codex')">⚖️ Codex 验收探测</button>
+          <button type="button" class="preset-btn" onclick="app.setProbePreset('identity')">🤖 身份与模型问答</button>
+        </div>
+
+        <div class="form-row" style="margin-top: 8px;">
+          <label for="probe-prompt-input">探测提示词 (Prompt)：</label>
+          <textarea id="probe-prompt-input" class="form-control prompt-textarea" rows="4" placeholder="输入简单的提示词用于探测..."></textarea>
+        </div>
+
+        <div class="probe-action-row">
+          <button id="btn-run-probe" class="btn btn-primary" onclick="app.runCliProbe()">
+            <span id="probe-btn-icon">🚀</span> <span id="probe-btn-text">发送提示词探测</span>
+          </button>
+          <span class="probe-hint" id="probe-exec-hint">探测仅测试通信协议与模型回包，不会对工作区代码造成破坏。</span>
+        </div>
+
+        <!-- Probe Output Result Box -->
+        <div id="probe-result-container" class="probe-result-container" style="display: none;">
+          <div class="result-topbar">
+            <div class="result-status-line">
+              <span class="badge" id="probe-result-badge">成功</span>
+              <span class="result-meta" id="probe-result-meta">耗时: --ms</span>
+            </div>
+            <button class="btn btn-sm btn-secondary" onclick="app.copyProbeOutput()">复制输出</button>
+          </div>
+          <div class="result-body">
+            <pre class="code-box" id="probe-output-box"></pre>
+          </div>
         </div>
       </div>
     </section>
@@ -244,6 +387,45 @@
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="app.closeRejectModal()">取消</button>
         <button class="btn btn-danger" onclick="app.confirmReject()">确认退回</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal for Clear All Confirmation (Two-step confirmation) -->
+  <div id="modal-clear-all" class="modal-backdrop" style="display: none;">
+    <div class="modal-card" style="max-width: 520px; border: 1px solid var(--danger);">
+      <div class="modal-header" style="border-bottom-color: rgba(218, 54, 51, 0.4);">
+        <h3 style="color: #ff7b72; display: flex; align-items: center; gap: 8px;">
+          <span>⚠️</span> 一键删除所有任务 (高危操作)
+        </h3>
+        <button class="close-btn" onclick="app.closeClearAllModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <p style="margin-bottom: 12px; color: #f0f6fc; font-weight: 500;">
+          您正在执行一键清空全部任务操作，该操作完全不可逆！
+        </p>
+        <div style="background: rgba(218, 54, 51, 0.1); border: 1px solid rgba(218, 54, 51, 0.3); padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; color: #ffa198;">
+          <p style="font-weight: 600; margin-bottom: 6px; color: #ff7b72;">确认后将一并清理以下全部内容：</p>
+          <ul style="padding-left: 18px; margin: 0; line-height: 1.6;">
+            <li>永久删除系统内<strong>所有开发任务</strong>与执行记录；</li>
+            <li>物理删除所有任务的<strong>方案文档与材料包</strong>（manifest, task.md, dev.md, tests.md, acceptance.md 等）；</li>
+            <li>物理删除 <code>data/tasks</code> 下所有<strong>磁盘目录与文件</strong>；</li>
+            <li>立即停止当前所有正在执行的后台回路。</li>
+          </ul>
+        </div>
+        
+        <div style="margin-top: 14px; padding: 12px; background: rgba(0, 0, 0, 0.25); border-radius: 6px; border: 1px solid var(--surface-border);">
+          <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; user-select: none; font-size: 13px; color: var(--text-main);">
+            <input type="checkbox" id="checkbox-confirm-clear" onchange="app.handleClearCheckboxChange()" style="margin-top: 3px; width: 16px; height: 16px; cursor: pointer;" />
+            <span><strong>二次确认</strong>：我已明确知晓此操作将彻底删除所有任务、方案文档和磁盘文件，并确认执行清空。</span>
+          </label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="app.closeClearAllModal()">取消</button>
+        <button class="btn btn-danger" id="btn-confirm-clear-all" disabled onclick="app.confirmClearAllTasks()">
+          确认彻底清空所有任务
+        </button>
       </div>
     </div>
   </div>
