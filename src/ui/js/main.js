@@ -392,16 +392,12 @@ export class App {
         const countEl = document.getElementById('runtime-cli-count');
         if (countEl) countEl.textContent = `共 ${data.clis.length} 个组件`;
 
-        const wbDesktop = data.clis.find((c) => c.id === 'workbuddy-desktop');
-        const wbCli = data.clis.find((c) => c.id === 'workbuddy-cli');
+        const wb = data.clis.find((c) => c.id === 'workbuddy');
         const wbEl = document.getElementById('runtime-stat-wb');
         if (wbEl) {
-          if (wbDesktop && wbDesktop.available) {
-            wbEl.textContent = '桌面 ACP 具名管道直连';
+          if (wb && wb.available) {
+            wbEl.textContent = 'Direct CLI (无会话持久化)';
             wbEl.className = 'stat-value text-blue';
-          } else if (wbCli && wbCli.available) {
-            wbEl.textContent = '命令行 Stdio MCP';
-            wbEl.className = 'stat-value text-purple';
           } else {
             wbEl.textContent = '待配置';
             wbEl.className = 'stat-value text-muted';
@@ -409,8 +405,8 @@ export class App {
         }
 
         const wbModelEl = document.getElementById('runtime-stat-wb-model');
-        if (wbModelEl && wbDesktop) {
-          wbModelEl.textContent = wbDesktop.defaultModel || 'deepseek-v4-flash';
+        if (wbModelEl && wb) {
+          wbModelEl.textContent = wb.defaultModel || 'deepseek-v4-flash';
         }
 
         const codexCli = data.clis.find((c) => c.id === 'codex');

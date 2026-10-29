@@ -1,136 +1,186 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 
-export type WorkBuddyBackend = 'desktop' | 'cli';
-const serverSchema = z.object({
-  command: z.string().min(1), args: z.array(z.string()).default([]),
-  cwd: z.string().optional(), env: z.record(z.string()).default({}),
-  enabled: z.boolean().optional(),
+export interface AgentCliConfig {
+  executable: string;
+  script?: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+}
+
+export interface WorkbenchCliConfigs {
+  workbuddy?: AgentCliConfig;
+  codex?: AgentCliConfig;
+}
+
+const agentCliSchema = z.object({
+  executable: z.string().min(1, 'executable 不能为空'),
+  script: z.string().optional(),
+  args: z.array(z.string()).optional(),
+  cwd: z.string().optional(),
+  env: z.record(z.string()).optional(),
 });
-export type WorkBuddyServerConfig = z.infer<typeof serverSchema>;
-export type WorkBuddyConfigs = Partial<Record<WorkBuddyBackend, WorkBuddyServerConfig>>;
 
-/** 只读取指定 MCP 表，避免从其他服务误取 server.js 或环境变量。 */
-export function parseWorkBuddyToml(content: string): WorkBuddyConfigs {
-  const result: Record<string, any> = {};
-  let backend = '';
-  let isEnv = false;
-  const lines = content.split(/\r?\n/);
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (line.startsWith('[')) {
-      const table = line.match(/^\[mcp_servers\.(?:"workbuddy-(desktop|cli)"|workbuddy-(desktop|cli))(\.env)?\]\s*(?:#.*)?$/);
-      backend = table ? table[1] || table[2] : '';
-      isEnv = !!table?.[3];
-      if (backend) result[backend] ??= { env: {} };
-      continue;
-    }
-    if (!backend || !line || line.startsWith('#')) continue;
-    const entry = line.match(/^("[^"\r\n]+"|[\w-]+)\s*=\s*(.*)$/);
-    if (!entry) throw new Error(`Unsupported WorkBuddy MCP configuration at line ${i + 1}`);
-    const key = entry[1].replace(/^"|"$/g, '');
-    if (!isEnv && !['command', 'args', 'cwd', 'enabled'].includes(key)) continue;
-    let value = entry[2];
-    if (value.trimStart().startsWith('[')) {
-      while (!/\]\s*(?:#.*)?$/.test(value) && i + 1 < lines.length) value += '\n' + lines[++i];
-    }
-    const parsed = parseValue(value);
-    if (isEnv) result[backend].env[key] = parsed;
-    else result[backend][key] = parsed;
+const workbenchCliConfigsSchema = z.object({
+  workbuddy: agentCliSchema.optional(),
+  codex: agentCliSchema.optional(),
+});
+
+/**
+ * 解析 CB_AGENT_CLI_CONFIG 独立配置文件
+ */
+export function resolveAgentCliConfigs(): WorkbenchCliConfigs {
+  if (process.env.CB_WORKBUDDY_MCP_CONFIG || process.env.CB_WORKBUDDY_BACKEND) {
+    throw new Error(
+      '检测到已废弃的配置项 CB_WORKBUDDY_MCP_CONFIG / CB_WORKBUDDY_BACKEND。当前工作台已全面采用 Direct CLI 任务分发，请迁移至 CB_AGENT_CLI_CONFIG 独立配置。'
+    );
   }
-  const configs: WorkBuddyConfigs = {};
-  for (const backend of ['desktop', 'cli'] as const) {
-    if (result[backend] && result[backend].enabled !== false) configs[backend] = serverSchema.parse(result[backend]);
+
+  const configFile = process.env.CB_AGENT_CLI_CONFIG;
+  if (configFile) {
+    if (!fs.existsSync(configFile)) {
+      throw new Error(`CB_AGENT_CLI_CONFIG 指定的配置文件不存在: '${configFile}'`);
+    }
+    let rawContent: string;
+    try {
+      rawContent = fs.readFileSync(configFile, 'utf8');
+    } catch (err: any) {
+      throw new Error(`无法读取 CB_AGENT_CLI_CONFIG 配置文件: ${err.message}`);
+    }
+
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(rawContent);
+    } catch (err: any) {
+      throw new Error(`CB_AGENT_CLI_CONFIG 配置文件包含无效 JSON: ${err.message}`);
+    }
+
+    const validation = workbenchCliConfigsSchema.safeParse(parsedJson);
+    if (!validation.success) {
+      throw new Error(`CB_AGENT_CLI_CONFIG 配置格式不符合规范: ${validation.error.message}`);
+    }
+
+    return validation.data;
   }
-  return configs;
+
+  return {};
 }
 
-// MCP 启动配置只需要字符串、字符串数组和 enabled；其他 TOML 语法显式报错。
-function parseValue(value: string): unknown {
-  let offset = 0;
-  const skip = () => {
-    while (offset < value.length) {
-      if (/\s/.test(value[offset])) offset++;
-      else if (value[offset] === '#') {
-        while (offset < value.length && value[offset] !== '\n') offset++;
-      } else break;
-    }
-  };
-  const string = () => {
-    skip();
-    const quote = value[offset++];
-    if (quote !== '"' && quote !== "'") throw new Error('Expected a quoted WorkBuddy MCP string');
-    let text = '';
-    while (offset < value.length) {
-      const char = value[offset++];
-      if (char === quote) return text;
-      if (char === '\\' && quote === '"') {
-        const escape = value[offset++];
-        const escapes: Record<string, string> = { b: '\b', t: '\t', n: '\n', f: '\f', r: '\r', '"': '"', '\\': '\\' };
-        if (escape === 'u' || escape === 'U') {
-          const length = escape === 'u' ? 4 : 8;
-          const hex = value.slice(offset, offset + length);
-          if (!new RegExp(`^[0-9a-fA-F]{${length}}$`).test(hex)) throw new Error('Invalid TOML unicode escape');
-          text += String.fromCodePoint(parseInt(hex, 16)); offset += length;
-        } else if (escape in escapes) text += escapes[escape];
-        else throw new Error('Invalid TOML string escape in WorkBuddy MCP configuration');
-      } else text += char;
-    }
-    throw new Error('Unterminated WorkBuddy MCP string');
-  };
-  skip();
-  let parsed: unknown;
-  if (value[offset] === '[') {
-    offset++; const args: string[] = []; skip();
-    while (value[offset] !== ']') {
-      args.push(string()); skip();
-      if (value[offset] === ',') { offset++; skip(); }
-      else if (value[offset] !== ']') throw new Error('Invalid WorkBuddy MCP args array');
-    }
-    offset++; parsed = args;
-  } else if (/^(true|false)\b/.test(value.slice(offset))) {
-    parsed = value.slice(offset).startsWith('true'); offset += parsed ? 4 : 5;
-  } else parsed = string();
-  skip();
-  if (offset !== value.length) throw new Error('Unsupported WorkBuddy MCP configuration value');
-  return parsed;
+/**
+ * 解析并获取 WorkBuddy CLI 的独立启动配置
+ */
+export function resolveWorkBuddyCliConfig(): AgentCliConfig {
+  const configs = resolveAgentCliConfigs();
+  if (configs.workbuddy) {
+    const wb = { ...configs.workbuddy };
+    wb.env = { ...process.env as Record<string, string>, ...wb.env };
+    applyLiteWbBundleDetection(wb);
+    return wb;
+  }
+
+  // 优先级 2：当前进程显式设置的环境变量 WB_COMMAND / WB_CLI_SCRIPT
+  if (process.env.WB_COMMAND || process.env.WB_CLI_SCRIPT) {
+    const wb: AgentCliConfig = {
+      executable: process.env.WB_COMMAND || process.execPath,
+      script: process.env.WB_CLI_SCRIPT,
+      env: { ...process.env as Record<string, string> },
+    };
+    applyLiteWbBundleDetection(wb);
+    return wb;
+  }
+
+  // 优先级 3：本机已核验的默认安装路径探测
+  const defaultScript = 'D:\\CODE\\TOOL\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy';
+  if (fs.existsSync(defaultScript)) {
+    const wb: AgentCliConfig = {
+      executable: process.execPath,
+      script: defaultScript,
+      env: { ...process.env as Record<string, string> },
+    };
+    applyLiteWbBundleDetection(wb);
+    return wb;
+  }
+
+  throw new Error(
+    '未找到 WorkBuddy CLI 启动入口。请设置 CB_AGENT_CLI_CONFIG 或 WB_COMMAND / WB_CLI_SCRIPT。'
+  );
 }
 
-/** 每次调用重新读取配置，登录和配置修复后不必清理静态缓存。 */
-export function resolveWorkBuddyConfigs(): WorkBuddyConfigs {
-  const configPath = process.env.CB_WORKBUDDY_MCP_CONFIG;
-  let configs: WorkBuddyConfigs;
-  if (configPath) {
-    configs = z.object({ desktop: serverSchema.optional(), cli: serverSchema.optional() })
-      .parse(JSON.parse(fs.readFileSync(configPath, 'utf8')));
-  } else {
-    const codexConfig = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml');
-    configs = fs.existsSync(codexConfig) ? parseWorkBuddyToml(fs.readFileSync(codexConfig, 'utf8')) : {};
+/**
+ * 为 lite-only 安装自动打上环境变量标记（不修改全局环境，仅子进程生效）
+ */
+function applyLiteWbBundleDetection(config: AgentCliConfig): void {
+  if (!config.script) return;
+  config.env ??= {};
+  if (config.env.CODEBUDDY_FORCE_LITE_WB_BUNDLE) return;
+
+  try {
+    const dist = path.resolve(path.dirname(config.script), '..', 'dist');
+    if (
+      fs.existsSync(path.join(dist, 'codebuddy-lite-wb.mjs')) &&
+      !fs.existsSync(path.join(dist, 'codebuddy-headless.js'))
+    ) {
+      config.env.CODEBUDDY_FORCE_LITE_WB_BUNDLE = '1';
+    }
+  } catch {}
+}
+
+/**
+ * 解析并获取 Codex CLI 的独立启动配置
+ */
+export function resolveCodexCliConfig(): AgentCliConfig {
+  const configs = resolveAgentCliConfigs();
+  if (configs.codex) {
+    return { ...configs.codex, env: { ...process.env as Record<string, string>, ...configs.codex.env } };
   }
-  for (const backend of ['desktop', 'cli'] as const) {
-    const config = configs[backend];
-    if (!config || config.enabled === false) { delete configs[backend]; continue; }
-    config.env = { ...process.env as Record<string, string>, ...config.env };
-    for (const [key, value] of Object.entries(process.env)) {
-      if (/^(WB_|WORKBUDDY_|CODEBUDDY_)/.test(key) && value !== undefined) config.env[key] = value;
-    }
-    const cliScript = config.env.WB_CLI_SCRIPT;
-    if (backend === 'cli' && cliScript && !config.env.CODEBUDDY_FORCE_LITE_WB_BUNDLE) {
-      const dist = path.resolve(path.dirname(cliScript), '..', 'dist');
-      if (fs.existsSync(path.join(dist, 'codebuddy-lite-wb.mjs')) && !fs.existsSync(path.join(dist, 'codebuddy-headless.js'))) {
-        config.env.CODEBUDDY_FORCE_LITE_WB_BUNDLE = '1';
-      }
-    }
-    if (backend === 'desktop' && process.env.CB_WORKBUDDY_IDLE_COMPAT !== 'false') {
-      const launcherIndex = config.args.findIndex(arg => path.basename(arg) === 'launch.py');
-      const root = launcherIndex >= 0 ? path.dirname(config.args[launcherIndex]) : '';
-      if (root && fs.existsSync(path.join(root, 'workbuddy_bridge', 'acp.py'))) {
-        config.args = [...config.args.slice(0, launcherIndex), fileURLToPath(new URL('../../bin/workbuddy-desktop-bridge.py', import.meta.url)), '--bridge-root', root];
-      }
+
+  // 检查已知的 Codex 包装脚本与原生路径
+  const customCmd = process.env.CODEX_CMD_PATH;
+  if (customCmd && fs.existsSync(customCmd)) {
+    return resolveCodexExecutableOrNode(customCmd);
+  }
+
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const candidates = [
+    path.join(home, 'AppData', 'Roaming', 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js'),
+    path.join(home, 'AppData', 'Roaming', 'npm', 'codex.cmd'),
+    'codex.cmd',
+    'codex',
+  ];
+
+  for (const c of candidates) {
+    if (fs.existsSync(c)) {
+      return resolveCodexExecutableOrNode(c);
     }
   }
-  return configs;
+
+  return { executable: 'codex' };
+}
+
+/**
+ * Windows 下若为 .cmd 包装器，解析到对应 node.js 脚本以实现 shell: false
+ */
+function resolveCodexExecutableOrNode(targetPath: string): AgentCliConfig {
+  if (targetPath.endsWith('.js')) {
+    return {
+      executable: process.execPath,
+      script: targetPath,
+    };
+  }
+
+  if (targetPath.endsWith('.cmd')) {
+    // 检查是否有平行的 node_modules/@openai/codex/bin/codex.js
+    const dir = path.dirname(targetPath);
+    const scriptPath = path.join(dir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    if (fs.existsSync(scriptPath)) {
+      return {
+        executable: process.execPath,
+        script: scriptPath,
+      };
+    }
+  }
+
+  return { executable: targetPath };
 }

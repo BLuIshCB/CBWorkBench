@@ -5,16 +5,33 @@
  * 每一个具体的模型或客户端适配器必须实现对应的接口，以便在上层工作流引擎中实现多态调度。
  */
 
-export const ADAPTER_VERSION = '1.0.0';
+export const ADAPTER_VERSION = '2.0.0';
+
+/**
+ * 统一 CLI 执行策略约束定义
+ */
+export interface AdapterExecutionPolicy {
+  transport: 'cli';
+  interaction: 'headless';
+  promptTransport: 'stdin-utf8';
+  sessionPersistence: 'disabled';
+}
+
+export const MANDATORY_CLI_POLICY: AdapterExecutionPolicy = {
+  transport: 'cli',
+  interaction: 'headless',
+  promptTransport: 'stdin-utf8',
+  sessionPersistence: 'disabled',
+} as const;
 
 /**
  * 适配器基础能力契约 (类似于 Java: public interface IAgentAdapter)
  */
 export interface IAgentAdapter {
-  /** 适配器全局唯一标识符，如 'workbuddy', 'mock-adapter' */
+  /** 适配器全局唯一标识符，如 'workbuddy', 'codex' */
   readonly id: string;
 
-  /** 适配器展示名称，如 'WorkBuddy 本地协同开发者' */
+  /** 适配器展示名称，如 'WorkBuddy 协同执行者' */
   readonly name: string;
 
   /** 适配器详细描述与说明 */
@@ -29,8 +46,11 @@ export interface IAgentAdapter {
   /** 该适配器的默认推荐模型 */
   readonly defaultModel: string;
 
-  /** 适配器通信与连接方式说明（如 桌面具名管道直连、标准 HTTP API 直连、只读沙箱子进程等） */
+  /** 适配器通信与连接方式说明（如 Direct CLI 非交互进程、只读沙箱等） */
   readonly connectionType?: string;
+
+  /** 适配器强制遵守的执行与无会话持久化策略 */
+  readonly executionPolicy: AdapterExecutionPolicy;
 
   /**
    * 连通性与健康检查（例如验证 CLI 工具存在、服务端口可达等）
@@ -158,6 +178,7 @@ export interface AdapterMetaDto {
   defaultModel: string;
   supportedModels: string[];
   connectionType?: string;
+  executionPolicy: AdapterExecutionPolicy;
   healthy?: boolean;
   statusMessage?: string;
   isWorker?: boolean;

@@ -83,7 +83,7 @@ export class RuntimeService {
         category: a.isWorker ? 'worker' : 'verifier',
         role: roleStr,
         connectionType: a.connectionType || '未指定',
-        configured: true,
+        configured: Boolean(a.healthy),
         available: Boolean(a.healthy),
         defaultModel: a.defaultModel,
         supportedModels: a.supportedModels,

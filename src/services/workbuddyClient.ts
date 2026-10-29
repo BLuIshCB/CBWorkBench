@@ -1,206 +1,311 @@
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { spawn } from 'node:child_process';
-import fs from 'node:fs';
 import path from 'node:path';
-import { WORKER_FIXED_MODEL, DEFAULT_WORKER_TIMEOUT_MS } from '../config/constants.ts';
-import { resolveWorkBuddyConfigs } from './workbuddyConfig.ts';
-import type { WorkBuddyBackend, WorkBuddyServerConfig } from './workbuddyConfig.ts';
+import fs from 'node:fs';
+import { WORKER_FIXED_MODEL, DEFAULT_WORKER_TIMEOUT_MS, ROOT_DIR } from '../config/constants.ts';
+import { resolveWorkBuddyCliConfig } from './workbuddyConfig.ts';
+import { CliRunner, type CliErrorCode } from './cliRunner.ts';
 
 export interface WorkerExecutionResult {
   ok: boolean;
   output: string;
   error?: string;
-  errorCode?: 'CONFIG' | 'AUTH_REQUIRED' | 'TIMEOUT' | 'CANCELLED' | 'EXECUTION';
+  errorCode?: CliErrorCode;
   timedOut?: boolean;
-  backend?: WorkBuddyBackend;
+  backend?: string;
   sessionId?: string;
+  durationMs?: number;
+  modelUsed?: string;
 }
 
-type ActiveRun = { taskId?: string; backend?: WorkBuddyBackend; controller: AbortController; client?: Client; transport?: StdioClientTransport; remoteTaskId?: string };
-const stripAnsi = (text: string) => text.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
-const authError = (text: string) => /^(?:Error:\s*)?(?:authentication required|please (?:use \/login|log\s?in|sign in)|not authenticated|未登录|请(?:先)?登录)/im.test(text.trim());
-const textContent = (response: any): string => stripAnsi((response.content || [])
-  .filter((item: any) => item.type === 'text' && typeof item.text === 'string').map((item: any) => item.text).join('\n'));
+const stripAnsi = (text: string) =>
+  text.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+
+const authError = (text: string) =>
+  /^(?:Error:\s*)?(?:authentication required|please (?:use \/login|log\s?in|sign in)|not authenticated|未登录|请(?:先)?登录)/im.test(
+    text.trim()
+  );
 
 export class WorkBuddyClient {
-  private static activeRuns = new Set<ActiveRun>();
-
-  /** 保留旧接口，启动参数由准确的 workbuddy-cli 配置表提供。 */
-  static resolveMcpServerConfig(): WorkBuddyServerConfig {
-    const config = resolveWorkBuddyConfigs().cli;
-    if (!config) throw new Error('WorkBuddy CLI MCP 未配置，请配置 workbuddy-cli 或 CB_WORKBUDDY_MCP_CONFIG。');
-    return config;
-  }
-
+  /**
+   * 中断指定 taskId 的运行，或终止所有活动任务
+   */
   static requestStop(taskId?: string): void {
-    for (const run of this.activeRuns) {
-      if (!taskId || run.taskId === taskId) run.controller.abort(new Error('Execution stopped by user.'));
-    }
+    CliRunner.abort(taskId);
   }
 
-  /** 实际连接并验证工具；桌面端同时验证 sidecar 连通状态，不派发模型任务。 */
+  /**
+   * 连通性健康检查：验证 Direct CLI 入口与 `--help` 可启动性
+   */
   static async healthCheck(): Promise<{ healthy: boolean; message?: string }> {
-    if (process.env.CB_MOCK_WORKBUDDY === 'true') return { healthy: true, message: 'Explicit WorkBuddy mock mode.' };
-    const run: ActiveRun = { controller: new AbortController() };
-    const timer = setTimeout(() => run.controller.abort(), 15000);
+    if (process.env.CB_MOCK_WORKBUDDY === 'true') {
+      return { healthy: true, message: 'Explicit WorkBuddy mock mode.' };
+    }
+
     try {
-      const backend = await this.connect(run);
-      return { healthy: true, message: backend === 'desktop' ? 'WorkBuddy Desktop connected.' : 'WorkBuddy CLI MCP connected; 登录态将在实际任务时验证。' };
-    } catch (error: any) {
-      return { healthy: false, message: error.message };
-    } finally {
-      clearTimeout(timer);
-      await this.close(run);
-    }
-  }
+      const config = resolveWorkBuddyCliConfig();
+      const args = [...(config.script ? [config.script] : []), '--help'];
 
-  static async runTask(params: { prompt: string; cwd: string; model?: string; timeoutMs?: number; taskId?: string }): Promise<WorkerExecutionResult> {
-    if (process.env.CB_MOCK_WORKBUDDY === 'true') return { ok: true, output: `[MOCK WORKBUDDY RESULT]\nCompleted prompt for cwd: ${params.cwd}` };
-    const timeoutMs = params.timeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS;
-    let validDirectory = false;
-    try { validDirectory = path.isAbsolute(params.cwd) && fs.statSync(params.cwd).isDirectory(); } catch { /* 无权限或路径不存在均为配置错误。 */ }
-    if (!params.prompt?.trim() || !validDirectory
-      || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
-      return { ok: false, output: '', errorCode: 'CONFIG', error: 'WorkBuddy 需要非空提示词、存在的绝对工作目录和有效的正整数超时时间。' };
-    }
-    const run: ActiveRun = { taskId: params.taskId, controller: new AbortController() };
-    this.activeRuns.add(run);
-    let timedOut = false;
-    const deadline = Date.now() + timeoutMs;
-    const timer = setTimeout(() => { timedOut = true; run.controller.abort(new Error('WorkBuddy execution timed out.')); }, timeoutMs);
-    let backend: WorkBuddyBackend | undefined;
-    let output = '';
-    let terminal = false;
-    try {
-      backend = await this.connect(run);
-      if (run.controller.signal.aborted) throw run.controller.signal.reason;
-      const model = params.model || WORKER_FIXED_MODEL;
-      if (backend === 'cli') {
-        const response = await this.call(run, 'run_workbuddy_task', { prompt: params.prompt, cwd: params.cwd, model, timeoutMs: Math.max(1, deadline - Date.now()) }, timeoutMs);
-        output = textContent(response);
-        if (response.isError || /^(?:EPERM:|EACCES:|Error:|ENOENT:)/m.test(output) || authError(output)) throw new Error(output || 'WorkBuddy CLI execution failed.');
-      } else {
-        const started = this.object(await this.call(run, 'workbuddy_start', {
-          prompt: params.prompt, cwd: params.cwd, model, reasoning_effort: 'low',
-          timeout_seconds: Math.max(1, Math.ceil((deadline - Date.now()) / 1000)),
-        }));
-        if (started.ok !== true || typeof started.task_id !== 'string' || !started.task_id) throw new Error(started.error || 'WorkBuddy start returned no task_id.');
-        run.remoteTaskId = started.task_id;
-        while (true) {
-          const state = this.object(await this.call(run, 'workbuddy_wait', {
-            task_id: run.remoteTaskId, timeout_seconds: Math.max(1, Math.min(50, Math.ceil((deadline - Date.now()) / 1000))),
-          }, 55000));
-          if (state.ok !== true || state.task_id !== run.remoteTaskId) throw new Error(state.error || 'WorkBuddy returned a mismatched task.');
-          if (state.state === 'completed') {
-            terminal = true;
-            output = typeof state.answer === 'string' ? state.answer : '';
-            if (state.error || state.result?.isError || authError(output)) throw new Error(state.error || output || 'WorkBuddy execution failed.');
-            if (!output.trim()) throw new Error('WorkBuddy completed without an answer.');
-            return { ok: true, output, backend, sessionId: state.session_id };
-          }
-          if (['failed', 'cancelled'].includes(state.state)) {
-            terminal = true;
-            const message = state.error || `WorkBuddy task ${state.state}`;
-            return { ok: false, output, backend, error: this.errorMessage(message), errorCode: authError(message) ? 'AUTH_REQUIRED' : state.state === 'cancelled' ? 'CANCELLED' : /timed? out|timeout/i.test(message) ? 'TIMEOUT' : 'EXECUTION', timedOut: /timed? out|timeout/i.test(message) };
-          }
-          if (!['queued', 'connecting', 'running', 'observing', 'cancelling'].includes(state.state)) throw new Error('Unknown WorkBuddy task state.');
-        }
-      }
-      if (!output.trim()) throw new Error('WorkBuddy returned no output.');
-      return { ok: true, output, backend };
-    } catch (error: any) {
-      const message = error?.message || String(error);
-      const cancelled = run.controller.signal.aborted;
-      return {
-        ok: false, output, backend, timedOut,
-        errorCode: timedOut ? 'TIMEOUT' : cancelled ? 'CANCELLED' : authError(message) ? 'AUTH_REQUIRED' : backend ? 'EXECUTION' : 'CONFIG',
-        error: timedOut ? `WorkBuddy 执行超过 ${timeoutMs}ms，已请求取消。` : cancelled ? 'WorkBuddy 执行已取消。' : this.errorMessage(message),
-      };
-    } finally {
-      clearTimeout(timer);
-      // 已派发任务不得换后端重试，否则 Worker 可能重复修改代码。
-      if (run.remoteTaskId && !terminal) await this.cancelRemote(run);
-      await this.close(run);
-      this.activeRuns.delete(run);
-    }
-  }
-
-  private static errorMessage(message: string): string {
-    return authError(message)
-      ? 'WorkBuddy 登录态不可用。桌面模式请启动并登录 WorkBuddy；CLI 模式请在相同 CODEBUDDY_CONFIG_DIR 下执行 /login，桌面登录不等于独立 CLI 登录。'
-      : message;
-  }
-
-  private static async connect(run: ActiveRun): Promise<WorkBuddyBackend> {
-    const mode = process.env.CB_WORKBUDDY_BACKEND || 'auto';
-    if (!['auto', 'desktop', 'cli'].includes(mode)) throw new Error('CB_WORKBUDDY_BACKEND must be auto, desktop or cli.');
-    const configs = resolveWorkBuddyConfigs();
-    const candidates: WorkBuddyBackend[] = mode === 'auto' ? ['desktop', 'cli'] : [mode as WorkBuddyBackend];
-    const errors: string[] = [];
-    for (const backend of candidates) {
-      const config = configs[backend];
-      if (!config) continue;
-      try {
-        if (run.controller.signal.aborted) throw run.controller.signal.reason;
-        run.backend = backend;
-        run.transport = new StdioClientTransport({ ...config, stderr: 'pipe' });
-        // stderr 可能包含鉴权/用户数据，消费管道但不直接写入工作台日志。
-        run.transport.stderr?.resume();
-        run.client = new Client({ name: 'cb-workbench-client', version: '0.1.0' }, { capabilities: {} });
-        await run.client.connect(run.transport, { timeout: 10000, signal: run.controller.signal });
-        const tools = await run.client.listTools({}, { timeout: 10000, signal: run.controller.signal });
-        const names = new Set(tools.tools.map(tool => tool.name));
-        const required = backend === 'desktop' ? ['workbuddy_status', 'workbuddy_start', 'workbuddy_wait', 'workbuddy_cancel'] : ['run_workbuddy_task'];
-        if (!required.every(name => names.has(name))) throw new Error('MCP server is missing required WorkBuddy tools.');
-        if (backend === 'desktop') {
-          const status = this.object(await this.call(run, 'workbuddy_status', {}, 10000));
-          if (status.ok !== true || status.connected !== true) throw new Error(status.error || 'WorkBuddy Desktop is not connected.');
-        }
-        return backend;
-      } catch (error: any) {
-        errors.push(`${backend}: ${error.message}`);
-        await this.close(run);
-        if (run.controller.signal.aborted) throw run.controller.signal.reason;
-      }
-    }
-    throw new Error(errors.join('\n') || '未找到 WorkBuddy MCP 配置，请配置 workbuddy-desktop / workbuddy-cli 或 CB_WORKBUDDY_MCP_CONFIG。');
-  }
-
-  private static call(run: ActiveRun, name: string, args: Record<string, unknown>, timeout = 15000) {
-    return run.client!.callTool({ name, arguments: args }, undefined, { timeout, signal: run.controller.signal });
-  }
-
-  private static object(response: any): Record<string, any> {
-    if (response.isError) throw new Error(textContent(response) || 'WorkBuddy MCP tool failed.');
-    const parsed = response.structuredContent || JSON.parse(textContent(response));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid WorkBuddy MCP response.');
-    return parsed;
-  }
-
-  private static async cancelRemote(run: ActiveRun): Promise<void> {
-    try {
-      // 取消不能复用已 aborted 的信号；等待终态让桥接器回收独立 Host。
-      for (let attempt = 0; attempt < 2; attempt++) {
-        await run.client!.callTool({ name: 'workbuddy_cancel', arguments: { task_id: run.remoteTaskId } }, undefined, { timeout: 5000 });
-        const state = this.object(await run.client!.callTool({ name: 'workbuddy_wait', arguments: { task_id: run.remoteTaskId, timeout_seconds: 3 } }, undefined, { timeout: 4000 }));
-        if (['completed', 'failed', 'cancelled'].includes(state.state)) break;
-      }
-    } catch { /* 连接已断开时仍继续回收本地 MCP 进程。 */ }
-  }
-
-  private static async close(run: ActiveRun): Promise<void> {
-    const transport = run.transport;
-    // CLI MCP 不处理取消通知，Windows 必须回收整个子进程树。
-    if (run.backend === 'cli' && run.controller.signal.aborted && transport?.pid && process.platform === 'win32') {
-      await new Promise<void>(resolve => {
-        const killer = spawn('taskkill', ['/pid', String(transport.pid), '/T', '/F'], { windowsHide: true, shell: false, stdio: 'ignore' });
-        killer.once('error', () => resolve()); killer.once('close', () => resolve());
+      const runRes = await CliRunner.run({
+        runId: `wb-health-${Date.now()}`,
+        executable: config.executable,
+        args,
+        cwd: ROOT_DIR,
+        timeoutMs: 10000,
+        env: config.env,
       });
+
+      const combined = `${runRes.stdout}\n${runRes.stderr}`;
+      const isHealthy =
+        runRes.exitCode === 0 ||
+        /Usage:\s*(codebuddy|cbc)/i.test(combined) ||
+        combined.includes('CodeBuddy Code');
+
+      if (isHealthy) {
+        return {
+          healthy: true,
+          message: 'WorkBuddy Direct CLI 就绪 (--no-session-persistence 模式已就绪)',
+        };
+      }
+
+      return {
+        healthy: false,
+        message: runRes.error || runRes.stderr || 'WorkBuddy CLI 启动失败',
+      };
+    } catch (err: any) {
+      return { healthy: false, message: err.message };
     }
-    try { await run.client?.close(); } catch { /* transport 可能已关闭。 */ }
-    try { await transport?.close(); } catch { /* 启动失败也要释放 transport。 */ }
-    run.client = undefined;
-    run.transport = undefined;
+  }
+
+  /**
+   * 执行实际 Worker 任务 (Direct CLI 子进程，UTF-8 stdin 传递完整提示词)
+   */
+  static async runTask(params: {
+    prompt: string;
+    cwd: string;
+    model?: string;
+    timeoutMs?: number;
+    taskId?: string;
+  }): Promise<WorkerExecutionResult> {
+    const startTime = Date.now();
+    const model = params.model || WORKER_FIXED_MODEL;
+    const timeoutMs = params.timeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS;
+
+    if (process.env.CB_MOCK_WORKBUDDY === 'true') {
+      return {
+        ok: true,
+        output: `[MOCK WORKBUDDY RESULT]\nCompleted prompt for cwd: ${params.cwd}`,
+        modelUsed: model,
+        durationMs: Date.now() - startTime,
+        backend: 'direct-cli-mock',
+      };
+    }
+
+    // 校验工作目录与输入有效性
+    let validDirectory = false;
+    try {
+      validDirectory = path.isAbsolute(params.cwd) && fs.statSync(params.cwd).isDirectory();
+    } catch {}
+
+    if (
+      !params.prompt?.trim() ||
+      !validDirectory ||
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs <= 0 ||
+      timeoutMs > 2147483647
+    ) {
+      return {
+        ok: false,
+        output: '',
+        errorCode: 'CONFIG',
+        error: 'WorkBuddy 需要非空提示词、存在的绝对工作目录和有效的正整数超时时间。',
+        durationMs: Date.now() - startTime,
+        modelUsed: model,
+      };
+    }
+
+    let config;
+    try {
+      config = resolveWorkBuddyCliConfig();
+    } catch (err: any) {
+      return {
+        ok: false,
+        output: '',
+        errorCode: 'CONFIG',
+        error: err.message,
+        durationMs: Date.now() - startTime,
+        modelUsed: model,
+      };
+    }
+
+    // 构造 Direct CLI 参数（必须带上 --no-session-persistence）
+    const args = [
+      ...(config.script ? [config.script] : []),
+      '-p',
+      '--no-session-persistence',
+      '--output-format',
+      'json',
+      '--model',
+      model,
+      '-y',
+    ];
+
+    const runResult = await CliRunner.run({
+      runId: `wb-${params.taskId || 'standalone'}-${Date.now()}`,
+      taskId: params.taskId,
+      executable: config.executable,
+      args,
+      cwd: params.cwd,
+      env: config.env,
+      stdin: params.prompt,
+      timeoutMs,
+    });
+
+    const durationMs = Date.now() - startTime;
+    const base = {
+      modelUsed: model,
+      durationMs,
+      backend: 'direct-cli',
+    };
+
+    if (runResult.timedOut) {
+      return {
+        ok: false,
+        output: runResult.stdout,
+        error: `WorkBuddy 执行超过 ${timeoutMs}ms，已请求取消。`,
+        errorCode: 'TIMEOUT',
+        timedOut: true,
+        ...base,
+      };
+    }
+
+    if (runResult.cancelled) {
+      return {
+        ok: false,
+        output: runResult.stdout,
+        error: 'WorkBuddy 执行已取消。',
+        errorCode: 'CANCELLED',
+        ...base,
+      };
+    }
+
+    if (runResult.errorCode === 'OUTPUT_LIMIT') {
+      return {
+        ok: false,
+        output: runResult.stdout,
+        error: runResult.error,
+        errorCode: 'OUTPUT_LIMIT',
+        ...base,
+      };
+    }
+
+    const cleanStdout = stripAnsi(runResult.stdout.trim());
+    const cleanStderr = stripAnsi(runResult.stderr.trim());
+
+    // 检查鉴权异常
+    if (authError(cleanStdout) || authError(cleanStderr)) {
+      return {
+        ok: false,
+        output: cleanStdout,
+        error:
+          'WorkBuddy 登录态不可用。请在相同 CODEBUDDY_CONFIG_DIR 下运行 /login 登录。桌面端登录不代表独立 CLI 已登录。',
+        errorCode: 'AUTH_REQUIRED',
+        ...base,
+      };
+    }
+
+    if (runResult.exitCode !== 0 && !cleanStdout) {
+      return {
+        ok: false,
+        output: '',
+        error: cleanStderr || `WorkBuddy CLI 非零退出 (exitCode=${runResult.exitCode})`,
+        errorCode: 'EXECUTION',
+        ...base,
+      };
+    }
+
+    // 解析 JSON 输出
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(cleanStdout);
+    } catch {
+      // 兼容 Markdown 代码块包裹: ```json ... ```
+      const jsonBlockMatch = cleanStdout.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+      if (jsonBlockMatch) {
+        try {
+          parsed = JSON.parse(jsonBlockMatch[1].trim());
+        } catch {}
+      }
+
+      // 兼容可能混杂的前置/后置日志：从首个 { 截取到末尾最后一个 }
+      if (!parsed) {
+        const jsonStart = cleanStdout.indexOf('{');
+        const jsonEnd = cleanStdout.lastIndexOf('}');
+        if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
+          try {
+            parsed = JSON.parse(cleanStdout.slice(jsonStart, jsonEnd + 1));
+          } catch {}
+        }
+      }
+
+      if (!parsed) {
+        return {
+          ok: false,
+          output: cleanStdout,
+          error: cleanStderr || 'WorkBuddy 返回了无法解析的 JSON 响应格式。',
+          errorCode: 'PROTOCOL',
+          ...base,
+        };
+      }
+    }
+
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.is_error || parsed.error) {
+        const errorMsg =
+          typeof parsed.error === 'string'
+            ? parsed.error
+            : typeof parsed.output === 'string'
+            ? parsed.output
+            : 'WorkBuddy 内部执行失败';
+        return {
+          ok: false,
+          output: cleanStdout,
+          error: errorMsg,
+          errorCode: authError(errorMsg) ? 'AUTH_REQUIRED' : 'EXECUTION',
+          ...base,
+        };
+      }
+
+      const outputText =
+        typeof parsed.output === 'string'
+          ? parsed.output
+          : typeof parsed.result === 'string'
+          ? parsed.result
+          : typeof parsed.answer === 'string'
+          ? parsed.answer
+          : JSON.stringify(parsed);
+
+      if (!outputText.trim()) {
+        return {
+          ok: false,
+          output: '',
+          error: 'WorkBuddy 返回空输出内容。',
+          errorCode: 'PROTOCOL',
+          ...base,
+        };
+      }
+
+      return {
+        ok: true,
+        output: outputText,
+        ...base,
+      };
+    }
+
+    return {
+      ok: false,
+      output: cleanStdout,
+      error: 'WorkBuddy CLI 返回了非预期的数据结构。',
+      errorCode: 'PROTOCOL',
+      ...base,
+    };
   }
 }

@@ -4,6 +4,7 @@ import type {
   IReviewerAdapter,
   AdapterMetaDto,
 } from './types.ts';
+import { MANDATORY_CLI_POLICY } from './types.ts';
 import { WorkBuddyAdapter } from './workbuddyAdapter.ts';
 import { CodexAdapter } from './codexAdapter.ts';
 import { logger } from '../utils/logger.ts';
@@ -30,7 +31,7 @@ export class AdapterRegistry {
   }
 
   /**
-   * 注册默认内置适配器 (当前仅保留 WorkBuddy CLI 与 Codex CLI)
+   * 注册默认内置适配器 (当前仅保留 WorkBuddy Direct CLI 与 Codex CLI)
    */
   private registerDefaults(): void {
     // 1. WorkBuddy 适配器 (Worker & Reviewer)
@@ -41,9 +42,22 @@ export class AdapterRegistry {
   }
 
   /**
-   * 注册一个适配器实例 (支持动态扩展与热插拔)
+   * 注册一个适配器实例 (严格校验统一 CLI 执行策略约束)
    */
   register(adapter: IAgentAdapter): void {
+    const policy = adapter.executionPolicy;
+    if (
+      !policy ||
+      policy.transport !== MANDATORY_CLI_POLICY.transport ||
+      policy.interaction !== MANDATORY_CLI_POLICY.interaction ||
+      policy.promptTransport !== MANDATORY_CLI_POLICY.promptTransport ||
+      policy.sessionPersistence !== MANDATORY_CLI_POLICY.sessionPersistence
+    ) {
+      throw new Error(
+        `适配器 '${adapter.id}' 未遵守统一 CLI 执行策略 (必须声明 transport: cli, interaction: headless, promptTransport: stdin-utf8, sessionPersistence: disabled)，拒绝注册。`
+      );
+    }
+
     this.adapters.set(adapter.id, adapter);
     logger.info(`[AdapterRegistry] Registered adapter: ${adapter.id} (${adapter.name})`);
   }
@@ -63,43 +77,43 @@ export class AdapterRegistry {
   }
 
   /**
-   * 获取 Worker 开发适配器 (如果未指定或找不到，回退到默认 workbuddy)
+   * 获取 Worker 开发适配器 (显式指定 ID 失败时直接报错，未指定时默认使用 workbuddy)
    */
   getWorkerAdapter(id?: string): IWorkerAdapter {
-    const targetId = id || 'workbuddy';
-    const adapter = this.adapters.get(targetId);
-
-    if (adapter && adapter.supportedRoles.includes('worker') && 'executeDevTask' in adapter) {
-      return adapter as IWorkerAdapter;
+    if (id) {
+      const adapter = this.adapters.get(id);
+      if (adapter && adapter.supportedRoles.includes('worker') && 'executeDevTask' in adapter) {
+        return adapter as IWorkerAdapter;
+      }
+      throw new Error(`未找到指定的 Worker 适配器或该适配器不支持 worker 角色: id='${id}'`);
     }
 
-    // 回退到 workbuddy
-    const fallback = this.adapters.get('workbuddy');
-    if (fallback && 'executeDevTask' in fallback) {
-      return fallback as IWorkerAdapter;
+    const defaultAdapter = this.adapters.get('workbuddy');
+    if (defaultAdapter && defaultAdapter.supportedRoles.includes('worker') && 'executeDevTask' in defaultAdapter) {
+      return defaultAdapter as IWorkerAdapter;
     }
 
-    throw new Error(`No available Worker adapter found for id='${targetId}'`);
+    throw new Error("默认 Worker 适配器 'workbuddy' 未注册或不可用");
   }
 
   /**
-   * 获取 Reviewer 审查适配器 (如果未指定或找不到，回退到默认 workbuddy)
+   * 获取 Reviewer 审查适配器 (显式指定 ID 失败时直接报错，未指定时默认使用 workbuddy)
    */
   getReviewerAdapter(id?: string): IReviewerAdapter {
-    const targetId = id || 'workbuddy';
-    const adapter = this.adapters.get(targetId);
-
-    if (adapter && adapter.supportedRoles.includes('reviewer') && 'executeReview' in adapter) {
-      return adapter as IReviewerAdapter;
+    if (id) {
+      const adapter = this.adapters.get(id);
+      if (adapter && adapter.supportedRoles.includes('reviewer') && 'executeReview' in adapter) {
+        return adapter as IReviewerAdapter;
+      }
+      throw new Error(`未找到指定的 Reviewer 适配器或该适配器不支持 reviewer 角色: id='${id}'`);
     }
 
-    // 回退到 workbuddy
-    const fallback = this.adapters.get('workbuddy');
-    if (fallback && 'executeReview' in fallback) {
-      return fallback as IReviewerAdapter;
+    const defaultAdapter = this.adapters.get('workbuddy');
+    if (defaultAdapter && defaultAdapter.supportedRoles.includes('reviewer') && 'executeReview' in defaultAdapter) {
+      return defaultAdapter as IReviewerAdapter;
     }
 
-    throw new Error(`No available Reviewer adapter found for id='${targetId}'`);
+    throw new Error("默认 Reviewer 适配器 'workbuddy' 未注册或不可用");
   }
 
   /**
@@ -126,7 +140,8 @@ export class AdapterRegistry {
         supportedRoles: [...a.supportedRoles],
         defaultModel: a.defaultModel,
         supportedModels: [...a.supportedModels],
-        connectionType: a.connectionType || '未指定连接协议',
+        connectionType: a.connectionType || 'Direct CLI 子进程',
+        executionPolicy: a.executionPolicy,
         healthy,
         statusMessage,
         isWorker: a.supportedRoles.includes('worker'),
@@ -147,9 +162,11 @@ export class AdapterRegistry {
           id: a.id,
           name: a.name,
           description: a.description,
+          supportedRoles: [...a.supportedRoles],
           defaultModel: a.defaultModel,
           supportedModels: [...a.supportedModels],
           connectionType: a.connectionType,
+          executionPolicy: a.executionPolicy,
           isWorker: true,
           isReviewer: a.supportedRoles.includes('reviewer'),
         });
@@ -169,9 +186,11 @@ export class AdapterRegistry {
           id: a.id,
           name: a.name,
           description: a.description,
+          supportedRoles: [...a.supportedRoles],
           defaultModel: a.defaultModel,
           supportedModels: [...a.supportedModels],
           connectionType: a.connectionType,
+          executionPolicy: a.executionPolicy,
           isWorker: a.supportedRoles.includes('worker'),
           isReviewer: true,
         });

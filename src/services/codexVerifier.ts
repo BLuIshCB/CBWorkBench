@@ -1,8 +1,9 @@
-import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import { VERIFIER_DEFAULT_MODEL, DEFAULT_VERIFIER_TIMEOUT_MS } from '../config/constants.ts';
+import { resolveCodexCliConfig } from './workbuddyConfig.ts';
+import { CliRunner } from './cliRunner.ts';
 import { logger } from '../utils/logger.ts';
 
 export interface CriterionResult {
@@ -31,36 +32,6 @@ export interface VerificationOutput {
 }
 
 export class CodexVerifier {
-  private static codexCommand: string | null = null;
-
-  static resolveCodexExecutable(): string {
-    if (this.codexCommand) return this.codexCommand;
-
-    // Check custom env
-    if (process.env.CODEX_CMD_PATH && fs.existsSync(process.env.CODEX_CMD_PATH)) {
-      this.codexCommand = process.env.CODEX_CMD_PATH;
-      return this.codexCommand;
-    }
-
-    const home = os.homedir();
-    const candidates = [
-      path.join(home, 'AppData', 'Roaming', 'npm', 'codex.cmd'),
-      path.join(home, 'AppData', 'Local', 'OpenAI', 'Codex', 'bin', 'codex.cmd'),
-      'codex.cmd',
-      'codex',
-    ];
-
-    for (const c of candidates) {
-      if (fs.existsSync(c)) {
-        this.codexCommand = c;
-        return c;
-      }
-    }
-
-    this.codexCommand = 'codex.cmd';
-    return this.codexCommand;
-  }
-
   static getCodexSchemaPath(): string {
     const tempDir = os.tmpdir();
     const schemaFile = path.join(tempDir, 'codex_acceptance_schema.json');
@@ -146,7 +117,7 @@ export class CodexVerifier {
     model?: string;
     timeoutMs?: number;
   }): Promise<VerificationOutput> {
-    // Check mock mode
+    // 检查 mock 模式
     if (process.env.CB_MOCK_CODEX === 'true') {
       logger.info('[CodexVerifier] Mock mode active: simulating Codex acceptance pass.');
       return {
@@ -164,7 +135,7 @@ export class CodexVerifier {
       };
     }
 
-    const codexBin = this.resolveCodexExecutable();
+    const codexConfig = resolveCodexCliConfig();
     const model = params.model || VERIFIER_DEFAULT_MODEL;
     const timeoutMs = params.timeoutMs || DEFAULT_VERIFIER_TIMEOUT_MS;
     const schemaPath = this.getCodexSchemaPath();
@@ -174,7 +145,14 @@ export class CodexVerifier {
       `codex_output_${params.taskId}_r${params.revision}_${Date.now()}.json`
     );
 
-    // Build the full prompt for Codex
+    // 确保运行前清理旧文件，防止复用上轮遗留结果
+    if (fs.existsSync(outputFilePath)) {
+      try {
+        fs.unlinkSync(outputFilePath);
+      } catch {}
+    }
+
+    // 组装 Codex 完整提示词
     const fullPrompt = [
       '# Codex Automated Acceptance Verification',
       '',
@@ -202,143 +180,131 @@ export class CodexVerifier {
 
     logger.info(`[CodexVerifier] Launching Codex CLI with model=${model}, cwd=${params.confirmedCwd}...`);
 
-    return new Promise((resolve) => {
-      const child = spawn(
-        codexBin,
-        [
-          'exec',
-          '-m',
-          model,
-          '-s',
-          'read-only',
-          '--skip-git-repo-check',
-          '--output-schema',
-          schemaPath,
-          '-o',
-          outputFilePath,
-          '-C',
-          params.confirmedCwd,
-          '-',
-        ],
-        {
-          shell: true,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        }
-      );
+    const codexArgs = [
+      ...(codexConfig.script ? [codexConfig.script] : []),
+      'exec',
+      '-m',
+      model,
+      '-s',
+      'read-only',
+      '--skip-git-repo-check',
+      '--ephemeral',
+      '--output-schema',
+      schemaPath,
+      '-o',
+      outputFilePath,
+      '-C',
+      params.confirmedCwd,
+      '-',
+    ];
 
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
-      let timedOut = false;
-
-      const timer = setTimeout(() => {
-        timedOut = true;
-        try {
-          if (process.platform === 'win32') {
-            spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
-          } else {
-            child.kill('SIGKILL');
-          }
-        } catch {}
-      }, timeoutMs);
-
-      child.stdout.on('data', (d) => stdoutChunks.push(Buffer.from(d)));
-      child.stderr.on('data', (d) => stderrChunks.push(Buffer.from(d)));
-
-      // Feed prompt via stdin to avoid Windows 8191-character command line limit
-      child.stdin.write(fullPrompt, 'utf8');
-      child.stdin.end();
-
-      child.on('close', (code) => {
-        clearTimeout(timer);
-        const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-        const stderr = Buffer.concat(stderrChunks).toString('utf8');
-
-        let parsed: VerificationOutput | null = null;
-
-        if (fs.existsSync(outputFilePath)) {
-          try {
-            const rawContent = fs.readFileSync(outputFilePath, 'utf8').trim();
-            parsed = JSON.parse(rawContent);
-            if (parsed) {
-              parsed.rawOutput = rawContent;
-            }
-          } catch (e) {
-            logger.warn('[CodexVerifier] Failed to parse output-last-message JSON:', e);
-          } finally {
-            try {
-              fs.unlinkSync(outputFilePath);
-            } catch {}
-          }
-        }
-
-        if (timedOut) {
-          resolve({
-            decision: 'blocked',
-            revision: params.revision,
-            summary: `Codex acceptance timed out after ${timeoutMs}ms.`,
-            criteriaResults: [],
-            issues: [
-              {
-                id: 'ERR-TIMEOUT',
-                description: `Verification execution timed out after ${timeoutMs}ms.`,
-              },
-            ],
-            manualChecksPending: [],
-            rawOutput: stderr,
-          });
-          return;
-        }
-
-        if (parsed && parsed.decision) {
-          // Validate targetWorkerIds in issues: must belong to definedWorkerIds
-          if (Array.isArray(parsed.issues)) {
-            for (const issue of parsed.issues) {
-              if (issue.targetWorkerId && !params.definedWorkerIds.includes(issue.targetWorkerId)) {
-                issue.targetWorkerId = params.definedWorkerIds[0] || 'worker-dev';
-              }
-            }
-          }
-
-          // Safety rule: if decision is passed but there are issues, downgrade to needs_changes
-          if (parsed.decision === 'passed' && parsed.issues && parsed.issues.length > 0) {
-            parsed.decision = 'needs_changes';
-            parsed.summary += ' (Downgraded to needs_changes because unresolved issues were reported).';
-          }
-
-          resolve(parsed);
-          return;
-        }
-
-        // If JSON output was not captured or process failed
-        logger.error(`[CodexVerifier] Non-zero exit or unparseable output (code=${code}):\n${stderr || stdout}`);
-        resolve({
-          decision: 'blocked',
-          revision: params.revision,
-          summary: `Codex verification failed (exit code ${code}): ${stderr.slice(0, 300) || stdout.slice(0, 300) || 'Unknown error'}`,
-          criteriaResults: [],
-          issues: [
-            {
-              id: 'ERR-CODEX-EXEC',
-              description: stderr.slice(0, 500) || 'Codex verification process failed to produce structured verdict.',
-            },
-          ],
-          manualChecksPending: [],
-          rawOutput: stderr || stdout,
-        });
-      });
-
-      child.on('error', (err) => {
-        clearTimeout(timer);
-        resolve({
-          decision: 'blocked',
-          revision: params.revision,
-          summary: `Failed to spawn Codex CLI: ${err.message}`,
-          criteriaResults: [],
-          issues: [{ id: 'ERR-SPAWN', description: err.message }],
-          manualChecksPending: [],
-        });
-      });
+    const runResult = await CliRunner.run({
+      runId: `codex-${params.taskId}-r${params.revision}-${Date.now()}`,
+      taskId: params.taskId,
+      executable: codexConfig.executable,
+      args: codexArgs,
+      cwd: params.confirmedCwd,
+      env: codexConfig.env,
+      stdin: fullPrompt,
+      timeoutMs,
     });
+
+    let parsed: VerificationOutput | null = null;
+
+    if (fs.existsSync(outputFilePath)) {
+      try {
+        const rawContent = fs.readFileSync(outputFilePath, 'utf8').trim();
+        parsed = JSON.parse(rawContent);
+        if (parsed) {
+          parsed.rawOutput = rawContent;
+        }
+      } catch (e) {
+        logger.warn('[CodexVerifier] Failed to parse output-last-message JSON:', e);
+      } finally {
+        try {
+          fs.unlinkSync(outputFilePath);
+        } catch {}
+      }
+    }
+
+    if (runResult.timedOut) {
+      return {
+        decision: 'blocked',
+        revision: params.revision,
+        summary: `Codex acceptance timed out after ${timeoutMs}ms.`,
+        criteriaResults: [],
+        issues: [
+          {
+            id: 'ERR-TIMEOUT',
+            description: `Verification execution timed out after ${timeoutMs}ms.`,
+          },
+        ],
+        manualChecksPending: [],
+        rawOutput: runResult.stderr,
+      };
+    }
+
+    if (runResult.cancelled) {
+      return {
+        decision: 'blocked',
+        revision: params.revision,
+        summary: 'Codex verification was cancelled.',
+        criteriaResults: [],
+        issues: [
+          {
+            id: 'ERR-CANCELLED',
+            description: 'Verification cancelled by user or engine.',
+          },
+        ],
+        manualChecksPending: [],
+        rawOutput: runResult.stderr,
+      };
+    }
+
+    if (parsed && parsed.decision) {
+      // 验证 targetWorkerIds 是否属于 definedWorkerIds
+      if (Array.isArray(parsed.issues)) {
+        for (const issue of parsed.issues) {
+          if (issue.targetWorkerId && !params.definedWorkerIds.includes(issue.targetWorkerId)) {
+            issue.targetWorkerId = params.definedWorkerIds[0] || 'worker-dev';
+          }
+        }
+      }
+
+      // 安全门禁：若判定为 passed 但存在 issues，自动降级为 needs_changes
+      if (parsed.decision === 'passed' && parsed.issues && parsed.issues.length > 0) {
+        parsed.decision = 'needs_changes';
+        parsed.summary += ' (Downgraded to needs_changes because unresolved issues were reported).';
+      }
+
+      return parsed;
+    }
+
+    // 进程非零退出或未生成结构化判定文件
+    logger.error(
+      `[CodexVerifier] Non-zero exit or unparseable output (code=${runResult.exitCode}):\n${
+        runResult.stderr || runResult.stdout
+      }`
+    );
+
+    return {
+      decision: 'blocked',
+      revision: params.revision,
+      summary: `Codex verification failed (exit code ${runResult.exitCode}): ${
+        runResult.stderr.slice(0, 300) || runResult.stdout.slice(0, 300) || runResult.error || 'Unknown error'
+      }`,
+      criteriaResults: [],
+      issues: [
+        {
+          id: 'ERR-CODEX-EXEC',
+          description:
+            runResult.stderr.slice(0, 500) ||
+            runResult.error ||
+            'Codex verification process failed to produce structured verdict.',
+        },
+      ],
+      manualChecksPending: [],
+      rawOutput: runResult.stderr || runResult.stdout,
+    };
   }
 }

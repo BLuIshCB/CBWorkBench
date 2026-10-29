@@ -68,4 +68,35 @@ const reviewers = adapterRegistry.listReviewers();
 assert.ok(reviewers.length >= 1);
 assert.ok(reviewers.some((r) => r.id === 'workbuddy' && r.supportedModels.includes('deepseek-v4-flash')));
 
+// 6. Execution policy verification
+assert.deepStrictEqual(workerAdapter.executionPolicy, {
+  transport: 'cli',
+  interaction: 'headless',
+  promptTransport: 'stdin-utf8',
+  sessionPersistence: 'disabled',
+});
+
+// 7. Explicit unknown adapter ID must throw (no silent fallback)
+assert.throws(() => adapterRegistry.getWorkerAdapter('unknown-adapter-id'), /未找到指定的 Worker 适配器/);
+assert.throws(() => adapterRegistry.getReviewerAdapter('unknown-adapter-id'), /未找到指定的 Reviewer 适配器/);
+
+// 8. Registering invalid adapter policy must be rejected
+assert.throws(() => {
+  adapterRegistry.register({
+    id: 'invalid-policy-adapter',
+    name: 'Invalid Policy Adapter',
+    description: 'Bad policy',
+    supportedRoles: ['worker'],
+    supportedModels: ['mock'],
+    defaultModel: 'mock',
+    executionPolicy: {
+      transport: 'cli',
+      interaction: 'headless',
+      promptTransport: 'stdin-utf8',
+      sessionPersistence: 'enabled' as any,
+    },
+    async healthCheck() { return { healthy: true }; },
+  });
+}, /未遵守统一 CLI 执行策略/);
+
 console.log('✅ adapters.test.ts passed successfully!');

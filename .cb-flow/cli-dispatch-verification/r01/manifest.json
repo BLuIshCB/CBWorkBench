@@ -1,0 +1,128 @@
+{
+  "packageVersion": 1,
+  "taskKey": "cli-dispatch-verification",
+  "revision": 1,
+  "title": "CLI 任务分发与无客户端对话验证",
+  "readiness": "ready",
+  "blockers": [],
+  "workspace": {
+    "cwd": "D:\\CODE\\AI\\CBWorkBench",
+    "gitRoot": "D:\\CODE\\AI\\CBWorkBench",
+    "head": "master"
+  },
+  "requirements": [
+    {
+      "id": "REQ-CLI-01",
+      "summary": "Direct CLI 执行并在 data/cli-verification 创建 UTF-8 中文产物"
+    },
+    {
+      "id": "REQ-CLI-02",
+      "summary": "端到端测试与 Reviewer 只读验收通过，客户端无新增会话"
+    }
+  ],
+  "developmentItems": [
+    {
+      "id": "TICKET-01",
+      "reqId": "REQ-CLI-01",
+      "order": 1,
+      "workerId": "worker-dev",
+      "done": "产物创建"
+    },
+    {
+      "id": "TICKET-02",
+      "reqId": "REQ-CLI-02",
+      "order": 2,
+      "workerId": "worker-dev",
+      "done": "测试与审查通过"
+    }
+  ],
+  "testCases": [
+    {
+      "id": "TEST-01",
+      "reqId": "REQ-CLI-01",
+      "workerId": "worker-dev",
+      "automated": true,
+      "required": true
+    },
+    {
+      "id": "TEST-02",
+      "reqId": "REQ-CLI-02",
+      "workerId": "worker-dev",
+      "automated": true,
+      "required": true
+    }
+  ],
+  "criteria": [
+    {
+      "id": "CRIT-01",
+      "reqId": "REQ-CLI-01",
+      "type": "automated",
+      "evidence": "文件逐字节匹配"
+    },
+    {
+      "id": "CRIT-02",
+      "reqId": "REQ-CLI-02",
+      "type": "automated",
+      "evidence": "自动化测试报告 exitCode=0"
+    },
+    {
+      "id": "MANUAL-01",
+      "reqId": "REQ-CLI-02",
+      "type": "manual",
+      "evidence": "客户端会话列表无新增"
+    }
+  ],
+  "workers": [
+    {
+      "workerId": "worker-dev",
+      "role": "开发与修复执行者",
+      "adapterId": "workbuddy",
+      "model": "deepseek-v4-flash",
+      "promptFile": "prompts/worker-dev.md"
+    }
+  ],
+  "verifier": {
+    "role": "只读沙箱审查者",
+    "adapterId": "workbuddy",
+    "model": "deepseek-v4-flash",
+    "promptFile": "prompts/verifier.md"
+  },
+  "executionPolicy": {
+    "transport": "cli",
+    "interaction": "headless",
+    "promptTransport": "stdin-utf8",
+    "sessionPersistence": "disabled"
+  },
+  "files": [
+    {
+      "path": "task.md",
+      "sha256": "4d279e6efd9576de1a46a202ce53a0db67fc161b2ebd3b096eb0e772db39bc44",
+      "size": 1334
+    },
+    {
+      "path": "development.md",
+      "sha256": "638d50b1f2778d8133c15483e45696a07ad556d9649cc33a2a89eee7c6ef8642",
+      "size": 1169
+    },
+    {
+      "path": "tests.md",
+      "sha256": "b42281b96533bd8486cacf172b5458192f9f0cc566c6705ec3b04f5720f1efe3",
+      "size": 757
+    },
+    {
+      "path": "acceptance.md",
+      "sha256": "fe8b9acb5c10ac125421607bb5824a5814efe8c1912d9372195e042fc661ea6c",
+      "size": 945
+    },
+    {
+      "path": "prompts/worker-dev.md",
+      "sha256": "1a7d6f38389fdea02741fde5f65c4897df7618343a9284e5acb47b95dcaf4111",
+      "size": 1032
+    },
+    {
+      "path": "prompts/verifier.md",
+      "sha256": "0fcb38ab36b49ddcd366732bb3704240a3ce52805cb115287e8f3a9965426b59",
+      "size": 809
+    }
+  ]
+}

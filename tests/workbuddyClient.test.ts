@@ -4,111 +4,293 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkBuddyClient } from '../src/services/workbuddyClient.ts';
-import { parseWorkBuddyToml, resolveWorkBuddyConfigs } from '../src/services/workbuddyConfig.ts';
+import { resolveWorkBuddyCliConfig, resolveAgentCliConfigs } from '../src/services/workbuddyConfig.ts';
 
-const savedEnv = { ...process.env };
-const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-client-'));
-const logFile = path.join(temp, 'calls.jsonl');
-const configFile = path.join(temp, 'config.json');
-const fixture = fileURLToPath(new URL('./fixtures/workbuddy-mcp.mjs', import.meta.url));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const fixtureScript = path.join(__dirname, 'fixtures', 'agent-cli.mjs');
+
+const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-client-test-'));
+const logFile = path.join(tempDir, 'cli-calls.jsonl');
+const configFile = path.join(tempDir, 'agent-cli-config.json');
+
 delete process.env.CB_MOCK_WORKBUDDY;
 delete process.env.CB_MOCK_CODEX;
-delete process.env.WB_TEST_SCENARIO;
-process.env.CB_WORKBUDDY_MCP_CONFIG = configFile;
-process.env.CB_WORKBUDDY_BACKEND = 'auto';
-process.env.HTTPS_PROXY = 'http://example.invalid:1234';
-const configure = (scenario: string, desktop = true, cli = true) => {
-  fs.writeFileSync(logFile, '');
-  const server = { command: process.execPath, args: [fixture], cwd: temp, env: { WB_TEST_SCENARIO: scenario, WB_TEST_LOG: logFile, CODEBUDDY_CONFIG_DIR: temp } };
-  fs.writeFileSync(configFile, JSON.stringify({ ...(desktop ? { desktop: server } : {}), ...(cli ? { cli: server } : {}) }));
-};
-const calls = () => fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
-const params = { prompt: 'multiline\n中文 & | < > $ ` " %', cwd: temp, model: 'model & literal', timeoutMs: 10000 };
+delete process.env.CB_WORKBUDDY_MCP_CONFIG;
+delete process.env.CB_WORKBUDDY_BACKEND;
 
-try {
-  const parsed = parseWorkBuddyToml(`
-[mcp_servers.unrelated]
-command = "wrong"
-args = ["wrong/server.js"]
-[mcp_servers."workbuddy-cli"]
-command = 'C:\\Node\\node.exe'
-args = [
-  "C:\\\\tools\\\\server.js", # comment
-]
-cwd = 'C:\\tasks'
-[mcp_servers.workbuddy-cli.env]
-CODEBUDDY_CONFIG_DIR = 'C:\\profile#name'
-[mcp_servers.workbuddy-desktop]
-enabled = false
-command = "disabled"
-`);
-  assert.equal(parsed.cli?.command, 'C:\\Node\\node.exe');
-  assert.deepEqual(parsed.cli?.args, ['C:\\tools\\server.js']);
-  assert.equal(parsed.cli?.env.CODEBUDDY_CONFIG_DIR, 'C:\\profile#name');
-  assert.equal(parsed.desktop, undefined);
-  assert.throws(() => parseWorkBuddyToml('[mcp_servers.workbuddy-cli]\ncommand="bad\\q"'));
+console.log('[Test] Running workbuddyClient.test.ts (Direct CLI Subprocess Protocol)...');
 
-  configure('success');
-  const success = await WorkBuddyClient.runTask(params);
-  assert.equal(success.ok, true);
-  assert.equal(success.backend, 'desktop');
-  assert.equal(success.sessionId, 'session-test');
-  assert.equal(calls().find(call => call.name === 'start').args.prompt, params.prompt);
-  assert.equal(calls().find(call => call.name === 'start').args.model, params.model);
-  assert.ok(calls().every(call => call.cwd === temp), 'MCP startup cwd must be forwarded');
-  assert.ok(!calls().some(call => call.name === 'cli'));
+// 1. 测试废弃配置拦截
+{
+  process.env.CB_WORKBUDDY_MCP_CONFIG = 'dummy.json';
+  assert.throws(
+    () => resolveAgentCliConfigs(),
+    /已废弃.*CB_WORKBUDDY_MCP_CONFIG/
+  );
+  delete process.env.CB_WORKBUDDY_MCP_CONFIG;
 
-  configure('disconnected');
-  const fallback = await WorkBuddyClient.runTask(params);
-  assert.equal(fallback.ok, true);
-  assert.equal(fallback.backend, 'cli');
-  assert.equal(calls().find(call => call.name === 'cli').args.configDir, temp);
-  assert.equal(calls().find(call => call.name === 'cli').args.proxy, process.env.HTTPS_PROXY);
-  assert.ok(!calls().some(call => call.name === 'start'));
-
-  for (const scenario of ['failed', 'start-error', 'bad-state', 'malformed']) {
-    configure(scenario);
-    const failure = await WorkBuddyClient.runTask(params);
-    assert.equal(failure.ok, false, scenario);
-    if (scenario === 'failed') assert.equal(failure.errorCode, 'AUTH_REQUIRED');
-    assert.ok(!calls().some(call => call.name === 'cli'), 'Never retry a dispatched task on another backend');
-  }
-  for (const [scenario, code] of [['auth', 'AUTH_REQUIRED'], ['permission', 'EXECUTION'], ['cli-error', 'EXECUTION'], ['module-error', 'EXECUTION']]) {
-    configure(scenario, false);
-    const failure = await WorkBuddyClient.runTask(params);
-    assert.equal(failure.ok, false);
-    assert.equal(failure.errorCode, code, scenario);
-  }
-
-  configure('hang');
-  const timeout = await WorkBuddyClient.runTask({ ...params, timeoutMs: 1600 });
-  assert.equal(timeout.timedOut, true);
-  assert.equal(timeout.errorCode, 'TIMEOUT');
-  assert.ok(calls().some(call => call.name === 'cancel'), 'Deadline must cancel the remote task');
-
-  configure('hang');
-  const running = WorkBuddyClient.runTask({ ...params, taskId: 'cancel-me' });
-  for (let i = 0; i < 100 && !calls().some(call => call.name === 'wait'); i++) await new Promise(resolve => setTimeout(resolve, 20));
-  WorkBuddyClient.requestStop('another-task');
-  WorkBuddyClient.requestStop('cancel-me');
-  assert.equal((await running).errorCode, 'CANCELLED');
-  assert.ok(calls().some(call => call.name === 'cancel'));
-
-  configure('success');
-  assert.equal((await WorkBuddyClient.healthCheck()).healthy, true);
-  assert.ok(!calls().some(call => call.name === 'start'), 'Health check must not dispatch a model task');
-  assert.equal((await WorkBuddyClient.runTask({ ...params, cwd: 'relative' })).errorCode, 'CONFIG');
-  assert.equal((await WorkBuddyClient.runTask({ ...params, timeoutMs: -1 })).errorCode, 'CONFIG');
-  process.env.CB_WORKBUDDY_BACKEND = 'invalid';
-  assert.equal((await WorkBuddyClient.runTask(params)).errorCode, 'CONFIG');
   process.env.CB_WORKBUDDY_BACKEND = 'desktop';
-  configure('success', false);
-  assert.equal((await WorkBuddyClient.runTask(params)).ok, false, 'Explicit desktop mode must not fall back to CLI');
-  fs.writeFileSync(configFile, JSON.stringify({ cli: { command: process.execPath, args: ['literal.js'], env: { CODEBUDDY_CONFIG_DIR: 'configured' } } }));
-  process.env.CODEBUDDY_CONFIG_DIR = 'override';
-  assert.equal(resolveWorkBuddyConfigs().cli?.env.CODEBUDDY_CONFIG_DIR, 'override');
-  console.log('✅ workbuddyClient.test.ts passed (real MCP subprocess protocol)');
-} finally {
-  process.env = savedEnv;
-  fs.rmSync(temp, { recursive: true, force: true });
+  assert.throws(
+    () => resolveAgentCliConfigs(),
+    /已废弃.*CB_WORKBUDDY_BACKEND/
+  );
+  delete process.env.CB_WORKBUDDY_BACKEND;
+  console.log('  ✓ Deprecated MCP & Backend config explicitly rejected');
 }
+
+// 2. 测试 CB_AGENT_CLI_CONFIG 解析
+{
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify({
+      workbuddy: {
+        executable: process.execPath,
+        script: fixtureScript,
+        env: {
+          AGENT_CLI_SCENARIO: 'workbuddy-json-success',
+          AGENT_CLI_LOG: logFile,
+        },
+      },
+    })
+  );
+  process.env.CB_AGENT_CLI_CONFIG = configFile;
+
+  const resolved = resolveWorkBuddyCliConfig();
+  assert.equal(resolved.executable, process.execPath);
+  assert.equal(resolved.script, fixtureScript);
+  console.log('  ✓ CB_AGENT_CLI_CONFIG parsed successfully');
+}
+
+// 3. 测试标准成功响应与参数传递 (含 --no-session-persistence 校验)
+{
+  fs.writeFileSync(logFile, '');
+  const prompt = '多行提示词\n中文 & | < > $ ` " %\n第二行代码实现';
+
+  const res = await WorkBuddyClient.runTask({
+    prompt,
+    cwd: tempDir,
+    model: 'deepseek-v4-flash',
+    timeoutMs: 10000,
+  });
+
+  assert.equal(res.ok, true);
+  assert.ok(res.output.includes('WorkBuddy executed successfully'));
+  assert.equal(res.backend, 'direct-cli');
+
+  // 验证 CLI 调用记录中的参数
+  const logs = fs.readFileSync(logFile, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  assert.ok(logs.length > 0);
+  const lastLog = logs[logs.length - 1];
+  assert.ok(lastLog.argv.includes('--no-session-persistence'), 'Must contain --no-session-persistence flag');
+  assert.ok(lastLog.argv.includes('--output-format'));
+  assert.ok(lastLog.argv.includes('json'));
+  assert.equal(lastLog.stdinLength, Buffer.from(prompt, 'utf8').length);
+  console.log('  ✓ Success run verified: --no-session-persistence present, UTF-8 stdin intact');
+}
+
+// 3.1 测试返回代码含大括号与嵌套对象时的 JSON 解析正确性
+{
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify({
+      workbuddy: {
+        executable: process.execPath,
+        script: fixtureScript,
+        env: { AGENT_CLI_SCENARIO: 'workbuddy-json-code' },
+      },
+    })
+  );
+
+  const res = await WorkBuddyClient.runTask({
+    prompt: 'write code with braces',
+    cwd: tempDir,
+    timeoutMs: 10000,
+  });
+
+  assert.equal(res.ok, true);
+  assert.ok(res.output.includes('function calculate(x: number) {'));
+  assert.ok(res.output.includes('{ value: x * 2 }'));
+  console.log('  ✓ Output containing braces & code blocks parsed successfully without PROTOCOL error');
+}
+
+// 3.2 测试输出混杂控制台前置/后置日志时的 JSON 解析容错
+{
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify({
+      workbuddy: {
+        executable: process.execPath,
+        script: fixtureScript,
+        env: { AGENT_CLI_SCENARIO: 'workbuddy-json-noisy' },
+      },
+    })
+  );
+
+  const res = await WorkBuddyClient.runTask({
+    prompt: 'noisy test',
+    cwd: tempDir,
+    timeoutMs: 10000,
+  });
+
+  assert.equal(res.ok, true);
+  assert.ok(res.output.includes('Success with nested object'));
+  console.log('  ✓ JSON output with surrounding logs extracted and parsed cleanly');
+}
+
+// 4. 测试 WorkBuddy JSON 返回错误
+{
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify({
+      workbuddy: {
+        executable: process.execPath,
+        script: fixtureScript,
+        env: { AGENT_CLI_SCENARIO: 'workbuddy-json-error' },
+      },
+    })
+  );
+
+  const res = await WorkBuddyClient.runTask({
+    prompt: 'test error',
+    cwd: tempDir,
+    timeoutMs: 5000,
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.errorCode, 'EXECUTION');
+  assert.ok(res.error?.includes('Internal tool error'));
+  console.log('  ✓ is_error response caught and mapped to EXECUTION error');
+}
+
+// 5. 测试鉴权失败响应
+{
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify({
+      workbuddy: {
+        executable: process.execPath,
+        script: fixtureScript,
+        env: { AGENT_CLI_SCENARIO: 'auth-required' },
+      },
+    })
+  );
+
+  const res = await WorkBuddyClient.runTask({
+    prompt: 'test auth',
+    cwd: tempDir,
+    timeoutMs: 5000,
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.errorCode, 'AUTH_REQUIRED');
+  console.log('  ✓ Auth failure detected and mapped to AUTH_REQUIRED error');
+}
+
+// 6. 测试残缺/非 JSON 响应协议错误
+{
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify({
+      workbuddy: {
+        executable: process.execPath,
+        script: fixtureScript,
+        env: { AGENT_CLI_SCENARIO: 'workbuddy-malformed-json' },
+      },
+    })
+  );
+
+  const res = await WorkBuddyClient.runTask({
+    prompt: 'test malformed',
+    cwd: tempDir,
+    timeoutMs: 5000,
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.errorCode, 'PROTOCOL');
+  console.log('  ✓ Malformed JSON output mapped to PROTOCOL error');
+}
+
+// 7. 测试执行超时
+{
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify({
+      workbuddy: {
+        executable: process.execPath,
+        script: fixtureScript,
+        env: { AGENT_CLI_SCENARIO: 'hang' },
+      },
+    })
+  );
+
+  const res = await WorkBuddyClient.runTask({
+    prompt: 'test timeout',
+    cwd: tempDir,
+    timeoutMs: 1200,
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.timedOut, true);
+  assert.equal(res.errorCode, 'TIMEOUT');
+  console.log('  ✓ Hanging CLI task terminated and reported TIMEOUT');
+}
+
+// 8. 测试精准取消
+{
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify({
+      workbuddy: {
+        executable: process.execPath,
+        script: fixtureScript,
+        env: { AGENT_CLI_SCENARIO: 'hang' },
+      },
+    })
+  );
+
+  const runPromise = WorkBuddyClient.runTask({
+    taskId: 'cancel-task-123',
+    prompt: 'test cancel',
+    cwd: tempDir,
+    timeoutMs: 10000,
+  });
+
+  await new Promise(r => setTimeout(r, 200));
+  WorkBuddyClient.requestStop('cancel-task-123');
+
+  const res = await runPromise;
+  assert.equal(res.ok, false);
+  assert.equal(res.errorCode, 'CANCELLED');
+  console.log('  ✓ Targeted requestStop successfully cancelled running task');
+}
+
+// 9. 参数有效性校验 (CONFIG)
+{
+  const resRel = await WorkBuddyClient.runTask({ prompt: 'test', cwd: 'relative/dir' });
+  assert.equal(resRel.errorCode, 'CONFIG');
+
+  const resEmptyPrompt = await WorkBuddyClient.runTask({ prompt: '', cwd: tempDir });
+  assert.equal(resEmptyPrompt.errorCode, 'CONFIG');
+  console.log('  ✓ Invalid cwd and empty prompt properly rejected with CONFIG');
+}
+
+// 10. 健康检查测试
+{
+  fs.writeFileSync(
+    configFile,
+    JSON.stringify({
+      workbuddy: {
+        executable: process.execPath,
+        script: fixtureScript,
+        env: { AGENT_CLI_SCENARIO: 'echo' },
+      },
+    })
+  );
+  const health = await WorkBuddyClient.healthCheck();
+  assert.equal(health.healthy, true);
+  console.log('  ✓ WorkBuddyClient.healthCheck() passed');
+}
+
+delete process.env.CB_AGENT_CLI_CONFIG;
+console.log('✅ workbuddyClient.test.ts passed successfully!');

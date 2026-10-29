@@ -96,7 +96,7 @@ export class WorkflowEngine {
     if (!task) return { success: false, message: 'Task not found' };
 
     db.requestTaskStop(taskId);
-    WorkBuddyClient.requestStop();
+    WorkBuddyClient.requestStop(taskId);
 
     if (task.status === TaskStatus.QUEUED || task.status === TaskStatus.PENDING_CONFIRM) {
       db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
