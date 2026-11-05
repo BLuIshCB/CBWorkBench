@@ -61,19 +61,25 @@ export const TaskDetail = {
     // 3. Gate 2 Confirmation Card
     const gate2Card = document.getElementById('gate2-card');
     if (gate2Card) {
-      if (task.status === 'pending_confirm') {
+      if (task.status === 'pending_confirm' || task.status === 'blocked') {
         gate2Card.style.display = 'block';
+        const timeoutInput=document.getElementById('execution-timeout-minutes');
+        if(timeoutInput.dataset.taskId!==task.id) {timeoutInput.value=(task.execution_timeout_ms || 3600000)/60000;timeoutInput.dataset.taskId=task.id;}
         const inputCwd = document.getElementById('input-confirmed-cwd');
-        if (inputCwd && !inputCwd.value) {
-          inputCwd.value = task.target_cwd;
+        if (inputCwd && inputCwd.dataset.taskId!==task.id) {
+          inputCwd.dataset.taskId=task.id;
+          inputCwd.value = task.confirmed_cwd || task.target_cwd;
         }
 
+        if(gate2Card.dataset.taskId!==task.id) {
+        gate2Card.dataset.taskId=task.id;
         window.app.populateExecutorSelects(
           task.worker_executor || 'workbuddy',
           task.worker_model || 'deepseek-v4-flash',
           task.reviewer_executor || 'workbuddy',
           task.reviewer_model || 'deepseek-v4-flash'
         );
+        }
 
         const gitInfoEl = document.getElementById('gate2-git-info');
         if (gitInfoEl) {

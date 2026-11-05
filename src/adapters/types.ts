@@ -1,109 +1,63 @@
-/**
- * Agent 适配器规范定义 (类似 Java 接口规范)
- * 
- * 本模块使用 TypeScript 严格契约（等价于 Java interface）规范 Worker 和 Reviewer 模型的调用。
- * 每一个具体的模型或客户端适配器必须实现对应的接口，以便在上层工作流引擎中实现多态调度。
- */
+import type { CliErrorCode } from '../services/cliRunner.ts';
 
-export const ADAPTER_VERSION = '2.0.0';
-
-/**
- * 统一 CLI 执行策略约束定义
- */
 export interface AdapterExecutionPolicy {
   transport: 'cli';
   interaction: 'headless';
   promptTransport: 'stdin-utf8';
-  sessionPersistence: 'disabled';
+  sessionPersistence: 'disabled' | 'native';
 }
 
 export const MANDATORY_CLI_POLICY: AdapterExecutionPolicy = {
-  transport: 'cli',
-  interaction: 'headless',
-  promptTransport: 'stdin-utf8',
-  sessionPersistence: 'disabled',
-} as const;
+  transport: 'cli', interaction: 'headless', promptTransport: 'stdin-utf8', sessionPersistence: 'disabled',
+};
 
-/**
- * 适配器基础能力契约 (类似于 Java: public interface IAgentAdapter)
- */
-export interface IAgentAdapter {
-  /** 适配器全局唯一标识符，如 'workbuddy', 'codex' */
-  readonly id: string;
-
-  /** 适配器展示名称，如 'WorkBuddy 协同执行者' */
-  readonly name: string;
-
-  /** 适配器详细描述与说明 */
-  readonly description: string;
-
-  /** 该适配器支持的角色列表 ('worker' | 'reviewer') */
-  readonly supportedRoles: readonly ('worker' | 'reviewer')[];
-
-  /** 该适配器支持的模型标识列表 */
-  readonly supportedModels: readonly string[];
-
-  /** 该适配器的默认推荐模型 */
-  readonly defaultModel: string;
-
-  /** 适配器通信与连接方式说明（如 Direct CLI 非交互进程、只读沙箱等） */
-  readonly connectionType?: string;
-
-  /** 适配器强制遵守的执行与无会话持久化策略 */
-  readonly executionPolicy: AdapterExecutionPolicy;
-
-  /**
-   * 连通性与健康检查（例如验证 CLI 工具存在、服务端口可达等）
-   */
-  healthCheck(): Promise<{ healthy: boolean; message?: string }>;
-
-  /**
-   * 中断当前任务执行（可选能力）
-   */
-  abort?(taskId: string): Promise<void>;
-}
-
-/**
- * Worker 开发执行上下文入参 (DTO)
- */
-export interface WorkerExecutionContext {
-  taskId: string;
-  roundNumber: number;
-  workerId: string;
-  model: string;
+/** 所有用途共用一个请求，用途与业务边界由提示词表达。 */
+export type AdapterProgress = {type:'output'|'progress';text:string;stream?:'stdout'|'stderr';toolName?:string};
+export interface AgentExecutionContext {
+  kind?: 'worker'|'reviewer'|'probe';
+  taskId?: string;
   prompt: string;
   cwd: string;
+  model?: string;
+  signal?: AbortSignal;
+  runId?: string;
+  roundId?: number;
+  onEvent?: (event:AdapterProgress)=>void;
   timeoutMs?: number;
 }
 
-/**
- * Worker 开发执行结果出参 (DTO)
- */
-export interface WorkerExecutionResult {
+export interface AgentExecutionResult {
+  runId?: string;
+  roundId?: number;
+  stopReason?: import("../services/executionService.ts").StopReason;
+  cleanupConfirmed?: boolean;
   ok: boolean;
   output: string;
   error?: string;
+  errorCode?: CliErrorCode;
   timedOut?: boolean;
   durationMs: number;
   modelUsed: string;
   metadata?: Record<string, any>;
 }
 
-/**
- * Worker 专用开发适配器契约 (类似于 Java: public interface IWorkerAdapter extends IAgentAdapter)
- */
-export interface IWorkerAdapter extends IAgentAdapter {
-  /**
-   * 执行业务代码开发或修复任务
-   * @param context 执行上下文入参
-   * @returns 执行结果输出
-   */
-  executeDevTask(context: WorkerExecutionContext): Promise<WorkerExecutionResult>;
+/** 仅翻译厂商命令行参数与响应协议，不承担业务角色。 */
+export interface IAgentAdapter {
+  readonly id: string;
+  readonly name: string;
+  readonly description: string;
+  readonly defaultModel: string;
+  /** 静态模型建议；有原生目录的适配器通过 listModels 获取完整可见列表。 */
+  readonly supportedModels: readonly string[];
+  readonly progressCapability?: 'raw'|'events';
+  readonly connectionType: string;
+  readonly executionPolicy: AdapterExecutionPolicy;
+  healthCheck(): Promise<{ healthy: boolean; message?: string }>;
+  listModels?(): Promise<string[]>;
+  execute(context: AgentExecutionContext): Promise<AgentExecutionResult>;
+  abort(taskId: string): Promise<void>;
 }
 
-/**
- * 细分验收准则的评判结果
- */
 export interface CriterionEvaluation {
   id: string;
   name?: string;
@@ -111,9 +65,6 @@ export interface CriterionEvaluation {
   evidence: string;
 }
 
-/**
- * 审查发现的具体问题条目
- */
 export interface ReviewIssue {
   id: string;
   criteriaId?: string;
@@ -122,10 +73,12 @@ export interface ReviewIssue {
   evidence?: string;
 }
 
-/**
- * Reviewer 验收审查上下文入参 (DTO)
- */
+// 以下属于工作流业务协议，不限制 CLI 的调用能力或权限。
 export interface ReviewerExecutionContext {
+  signal?: AbortSignal;
+  runId?: string;
+  roundId?: number;
+  onEvent?: (event:AdapterProgress)=>void;
   timeoutMs?: number;
   taskId: string;
   roundNumber: number;
@@ -139,9 +92,6 @@ export interface ReviewerExecutionContext {
   definedWorkerIds: string[];
 }
 
-/**
- * Reviewer 验收审查结果出参 (DTO)
- */
 export interface ReviewerExecutionResult {
   decision: 'passed' | 'needs_changes' | 'blocked';
   revision: number;
@@ -155,32 +105,17 @@ export interface ReviewerExecutionResult {
   metadata?: Record<string, any>;
 }
 
-/**
- * Reviewer 专用验收审查适配器契约 (类似于 Java: public interface IReviewerAdapter extends IAgentAdapter)
- */
-export interface IReviewerAdapter extends IAgentAdapter {
-  /**
-   * 执行任务验收与质量审查（无沙箱直接执行/评审）
-   * @param context 审查上下文入参
-   * @returns 结构化验收决策与问题列表
-   */
-  executeReview(context: ReviewerExecutionContext): Promise<ReviewerExecutionResult>;
-}
-
-/**
- * 适配器元数据概览，用于前端下拉菜单展示
- */
 export interface AdapterMetaDto {
   id: string;
   name: string;
   description: string;
-  supportedRoles: ('worker' | 'reviewer')[];
   defaultModel: string;
   supportedModels: string[];
-  connectionType?: string;
+  progressCapability?: 'raw'|'events';
+  connectionType: string;
   executionPolicy: AdapterExecutionPolicy;
   healthy?: boolean;
   statusMessage?: string;
-  isWorker?: boolean;
-  isReviewer?: boolean;
+  modelCatalogSource?: 'cli' | 'defaults' | 'unavailable';
+  modelCatalogError?: string;
 }

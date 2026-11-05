@@ -67,7 +67,7 @@ const timeoutResult = await TestRunner.runSingleTest(
   1000
 );
 assert.strictEqual(timeoutResult.passed, false);
-assert.ok(timeoutResult.stderr.includes('timed out'));
+assert.strictEqual(timeoutResult.terminationReason, 'EXECUTION_TIMEOUT');
 
 // 7. Test runAllTests aggregate
 const aggregate = await TestRunner.runAllTests(

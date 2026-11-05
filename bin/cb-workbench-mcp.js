@@ -4,6 +4,8 @@ process.env.MCP_MODE = 'true';
 console.log = (...args) => console.error(...args);
 
 import { spawn } from 'node:child_process';
+import { ensureWorkspaceDependencies } from '../src/utils/nodeResolver.js';
+try {ensureWorkspaceDependencies();} catch(error) {console.error(error.message);process.exit(1);}
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,7 +16,7 @@ const rootDir = path.resolve(__dirname, '..');
 let hasSqlite = false;
 try {
   const { DatabaseSync } = await import('node:sqlite');
-  if (DatabaseSync) hasSqlite = true;
+  if (DatabaseSync && Number(process.versions.node.split('.')[0])>=24) hasSqlite = true;
 } catch {
   hasSqlite = false;
 }

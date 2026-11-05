@@ -1,3 +1,4 @@
+import { executionTimeoutSchema, resolveExecutionTimeout } from '../services/executionPolicy.ts';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -32,13 +33,17 @@ export function createWorkbenchMcpServer(): McpServer {
       worker_prompts: z
         .record(z.string())
         .describe('各 Worker 提示词映射，键为 workerId（如 "worker-dev"），值为独立提示词正文'),
+      execution_timeout_ms: executionTimeoutSchema.optional(),
       budget_max_rounds: z.number().optional().describe('可选：最大执行轮次预算（默认 10）'),
-      budget_timeout_sec: z.number().optional().describe('可选：总执行时长预算秒数（默认 1800）'),
+      budget_timeout_sec: z.number().optional().describe('可选：已废弃：仅兼容接收，不再限制执行时间'),
     },
     async (args) => {
       try {
         const taskId = `task-${crypto.randomBytes(6).toString('hex')}`;
         const revision = 1;
+        const manifest=JSON.parse(args.manifest_json);
+        const executionTimeoutMs=resolveExecutionTimeout(args.execution_timeout_ms,null,manifest);
+        const executionTimeoutSource=args.execution_timeout_ms!==undefined?'request':manifest.executionPolicy?.executionTimeoutMs!==undefined?'manifest.executionTimeoutMs':executionTimeoutSchema.safeParse(manifest.executionPolicy?.timeoutMs).success?'manifest.timeoutMs':executionTimeoutSchema.safeParse(Number(process.env.CB_EXECUTION_TIMEOUT_MS)).success?'environment':'default';
 
         // Inspect workspace Git
         let gitInfo;
@@ -68,6 +73,7 @@ export function createWorkbenchMcpServer(): McpServer {
             git_root: gitInfo.gitRoot,
             git_commit: gitInfo.headCommit,
             git_status: gitInfo.statusText,
+            execution_timeout_ms: executionTimeoutMs,
             budget_max_rounds: args.budget_max_rounds,
             budget_timeout_sec: args.budget_timeout_sec,
           });
@@ -121,13 +127,15 @@ export function createWorkbenchMcpServer(): McpServer {
                   taskKey: args.task_key,
                   revision,
                   status: TaskStatus.PENDING_CONFIRM,
+                  execution_timeout_ms:executionTimeoutMs,
+                  executionTimeoutSource,
                   statusDescription: '待启动确认',
                   targetCwd: args.target_cwd,
                   gitRoot: gitInfo.gitRoot,
                   gitCommit: gitInfo.headCommit,
                   webUrl,
                   message:
-                    '任务包已成功上传到工作台，处于【待启动确认】状态。请用户在工作台页面核对目录并点击【确认并开始】。',
+                    '任务包已成功上传到工作台，处于【待启动确认】状态。请用户在工作台页面核对目录并点击【确认并开始】。' + (args.budget_timeout_sec!==undefined ? ' budget_timeout_sec 已废弃并忽略，不再限制任务总时长。' : '') + (['workerTimeoutMs','verifierTimeoutMs','testTimeoutMs'].some(key=>manifest.executionPolicy?.[key]!==undefined) ? ' workerTimeoutMs 等分阶段时限已停用。' : ''),
                 },
                 null,
                 2
@@ -341,7 +349,7 @@ export function createWorkbenchMcpServer(): McpServer {
           content: [{ type: 'text', text: `未找到任务: ${args.task_id}` }],
         };
       }
-      workflowEngine.handleTaskDeleted(args.task_id);
+      await workflowEngine.handleTaskDeleted(args.task_id);
       db.deleteTask(args.task_id);
       taskFileStore.deleteTaskFiles(args.task_id);
       logger.info(`[WorkbenchMCP] Task deleted: ${args.task_id}`);

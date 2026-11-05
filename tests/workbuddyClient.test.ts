@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkBuddyClient } from '../src/services/workbuddyClient.ts';
-import { resolveWorkBuddyCliConfig, resolveAgentCliConfigs } from '../src/services/workbuddyConfig.ts';
+import { resolveWorkBuddyCliConfig, resolveAgentCliConfigs } from '../src/services/cliConfig.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

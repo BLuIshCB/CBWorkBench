@@ -1,7 +1,7 @@
 import assert from 'node:assert';
 import { db } from '../src/storage/db.ts';
 import { workflowEngine } from '../src/services/workflowEngine.ts';
-import { TaskStatus, RoundStage } from '../src/config/constants.ts';
+import { TaskStatus, RoundStage, VERIFIER_DEFAULT_MODEL } from '../src/config/constants.ts';
 
 // Enable mock mode for fast deterministic testing
 process.env.CB_MOCK_WORKBUDDY = 'true';
@@ -27,6 +27,12 @@ db.createTask({
 const invalidStateResult = await workflowEngine.confirmAndStartTask(dummyTaskId);
 assert.strictEqual(invalidStateResult.success, false);
 assert.ok(invalidStateResult.message.includes('Cannot start task'));
+
+const unknownCliTaskId = `wf-unknown-cli-${Date.now()}`;
+db.createTask({ id: unknownCliTaskId, task_key: 'unknown-cli', title: 'Unknown CLI', target_cwd: process.cwd() });
+const unknownCliResult = await workflowEngine.confirmAndStartTask(unknownCliTaskId, undefined, { workerExecutor: 'unknown-cli' });
+assert.equal(unknownCliResult.success, false);
+assert.equal(db.getTask(unknownCliTaskId)?.status, TaskStatus.PENDING_CONFIRM);
 
 // 3. Stop task on pending/queued
 const stopTaskId = `wf-stop-${Date.now()}`;
@@ -102,8 +108,17 @@ db.saveWorkerPrompt({
   prompt_text: 'Develop the feature',
 });
 
-const startRes = await workflowEngine.confirmAndStartTask(loopTaskId);
+const startRes = await workflowEngine.confirmAndStartTask(loopTaskId, undefined, {
+  workerExecutor: 'codex', reviewerExecutor: 'codex',
+});
 assert.strictEqual(startRes.success, true);
+const competingTaskId = `wf-competing-${Date.now()}`;
+db.createTask({ id: competingTaskId, task_key: 'competing', title: 'Competing task', target_cwd: process.cwd() });
+const competingStart = await workflowEngine.confirmAndStartTask(competingTaskId);
+assert.strictEqual(competingStart.success, false, 'The execution slot must be reserved before asynchronous dispatch');
+assert.strictEqual(db.getTask(competingTaskId)?.status, TaskStatus.PENDING_CONFIRM);
+assert.equal(db.getTask(loopTaskId)?.worker_model, VERIFIER_DEFAULT_MODEL, 'Switching CLI must use the new provider default model');
+assert.equal(db.getTask(loopTaskId)?.reviewer_model, VERIFIER_DEFAULT_MODEL);
 
 // Wait for round 1 to complete and reach HUMAN_REVIEW
 let pollCount = 0;

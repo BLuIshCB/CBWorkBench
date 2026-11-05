@@ -10,28 +10,25 @@ export const RuntimeView = {
     if (!grid) return;
 
     if (!clis || !clis.length) {
-      grid.innerHTML = '<div class="empty-state">暂未检测到任何 Worker CLI 配置</div>';
+      grid.innerHTML = '<div class="empty-state">暂未检测到 CLI 配置</div>';
       return;
     }
 
     const icons = {
       'workbuddy': '🤖',
-      'workbuddy-desktop': '🖥️',
-      'workbuddy-cli': '💻',
-      'codex': '⚖️',
+      'codex': '💻',
+      'antigravity': '🌌',
     };
 
     grid.innerHTML = clis.map((cli) => {
       const icon = icons[cli.id] || '🧩';
       const statusBadge = cli.available
-        ? '<span class="badge badge-completed">就绪 / 可用</span>'
+        ? '<span class="badge badge-completed">入口可启动</span>'
         : cli.configured
         ? '<span class="badge badge-pending_confirm">已声明 (待检测)</span>'
         : '<span class="badge badge-secondary">未就绪</span>';
 
-      const roleBadge = cli.category === 'verifier'
-        ? '<span class="badge badge-human_review">Reviewer 验收者</span>'
-        : '<span class="badge badge-running">Worker 执行者</span>';
+      const roleBadge = '<span class="badge badge-running">CLI 对话</span>';
 
       const connHtml = cli.connectionType
         ? `<div class="cli-meta-item">
@@ -40,12 +37,15 @@ export const RuntimeView = {
            </div>`
         : '';
 
-      const modelsHtml = cli.supportedModels && cli.supportedModels.length > 0
+      const modelsHtml = `<div class="cli-meta-item">
+             <span class="label">默认模型：</span>
+             <span class="value"><code>${escapeHtml(cli.defaultModel || 'default')}</code></span>
+           </div>` + (cli.supportedModels && cli.supportedModels.length > 0
         ? `<div class="cli-meta-item">
-             <span class="label">支持模型：</span>
+             <span class="label">${cli.extraInfo?.modelCatalogSource === 'cli' ? 'CLI 模型目录' : '模型建议'}：</span>
              <span class="value"><code class="code-pill">${escapeHtml(cli.supportedModels.join(', '))}</code></span>
            </div>`
-        : '';
+        : '');
 
       return `
         <div class="card cli-card ${cli.available ? 'cli-card-ready' : ''}" id="cli-card-${cli.id}">
@@ -67,6 +67,8 @@ export const RuntimeView = {
             <p style="color: #8b949e; font-size: 12px; margin-bottom: 8px;">${escapeHtml(cli.description || '')}</p>
             ${connHtml}
             ${modelsHtml}
+            <p>真实对话验证：${escapeHtml(cli.verification?.state || "unknown")} ${escapeHtml(cli.verification?.model || "")} ${escapeHtml(cli.verification?.message || "请点击验证真实对话")}</p>
+            <p>入口：${escapeHtml(cli.discovery?.entry || "未发现")}</p>
             <div class="cli-meta-item">
               <span class="label">适配器标识：</span>
               <span class="value"><code class="path-code">${escapeHtml(cli.id)}</code></span>
@@ -82,7 +84,7 @@ export const RuntimeView = {
               🎯 填入探测台
             </button>
             <button class="btn btn-sm btn-secondary" onclick="window.app.quickProbeCli('${cli.id}')">
-              ⚡ 快速探测
+              ⚡ 验证真实对话
             </button>
           </div>
         </div>
@@ -101,8 +103,8 @@ export const RuntimeView = {
 
     if (previousValue && clis.some((c) => c.id === previousValue)) {
       cliSelect.value = previousValue;
-    } else if (clis.some((c) => c.id === 'workbuddy')) {
-      cliSelect.value = 'workbuddy';
+    } else if (clis.some((c) => c.id === 'codex')) {
+      cliSelect.value = 'codex';
     }
 
     const cwdInput = document.getElementById('probe-cwd-input');

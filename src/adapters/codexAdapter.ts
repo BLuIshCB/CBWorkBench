@@ -1,88 +1,71 @@
-import type {
-  IReviewerAdapter,
-  ReviewerExecutionContext,
-  ReviewerExecutionResult,
-  AdapterExecutionPolicy,
-} from './types.ts';
+import { NativeCliAdapter } from './nativeCliAdapter.ts';
+import { resolveCodexCliConfig } from '../services/cliConfig.ts';
+import { VERIFIER_DEFAULT_MODEL } from '../config/constants.ts';
 import { MANDATORY_CLI_POLICY } from './types.ts';
-import { CodexVerifier } from '../services/codexVerifier.ts';
-import { resolveCodexCliConfig } from '../services/workbuddyConfig.ts';
 import { CliRunner } from '../services/cliRunner.ts';
-import { VERIFIER_DEFAULT_MODEL, DEFAULT_VERIFIER_TIMEOUT_MS, ROOT_DIR } from '../config/constants.ts';
+import { ROOT_DIR } from '../config/constants.ts';
+import { createHash, randomUUID } from 'node:crypto';
 
-/**
- * Codex 自动验收适配器
- * 基于 OpenAI Codex CLI 严格只读沙箱与 --ephemeral 执行项目代码变更验收与审查。
- */
-export class CodexAdapter implements IReviewerAdapter {
+export class CodexAdapter extends NativeCliAdapter {
   readonly id = 'codex';
-  readonly name = 'Codex CLI 验收者 (只读沙箱)';
-  readonly description = '基于 OpenAI Codex CLI 执行 -s read-only 与 --ephemeral 只读沙箱自动化验收。';
-  readonly supportedRoles = ['reviewer'] as const;
+  readonly name = 'Codex CLI';
+  readonly description = '原生 codex exec 对话，无沙箱与交互审批，不依赖客户端。';
   readonly defaultModel = VERIFIER_DEFAULT_MODEL;
-  readonly supportedModels = [VERIFIER_DEFAULT_MODEL, 'gpt-5-turbo', 'o3-mini', 'o1'] as const;
-  readonly connectionType = '只读沙箱子进程 (codex exec -s read-only --ephemeral)';
-  readonly executionPolicy: AdapterExecutionPolicy = MANDATORY_CLI_POLICY;
+  readonly supportedModels = [VERIFIER_DEFAULT_MODEL];
+  readonly connectionType = 'codex exec --dangerously-bypass-approvals-and-sandbox';
+  readonly executionPolicy = MANDATORY_CLI_POLICY;
+  protected resolveConfig = resolveCodexCliConfig;
+  private catalog?: { key: string; expiresAt: number; models: Promise<string[]> };
 
-  async healthCheck(): Promise<{ healthy: boolean; message?: string }> {
+  async healthCheck(): Promise<{healthy:boolean;message?:string}> {
+    const version=await super.healthCheck();
+    if(!version.healthy || process.env.CB_MOCK_CODEX==='true')return version;
     try {
-      const config = resolveCodexCliConfig();
-      const args = [...(config.script ? [config.script] : []), '--version'];
+      const config=this.resolveConfig();
+      const help=await CliRunner.run({runId:randomUUID(),executable:config.executable,args:[...(config.script?[config.script]:[]),...(config.args || []),'exec','--help'],cwd:ROOT_DIR,env:config.env,timeoutMs:10000});
+      const required=['--json','--ephemeral','--skip-git-repo-check','--dangerously-bypass-approvals-and-sandbox'];
+      if(help.errorCode || !required.every(flag=>help.stdout.includes(flag))) return {healthy:false,message:'Codex 版本或入口不兼容：exec --help 缺少所需参数。'+(help.error || '')};
+      return version;
+    } catch(error) {return {healthy:false,message:String(error)};}
+  }
 
-      const runRes = await CliRunner.run({
-        runId: `codex-health-${Date.now()}`,
-        executable: config.executable,
-        args,
-        cwd: ROOT_DIR,
-        timeoutMs: 5000,
-        env: config.env,
+  /** 使用同一 CLI 和账户刷新目录，不把默认模型当成完整列表。 */
+  async listModels(): Promise<string[]> {
+    if (process.env.CB_MOCK_CODEX === 'true') return [...this.supportedModels];
+    const config = this.resolveConfig();
+    const key = createHash('sha256').update(JSON.stringify(config)).digest('hex');
+    if (this.catalog?.key === key && this.catalog.expiresAt > Date.now()) return [...await this.catalog.models];
+    const models = (async () => {
+      const result = await CliRunner.run({
+        runId: randomUUID(), executable: config.executable,
+        args: [...(config.script ? [config.script] : []), ...(config.args || []), 'debug', 'models'],
+        env: config.env, cwd: ROOT_DIR, timeoutMs: 20000,
       });
-
-      if (runRes.exitCode === 0 && runRes.stdout.trim()) {
-        return { healthy: true, message: `已检测到 ${runRes.stdout.trim()} (Direct CLI ephemeral)` };
-      }
-
-      return {
-        healthy: false,
-        message: runRes.error || runRes.stderr || 'Codex CLI 探测失败',
-      };
-    } catch (err: any) {
-      return { healthy: false, message: `Codex CLI 不可用: ${err.message}` };
-    }
+      if (result.errorCode || result.exitCode !== 0) throw new Error(result.error || result.stderr || 'Codex 模型目录读取失败');
+      const catalog = JSON.parse(result.stdout);
+      if (!Array.isArray(catalog.models)) throw new Error('Codex 模型目录缺少 models 数组');
+      const visible = [...new Set<string>(catalog.models.filter((model: any) => model.visibility === 'list')
+        .map((model: any) => model.slug).filter((slug: unknown): slug is string => typeof slug === 'string' && slug.trim().length > 0))];
+      if (!visible.length) throw new Error('Codex 未返回可见模型');
+      return visible;
+    })();
+    const entry = { key, expiresAt: Date.now() + 5 * 60000, models };
+    this.catalog = entry;
+    try { return [...await models]; }
+    catch (error) { if (this.catalog === entry) this.catalog = undefined; throw error; }
   }
 
-  async abort(taskId: string): Promise<void> {
-    await CliRunner.abort(taskId);
+  protected buildArgs(model: string): string[] {
+    return ['exec', '--ephemeral', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '--json',
+      ...(model && model !== 'default' ? ['-m', model] : []), '-'];
   }
 
-  async executeReview(context: ReviewerExecutionContext): Promise<ReviewerExecutionResult> {
-    const startTime = Date.now();
-    const modelUsed = context.model || this.defaultModel;
-    const res = await CodexVerifier.verify({
-      taskId: context.taskId,
-      revision: context.revision,
-      confirmedCwd: context.confirmedCwd,
-      taskPackageDir: context.taskPackageDir,
-      testRunsSummary: context.testRunsSummary,
-      gitDiff: context.gitDiff || '',
-      verifierPrompt: context.verifierPrompt,
-      definedWorkerIds: context.definedWorkerIds,
-      model: modelUsed,
-      timeoutMs: context.timeoutMs ?? DEFAULT_VERIFIER_TIMEOUT_MS,
-    });
-    return {
-      decision: res.decision,
-      revision: res.revision,
-      summary: res.summary,
-      criteriaResults: res.criteriaResults,
-      issues: res.issues,
-      manualChecksPending: res.manualChecksPending,
-      rawOutput: res.rawOutput,
-      durationMs: Date.now() - startTime,
-      modelUsed,
-      metadata: {
-        executionPolicy: this.executionPolicy,
-      },
-    };
+  protected parseOutput(stdout: string): string {
+    const events = stdout.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+    const failure = events.find(e => e.type === 'turn.failed' || e.type === 'error');
+    if (failure) throw new Error(failure.error?.message || failure.message || 'Codex turn failed');
+    if (!events.some(e => e.type === 'turn.completed')) throw new Error('Codex 缺少 turn.completed 事件');
+    return events.filter(e => e.type === 'item.completed' && e.item?.type === 'agent_message')
+      .map(e => e.item.text).join('\n');
   }
 }

@@ -10,13 +10,21 @@ const testSuites = [
   'db.test.ts',
   'gitService.test.ts',
   'testRunner.test.ts',
+  'testRunnerFailures.test.ts',
+  'executionGovernance.test.ts',
+  'executionActivity.test.ts',
   'adapters.test.ts',
+  'nativeAgents.test.ts',
+  'codexModels.test.ts',
+  'codexModelsApi.test.ts',
+  'codexDiscovery.test.ts',
   'workbuddyRegression.test.ts',
   'workbuddyClient.test.ts',
   'runtimeService.test.ts',
   'httpServer.test.ts',
   'mcpServer.test.ts',
   'workflowEngine.test.ts',
+  'workflowExecutionPolicy.test.ts',
 ];
 
 console.log('============================================================');
@@ -60,6 +68,6 @@ console.log('============================================================');
 if (failedCount > 0) {
   process.exit(1);
 } else {
-  console.log('\n🎉 ALL TESTS PASSED! CBWorkBench is fully verified.');
+  console.log('\n🎉 ALL OFFLINE TESTS PASSED. Real CLI conversations are verified separately.');
   process.exit(0);
 }

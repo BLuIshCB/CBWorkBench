@@ -8,13 +8,15 @@ export const DEFAULT_PORT = Number(process.env.CB_PORT) || 3721;
 export const DEFAULT_HOST = process.env.CB_HOST || '127.0.0.1';
 
 export const WORKER_FIXED_MODEL = 'deepseek-v4-flash';
-export const VERIFIER_DEFAULT_MODEL = process.env.CB_VERIFIER_MODEL || 'gpt-5.6-sol';
+export const VERIFIER_DEFAULT_MODEL = 'default';
 
+export const DEFAULT_EXECUTION_TIMEOUT_MS = 3600000;
+export const INTERNAL_SILENCE_WARNING_MS = 300000;
 export const DEFAULT_BUDGET_MAX_ROUNDS = 10;
-export const DEFAULT_BUDGET_TIMEOUT_SECONDS = Number(process.env.CB_BUDGET_TIMEOUT_SECONDS) || 3600; // 60 minutes
-export const DEFAULT_WORKER_TIMEOUT_MS = Number(process.env.CB_WORKER_TIMEOUT_MS) || 1800000; // 30 minutes
-export const DEFAULT_VERIFIER_TIMEOUT_MS = Number(process.env.CB_VERIFIER_TIMEOUT_MS) || 600000; // 10 minutes
-export const DEFAULT_TEST_TIMEOUT_MS = Number(process.env.CB_TEST_TIMEOUT_MS) || 180000; // 3 minutes
+export const DEFAULT_BUDGET_TIMEOUT_SECONDS = 3600; // 60 minutes
+export const DEFAULT_WORKER_TIMEOUT_MS = DEFAULT_EXECUTION_TIMEOUT_MS;
+export const DEFAULT_VERIFIER_TIMEOUT_MS = DEFAULT_EXECUTION_TIMEOUT_MS;
+export const DEFAULT_TEST_TIMEOUT_MS = DEFAULT_EXECUTION_TIMEOUT_MS;
 
 export const ROOT_DIR = path.resolve(__dirname, '../../');
 export const DATA_DIR = path.resolve(process.env.CB_DATA_DIR || path.join(ROOT_DIR, 'data'));
@@ -40,3 +42,7 @@ export const RoundStage = {
   HUMAN_REVIEW: 'human_review',       // 人工审核门禁
 } as const;
 export type RoundStage = (typeof RoundStage)[keyof typeof RoundStage];
+
+for (const key of ['CB_WORKER_TIMEOUT_MS', 'CB_VERIFIER_TIMEOUT_MS', 'CB_TEST_TIMEOUT_MS', 'CB_BUDGET_TIMEOUT_SECONDS']) {
+  if (process.env[key]) console.warn(`[Deprecated] ${key} 已停用，请使用任务单次执行时限。`);
+}

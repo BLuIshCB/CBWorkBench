@@ -1,3 +1,4 @@
+import { refreshExecution, closeExecution } from './components/executionView.js';
 /**
  * CBWorkBench 前端核心应用控制器 (Modern Modular Controller)
  */
@@ -8,6 +9,7 @@ import { Router } from './router.js';
 import { TaskList } from './components/taskList.js';
 import { TaskDetail } from './components/taskDetail.js';
 import { RuntimeView } from './components/runtimeView.js';
+import { populateModelPicker, updateModelPicker, getModelValue } from './components/modelPicker.js';
 import { escapeHtml, copyToClipboard, toggleDrawer } from './utils.js';
 
 export class App {
@@ -24,11 +26,12 @@ export class App {
 
   async init() {
     // 监听路由初始状态
-    this.router.handleRoute();
 
     // 加载全局状态
     await this.fetchSystemStatus();
     await this.fetchExecutors();
+
+    this.router.handleRoute();
 
     // 启动智能轮询
     this.startPolling();
@@ -41,6 +44,7 @@ export class App {
   }
 
   showTaskList(pushHistory = true) {
+    closeExecution();
     store.setState({ currentTaskId: null });
     if (pushHistory) window.history.pushState({}, '', '/');
     this.router.updateNavTabs('tasks');
@@ -138,6 +142,7 @@ export class App {
       }
       store.setState({ currentTaskDetail: data });
       const { availableWorkers, availableReviewers, activeDetailTab, currentMaterialSubtab } = store.getState();
+      refreshExecution(taskId,data.task).catch(error=>console.error('读取执行记录失败',error));
       TaskDetail.render(data, availableWorkers, availableReviewers, activeDetailTab, currentMaterialSubtab);
     } catch (e) {
       console.error('Error fetching task detail:', e);
@@ -184,17 +189,17 @@ export class App {
     const confirmedCwd = inputCwd ? inputCwd.value.trim() : undefined;
 
     const workerSelect = document.getElementById('select-worker-executor');
-    const workerModelSelect = document.getElementById('select-worker-model');
     const reviewerSelect = document.getElementById('select-reviewer-executor');
-    const reviewerModelSelect = document.getElementById('select-reviewer-model');
 
     const workerExecutor = workerSelect?.value;
-    const workerModel = workerModelSelect?.value;
+    const workerModel = getModelValue('select-worker-model');
     const reviewerExecutor = reviewerSelect?.value;
-    const reviewerModel = reviewerModelSelect?.value;
+    const reviewerModel = getModelValue('select-reviewer-model');
+    if (!workerModel || !reviewerModel) { alert('请填写模型名称。'); return; }
 
     try {
       const data = await api.confirmStartTask(currentTaskId, {
+        execution_timeout_ms: Number(document.getElementById('execution-timeout-minutes').value) * 60000,
         confirmed_cwd: confirmedCwd,
         worker_executor: workerExecutor,
         worker_model: workerModel,
@@ -215,7 +220,7 @@ export class App {
   async handleStopTask() {
     const { currentTaskId } = store.getState();
     if (!currentTaskId) return;
-    if (!confirm('确定要停止后续执行吗？当前正在调用的操作返回后将终止派发。')) return;
+    if (!confirm('确定停止当前 CLI 或测试进程吗？已产生的文件改动会保留。')) return;
 
     try {
       const data = await api.stopTask(currentTaskId);
@@ -426,24 +431,13 @@ export class App {
 
   handleProbeTargetChange() {
     const cliSelect = document.getElementById('probe-target-cli');
-    const modelSelect = document.getElementById('probe-model-select');
     const promptInput = document.getElementById('probe-prompt-input');
     if (!cliSelect) return;
 
     const selectedId = cliSelect.value;
     const cli = store.getState().runtimeClis.find((c) => c.id === selectedId);
 
-    if (modelSelect) {
-      if (cli && cli.supportedModels && cli.supportedModels.length) {
-        modelSelect.disabled = false;
-        modelSelect.innerHTML = cli.supportedModels
-          .map((m) => `<option value="${m}" ${m === cli.defaultModel ? 'selected' : ''}>${m}</option>`)
-          .join('');
-      } else {
-        modelSelect.innerHTML = `<option value="">(无需指定模型)</option>`;
-        modelSelect.disabled = true;
-      }
-    }
+    populateModelPicker('probe-model-select', cli);
 
     if (promptInput && (!promptInput.value.trim() || promptInput.dataset.autoFilled === 'true')) {
       if (cli && cli.defaultProbePrompt) {
@@ -499,13 +493,11 @@ export class App {
 
   async quickProbeCli(cliId) {
     this.selectCliForProbe(cliId);
-    await this.runCliProbe();
+    await this.runCliProbe(true);
   }
 
-  async runCliProbe() {
+  async runCliProbe(verify = false) {
     const cliSelect = document.getElementById('probe-target-cli');
-    const modelSelect = document.getElementById('probe-model-select');
-    const timeoutSelect = document.getElementById('probe-timeout-select');
     const cwdInput = document.getElementById('probe-cwd-input');
     const promptInput = document.getElementById('probe-prompt-input');
     const runBtn = document.getElementById('btn-run-probe');
@@ -520,8 +512,9 @@ export class App {
     if (!cliId) return;
 
     const prompt = promptInput?.value || '';
-    const model = modelSelect && !modelSelect.disabled ? modelSelect.value : undefined;
-    const timeoutMs = timeoutSelect ? parseInt(timeoutSelect.value, 10) : 30000;
+    const model = getModelValue('probe-model-select');
+    if (!model) { alert('请填写模型名称。'); return; }
+    const timeoutMs = 180000;
     const cwd = cwdInput?.value?.trim() || undefined;
 
     // Loading UI
@@ -538,7 +531,7 @@ export class App {
     if (outputBox) outputBox.textContent = `[CBWorkBench Probe] 正在向 CLI '${cliId}' 发送请求...\n提示词: "${prompt}"\n超时设置: ${timeoutMs}ms\n\n请稍候...`;
 
     try {
-      const data = await api.probeCli({ cliId, prompt, model, timeoutMs, cwd });
+      const data = await api.probeCli({ cliId, ...(verify ? {verify:true} : {prompt}), model, cwd });
       if (!data.success || !data.result) {
         throw new Error(data.message || 'Probe request returned failure');
       }
@@ -546,7 +539,7 @@ export class App {
       const r = data.result;
       store.setState({ currentProbeResult: r });
 
-      if (r.ok) {
+      if (r.ok && (!verify || r.markerMatched)) {
         badge.className = 'badge badge-completed';
         badge.textContent = '探测成功 · AVAILABLE';
       } else if (r.errorCode === 'AUTH_REQUIRED') {
@@ -618,8 +611,8 @@ export class App {
         const pillCodex = document.getElementById('pill-codex');
 
         if (pillNode) pillNode.textContent = `Node ${s.nodeVersion} SQLite`;
-        if (pillWb) pillWb.textContent = `Worker: ${s.workerModel}`;
-        if (pillCodex) pillCodex.textContent = `Reviewer: ${s.workerModel}`;
+        if (pillWb) pillWb.textContent = `Worker: ${s.workerModel==='default'?'沿用CLI配置':s.workerModel}`;
+        if (pillCodex) pillCodex.textContent = `Reviewer: ${s.verifierModel==='default'?'沿用CLI配置':s.verifierModel}`;
       }
     } catch (e) {
       console.warn('Failed to fetch system status:', e);
@@ -665,42 +658,22 @@ export class App {
   handleWorkerExecutorChange(preferredModel) {
     const { availableWorkers } = store.getState();
     const workerSelect = document.getElementById('select-worker-executor');
-    const modelSelect = document.getElementById('select-worker-model');
-    if (!workerSelect || !modelSelect) return;
+    if (!workerSelect) return;
 
     const worker = availableWorkers.find((w) => w.id === workerSelect.value);
-    const models = worker ? worker.supportedModels : ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-coder'];
-
-    modelSelect.innerHTML = models
-      .map((m) => `<option value="${m}">${m}</option>`)
-      .join('');
-
-    if (preferredModel && models.includes(preferredModel)) {
-      modelSelect.value = preferredModel;
-    } else if (worker && worker.defaultModel) {
-      modelSelect.value = worker.defaultModel;
-    }
+    populateModelPicker('select-worker-model', worker, preferredModel);
   }
 
   handleReviewerExecutorChange(preferredModel) {
     const { availableReviewers } = store.getState();
     const reviewerSelect = document.getElementById('select-reviewer-executor');
-    const modelSelect = document.getElementById('select-reviewer-model');
-    if (!reviewerSelect || !modelSelect) return;
+    if (!reviewerSelect) return;
 
     const reviewer = availableReviewers.find((r) => r.id === reviewerSelect.value);
-    const models = reviewer ? reviewer.supportedModels : ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-coder'];
-
-    modelSelect.innerHTML = models
-      .map((m) => `<option value="${m}">${m}</option>`)
-      .join('');
-
-    if (preferredModel && models.includes(preferredModel)) {
-      modelSelect.value = preferredModel;
-    } else if (reviewer && reviewer.defaultModel) {
-      modelSelect.value = reviewer.defaultModel;
-    }
+    populateModelPicker('select-reviewer-model', reviewer, preferredModel);
   }
+
+  handleModelSelectionChange(id) { updateModelPicker(id); }
 
   toggleDrawer(id) {
     toggleDrawer(id);

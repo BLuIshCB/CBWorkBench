@@ -1,6 +1,10 @@
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
+if (args.includes('--help') || args.includes('--version')) {
+  console.log('CodeBuddy Code fixture 1.0');
+  process.exit(0);
+}
 const scenario = process.env.AGENT_CLI_SCENARIO || args[0] || 'echo';
 
 // 读取 stdin
@@ -30,6 +34,10 @@ process.stdin.on('end', async () => {
   const hasNoSessionPersistence = args.includes('--no-session-persistence');
 
   switch (scenario) {
+    case 'invalid-utf8': {
+      process.stdout.write(Buffer.from([0xc3, 0x28]));
+      break;
+    }
     case 'echo': {
       // 原样输出完整 stdin Buffer
       process.stdout.write(fullBuffer);
@@ -70,10 +78,11 @@ process.stdin.on('end', async () => {
     case 'large-output': {
       // 持续输出大量数据以测试 OUTPUT_LIMIT
       const bigChunk = Buffer.alloc(1024 * 1024, 'A');
+      // 保持进程存活，让用例验证超限终止及回收，而非 process.exit 截断管道。
+      setInterval(() => {}, 10000);
       for (let i = 0; i < 30; i++) {
         process.stdout.write(bigChunk);
       }
-      process.exit(0);
       break;
     }
 

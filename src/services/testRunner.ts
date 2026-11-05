@@ -1,4 +1,6 @@
-import { spawn } from 'node:child_process';
+import type { StopReason } from './executionService.ts';
+import { CliRunner } from './cliRunner.ts';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 import { DEFAULT_TEST_TIMEOUT_MS } from '../config/constants.ts';
@@ -23,9 +25,12 @@ export interface SingleTestResult {
   reportContent?: string;
   passed: boolean;
   durationMs: number;
+  terminationReason?: StopReason;
+  runId?: string;
 }
 
 export interface AggregateTestResult {
+  interrupted?: boolean;
   allPassed: boolean;
   testRuns: SingleTestResult[];
   failureSummary: string | null;
@@ -115,102 +120,34 @@ export class TestRunner {
   static async runSingleTest(
     tc: TestCaseItem,
     workspaceDir: string,
-    timeoutMs: number = DEFAULT_TEST_TIMEOUT_MS
+    timeoutMs: number = DEFAULT_TEST_TIMEOUT_MS,
+    options?: { taskId: string; roundId?: number; signal?: AbortSignal }
   ): Promise<SingleTestResult> {
-    const startTime = Date.now();
     const runCwd = tc.cwd ? path.resolve(workspaceDir, tc.cwd) : workspaceDir;
 
-    return new Promise((resolve) => {
-      // Use shell: true on Windows to handle commands like npm or node
-      const child = spawn(tc.command, {
-        cwd: runCwd,
-        shell: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-      });
-
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
-      let timedOut = false;
-
-      const timer = setTimeout(() => {
-        timedOut = true;
-        try {
-          if (process.platform === 'win32') {
-            spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
-          } else {
-            child.kill('SIGKILL');
-          }
-        } catch {
-          // ignore
-        }
-      }, timeoutMs);
-
-      child.stdout.on('data', (d) => stdoutChunks.push(Buffer.from(d)));
-      child.stderr.on('data', (d) => stderrChunks.push(Buffer.from(d)));
-
-      child.on('close', (code) => {
-        clearTimeout(timer);
-        const durationMs = Date.now() - startTime;
-        const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-        let stderr = Buffer.concat(stderrChunks).toString('utf8');
-
-        if (timedOut) {
-          stderr += `\n[TestRunner] Command timed out after ${timeoutMs}ms.`;
-        }
-
-        let reportContent: string | undefined;
-        let reportExists = true;
-
-        if (tc.reportPath) {
-          const resolvedReport = path.resolve(runCwd, tc.reportPath);
-          if (fs.existsSync(resolvedReport)) {
-            try {
-              reportContent = fs.readFileSync(resolvedReport, 'utf8');
-            } catch {
-              reportContent = '(Report file exists but could not be read)';
-            }
-          } else {
-            reportExists = false;
-          }
-        }
-
-        const passed = !timedOut && code === 0 && reportExists;
-
-        resolve({
-          testCaseId: tc.id,
-          command: tc.command,
-          exitCode: code ?? -1,
-          stdout,
-          stderr,
-          reportPath: tc.reportPath,
-          reportContent,
-          passed,
-          durationMs,
-        });
-      });
-
-      child.on('error', (err) => {
-        clearTimeout(timer);
-        const durationMs = Date.now() - startTime;
-        resolve({
-          testCaseId: tc.id,
-          command: tc.command,
-          exitCode: -1,
-          stdout: '',
-          stderr: `[TestRunner] Process spawn error: ${err.message}`,
-          reportPath: tc.reportPath,
-          passed: false,
-          durationMs,
-        });
-      });
-    });
+    const result = await CliRunner.run({ runId: randomUUID(), taskId: options?.taskId, roundId:options?.roundId, executable: tc.command,
+      cwd: runCwd, shell: true, timeoutMs, signal: options?.signal });
+    // 退出码非零也可能来自日志保存失败后的终止，只有执行器明确标记的普通退出才允许返修。
+    const assertionFailure = result.failureKind === 'exit-code' && result.cleanupConfirmed === true && result.stopReason === 'PROCESS_FAILED';
+    const terminationReason = assertionFailure ? undefined : result.stopReason;
+    let reportContent: string | undefined;
+    let reportExists = true;
+    if (tc.reportPath) {
+      try { reportContent = fs.readFileSync(path.resolve(runCwd, tc.reportPath), 'utf8'); }
+      catch { reportExists = false; }
+    }
+    return { testCaseId: tc.id, command: tc.command, exitCode: result.exitCode ?? -1,
+      stdout: result.stdout, stderr: result.stderr + (result.error ? '\n' + result.error : ''),
+      reportPath: tc.reportPath, reportContent, passed: !result.errorCode && !terminationReason && result.exitCode === 0 && reportExists,
+      durationMs: result.durationMs, runId: result.runId,
+      terminationReason };
   }
 
   static async runAllTests(
     testCases: TestCaseItem[],
     workspaceDir: string,
-    timeoutMs: number = DEFAULT_TEST_TIMEOUT_MS
+    timeoutMs: number = DEFAULT_TEST_TIMEOUT_MS,
+    options?: { taskId: string; roundId?: number; signal?: AbortSignal }
   ): Promise<AggregateTestResult> {
     if (testCases.length === 0) {
       logger.info('[TestRunner] No automated test commands found to execute.');
@@ -226,9 +163,11 @@ export class TestRunner {
     const failures: string[] = [];
 
     for (const tc of testCases) {
+      if (options?.signal?.aborted) return { allPassed: false, testRuns, interrupted: true, failureSummary: "Execution cancelled" };
       logger.info(`[TestRunner] Executing test ${tc.id}: ${tc.command}`);
-      const result = await this.runSingleTest(tc, workspaceDir, timeoutMs);
+      const result = await this.runSingleTest(tc, workspaceDir, timeoutMs, options);
       testRuns.push(result);
+      if (result.terminationReason) return { allPassed: false, testRuns, interrupted: true, failureSummary: result.stderr };
 
       if (!result.passed) {
         allPassed = false;

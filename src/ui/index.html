@@ -40,7 +40,7 @@
       <div class="section-header">
         <div class="title-group">
           <h2>开发任务看板</h2>
-          <p class="subtitle">单机串行执行 · WorkBuddy 开发修复 · Codex 自动验收 · 用户终审门禁</p>
+          <p class="subtitle">单机串行执行 · CLI 对话开发与验收 · 独立测试 · 用户终审门禁</p>
         </div>
         <div class="action-group">
           <button class="btn btn-secondary" onclick="app.refreshTaskList()">🔄 刷新列表</button>
@@ -99,6 +99,7 @@
       <div class="card confirmation-card" id="gate2-card" style="display: none;">
         <h3>门禁 2：用户确认并开始执行</h3>
         <p class="desc">聊天中的同意、模型提交任务或 MCP 调用均不能代替此页面操作。请选择执行者与模型，核对工作目录后点击确认。</p>
+        <p class="desc">执行使用当前用户权限，工作目录不构成安全隔离。开发和验收 CLI 均可能写文件；当前参数沿用厂商的跳过审批策略。</p>
         
         <!-- Executor & Model Selection -->
         <div class="form-row-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; background: #0d1117; padding: 14px; border-radius: 6px; border: 1px solid var(--surface-border);">
@@ -110,11 +111,10 @@
               <select id="select-worker-executor" class="form-control" style="flex: 1;" onchange="app.handleWorkerExecutorChange()">
                 <option value="workbuddy">WorkBuddy (本地执行 · 无沙箱)</option>
               </select>
-              <select id="select-worker-model" class="form-control" style="flex: 1;">
-                <option value="deepseek-v4-flash">deepseek-v4-flash</option>
-                <option value="deepseek-chat">deepseek-chat</option>
-                <option value="deepseek-coder">deepseek-coder</option>
-              </select>
+              <div style="flex: 1; min-width: 0;">
+                <select id="select-worker-model" class="form-control" onchange="app.handleModelSelectionChange('select-worker-model')"></select>
+                <input id="select-worker-model-custom" class="form-control" style="display: none; margin-top: 6px;" aria-label="手动输入开发模型" placeholder="输入模型名称">
+              </div>
             </div>
           </div>
 
@@ -126,15 +126,19 @@
               <select id="select-reviewer-executor" class="form-control" style="flex: 1;" onchange="app.handleReviewerExecutorChange()">
                 <option value="workbuddy">WorkBuddy (质量审查 · 无沙箱)</option>
               </select>
-              <select id="select-reviewer-model" class="form-control" style="flex: 1;">
-                <option value="deepseek-v4-flash">deepseek-v4-flash</option>
-                <option value="deepseek-chat">deepseek-chat</option>
-                <option value="deepseek-coder">deepseek-coder</option>
-              </select>
+              <div style="flex: 1; min-width: 0;">
+                <select id="select-reviewer-model" class="form-control" onchange="app.handleModelSelectionChange('select-reviewer-model')"></select>
+                <input id="select-reviewer-model-custom" class="form-control" style="display: none; margin-top: 6px;" aria-label="手动输入验收模型" placeholder="输入模型名称">
+              </div>
             </div>
           </div>
         </div>
 
+        <div class="form-row">
+          <label for="execution-timeout-minutes">单次执行超时时间（分钟）</label>
+          <input id="execution-timeout-minutes" type="number" min="1" max="1440" step="1" value="60" class="form-control">
+          <p>每次 CLI 调用或每条独立测试命令分别计时。旧分阶段和总预算已停用。</p>
+        </div>
         <div class="form-row">
           <label for="input-confirmed-cwd">执行目录 (工作台识别的真实项目路径)：</label>
           <div class="input-with-button">
@@ -260,8 +264,8 @@
     <section id="view-runtime" class="view-section" style="display: none;">
       <div class="section-header">
         <div class="title-group">
-          <h2>🧩 适配器中心 (Adapters & Workers)</h2>
-          <p class="subtitle">适配器即 Worker。工作台所有执行者均基于 IAgentAdapter 注册中心统一接入，每开发一个适配器即对应一个 Worker，支持即时发送提示词探测连通性</p>
+          <h2>🧩 CLI 适配器中心</h2>
+          <p class="subtitle">Codex、WorkBuddy、Antigravity 共用同一个对话接口；开发或验收由提示词决定，不限制适配器角色。</p>
         </div>
         <div class="action-group">
           <button class="btn btn-secondary" onclick="app.fetchRuntimeClis()">刷新适配器状态</button>
@@ -302,13 +306,13 @@
         <div class="probe-header">
           <div class="probe-title-group">
             <h3>🎯 适配器提示词即时探测控制台</h3>
-            <p class="desc">向选定的适配器实例发送提示词，直接测试底层 executeDevTask() 或 executeReview() 连通性与模型回包能力。</p>
+            <p class="desc">通过统一 execute() 接口发送提示词，直接验证独立 CLI 的登录态与模型响应。开发和验收使用相同调用能力。</p>
           </div>
         </div>
 
         <div class="probe-form-grid">
           <div class="form-group">
-            <label for="probe-target-cli">目标适配器 (Worker/Reviewer)：</label>
+            <label for="probe-target-cli">目标 CLI：</label>
             <select id="probe-target-cli" class="form-control" onchange="app.handleProbeTargetChange()">
               <!-- Injected by JS -->
             </select>
@@ -316,18 +320,12 @@
 
           <div class="form-group">
             <label for="probe-model-select">执行模型 (可选)：</label>
-            <select id="probe-model-select" class="form-control">
-              <!-- Injected by JS -->
-            </select>
+            <select id="probe-model-select" class="form-control" onchange="app.handleModelSelectionChange('probe-model-select')"></select>
+            <input id="probe-model-select-custom" class="form-control" style="display: none; margin-top: 6px;" aria-label="手动输入执行模型" placeholder="输入模型名称，default 使用 CLI 默认模型">
           </div>
 
           <div class="form-group">
-            <label for="probe-timeout-select">超时时限：</label>
-            <select id="probe-timeout-select" class="form-control">
-              <option value="15000">15 秒 (轻量探针)</option>
-              <option value="30000" selected>30 秒 (标准推荐)</option>
-              <option value="60000">60 秒 (慢速模型)</option>
-            </select>
+            <p>CLI 连通性检查使用内部固定时限。</p>
           </div>
         </div>
 
@@ -339,7 +337,7 @@
         <div class="prompt-preset-bar">
           <span class="preset-label">快捷预设：</span>
           <button type="button" class="preset-btn" onclick="app.setProbePreset('wb_echo')">⚡ WorkBuddy 标准回声</button>
-          <button type="button" class="preset-btn" onclick="app.setProbePreset('codex')">⚖️ Codex 验收探测</button>
+          <button type="button" class="preset-btn" onclick="app.setProbePreset('codex')">💻 Codex 对话探测</button>
           <button type="button" class="preset-btn" onclick="app.setProbePreset('pong')">🏓 极简响应 (PONG)</button>
         </div>
 

@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { WorkBuddyClient } from '../services/workbuddyClient.ts';
-import { resolveWorkBuddyCliConfig } from '../services/workbuddyConfig.ts';
+import { resolveWorkBuddyCliConfig } from '../services/cliConfig.ts';
 
 const action = process.argv[2] || 'status';
 try {
@@ -22,13 +22,13 @@ try {
   } else if (action === 'login') {
     const config = resolveWorkBuddyCliConfig();
     const script = config.script;
-    if (!config || !script || !fs.existsSync(script)) throw new Error('没有可交互登录的 CLI 路径，请在 WorkBuddy 桌面端登录。');
+    if (!config || !script || !fs.existsSync(script)) throw new Error('没有可交互登录的 CLI 路径，请安装完整 CLI 并配置 data/agent-cli.json。');
     const dist = path.resolve(path.dirname(script), '..', 'dist');
     if (fs.existsSync(path.join(dist, 'codebuddy-lite-wb.mjs')) && !fs.existsSync(path.join(dist, 'codebuddy.js'))) {
-      throw new Error('当前安装仅包含 WorkBuddy lite-wb，缺少交互式 CLI。请在 WorkBuddy 桌面端登录，再运行 node bin/workbuddy.js verify；独立 CLI 模式需使用支持 /login 的完整 CLI。');
+      throw new Error('当前安装仅包含 lite-wb，缺少交互式 CLI。请运行 bin/install-clis.ps1 安装完整 CLI，再执行 node bin/agent.js login workbuddy。');
     }
     console.log(`请在交互会话中执行 /login。配置目录：${config.env?.CODEBUDDY_CONFIG_DIR || '(CLI default)'}`);
-    const child = spawn(config.executable || process.execPath, [script], { cwd: process.cwd(), env: config.env, stdio: 'inherit', shell: false, windowsHide: false });
+    const child = spawn(config.executable || process.execPath, [script, ...(config.args || [])], { cwd: process.cwd(), env: config.env, stdio: 'inherit', shell: false, windowsHide: false });
     child.once('error', error => { console.error(error.message); process.exitCode = 1; });
     child.once('close', code => { process.exitCode = code ?? 1; });
   } else throw new Error('Usage: node bin/workbuddy.js status|verify [cwd]|login');

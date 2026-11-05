@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
+import { ROOT_DIR } from '../config/constants.ts';
 
 export interface AgentCliConfig {
+  discoverySource?: 'config'|'path'|'npm'|'project';
   executable: string;
   script?: string;
   args?: string[];
@@ -13,6 +15,7 @@ export interface AgentCliConfig {
 export interface WorkbenchCliConfigs {
   workbuddy?: AgentCliConfig;
   codex?: AgentCliConfig;
+  antigravity?: AgentCliConfig;
 }
 
 const agentCliSchema = z.object({
@@ -26,6 +29,7 @@ const agentCliSchema = z.object({
 const workbenchCliConfigsSchema = z.object({
   workbuddy: agentCliSchema.optional(),
   codex: agentCliSchema.optional(),
+  antigravity: agentCliSchema.optional(),
 });
 
 /**
@@ -38,7 +42,8 @@ export function resolveAgentCliConfigs(): WorkbenchCliConfigs {
     );
   }
 
-  const configFile = process.env.CB_AGENT_CLI_CONFIG;
+  const localConfig = path.join(ROOT_DIR, 'data', 'agent-cli.json');
+  const configFile = process.env.CB_AGENT_CLI_CONFIG || (fs.existsSync(localConfig) ? localConfig : undefined);
   if (configFile) {
     if (!fs.existsSync(configFile)) {
       throw new Error(`CB_AGENT_CLI_CONFIG 指定的配置文件不存在: '${configFile}'`);
@@ -133,30 +138,55 @@ function applyLiteWbBundleDetection(config: AgentCliConfig): void {
 export function resolveCodexCliConfig(): AgentCliConfig {
   const configs = resolveAgentCliConfigs();
   if (configs.codex) {
-    return { ...configs.codex, env: { ...process.env as Record<string, string>, ...configs.codex.env } };
+    return { ...configs.codex, ...resolveCodexExecutableOrNode(configs.codex.executable), discoverySource:'config', env: { ...process.env as Record<string, string>, ...configs.codex.env } };
   }
 
   // 检查已知的 Codex 包装脚本与原生路径
   const customCmd = process.env.CODEX_CMD_PATH;
-  if (customCmd && fs.existsSync(customCmd)) {
-    return resolveCodexExecutableOrNode(customCmd);
+  if (customCmd) {
+    if (!fs.existsSync(customCmd)) throw new Error('CODEX_CMD_PATH 指定入口不存在');
+    return {...resolveCodexExecutableOrNode(customCmd),discoverySource:'config'};
   }
 
   const home = process.env.USERPROFILE || process.env.HOME || '';
+  const pathDirectories=(process.env.PATH || '').split(path.delimiter).filter(dir=>dir.trim());
+  const pathCount=pathDirectories.length*(process.platform==='win32'?3:1);
   const candidates = [
+    ...pathDirectories.flatMap(dir => (process.platform === 'win32' ? ['codex.exe','codex.cmd','codex.ps1'] : ['codex']).map(name => path.join(dir.replace(/^"|"$/g,''),name))),
+    ...[process.env.NPM_CONFIG_PREFIX,process.env.npm_config_prefix].filter((dir):dir is string=>Boolean(dir)).map(dir=>path.join(dir,'node_modules','@openai','codex','bin','codex.js')),
     path.join(home, 'AppData', 'Roaming', 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js'),
     path.join(home, 'AppData', 'Roaming', 'npm', 'codex.cmd'),
-    'codex.cmd',
-    'codex',
+    path.join(ROOT_DIR, 'data', 'runtimes', 'native', 'node_modules', '@openai', 'codex', 'bin', 'codex.js'),
   ];
 
-  for (const c of candidates) {
+  for (const [index,c] of candidates.entries()) {
     if (fs.existsSync(c)) {
-      return resolveCodexExecutableOrNode(c);
+      return {...resolveCodexExecutableOrNode(c),discoverySource:index<pathCount?'path':c.startsWith(ROOT_DIR)?'project':'npm'};
     }
   }
 
-  return { executable: 'codex' };
+  return { executable: 'codex',discoverySource:'path' };
+}
+
+/** 交互登录与非交互调用必须使用完全相同的入口及配置。 */
+export function resolveCliConfig(id: string): AgentCliConfig {
+  if (id === 'workbuddy') return resolveWorkBuddyCliConfig();
+  if (id === 'codex') return resolveCodexCliConfig();
+  if (id === 'antigravity') return resolveAntigravityCliConfig();
+  throw new Error(`未知 CLI: ${id}`);
+}
+
+/** agy 是独立 CLI，不能用 Antigravity.exe 或 IDE 的启动命令代替。 */
+export function resolveAntigravityCliConfig(): AgentCliConfig {
+  const config = resolveAgentCliConfigs().antigravity;
+  if (config) return { ...config, env: { ...process.env as Record<string, string>, ...config.env } };
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const candidates = [process.env.ANTIGRAVITY_CLI_PATH,
+    path.join(ROOT_DIR, 'data', 'runtimes', 'antigravity', 'agy.exe'),
+    path.join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'),
+    path.join(home, '.local', 'bin', 'agy')];
+  for (const candidate of candidates) if (candidate && fs.existsSync(candidate)) return { executable: candidate };
+  return { executable: process.platform === 'win32' ? 'agy.exe' : 'agy' };
 }
 
 /**
@@ -170,7 +200,7 @@ function resolveCodexExecutableOrNode(targetPath: string): AgentCliConfig {
     };
   }
 
-  if (targetPath.endsWith('.cmd')) {
+  if (/\.(cmd|ps1)$/i.test(targetPath)) {
     // 检查是否有平行的 node_modules/@openai/codex/bin/codex.js
     const dir = path.dirname(targetPath);
     const scriptPath = path.join(dir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
@@ -182,5 +212,6 @@ function resolveCodexExecutableOrNode(targetPath: string): AgentCliConfig {
     }
   }
 
+  if (/\.(cmd|ps1)$/i.test(targetPath)) throw new Error('无法安全解析 Codex 包装器，请配置实际 exe 或 node+script 入口。');
   return { executable: targetPath };
 }

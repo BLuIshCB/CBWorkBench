@@ -14,6 +14,12 @@ const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-clirunner-test-'));
 
 console.log('[Test] Running cliRunner.test.ts...');
 
+const malformedUtf8 = await CliRunner.run({
+  runId: 'invalid-utf8', executable: process.execPath, args: [fixtureScript, 'invalid-utf8'],
+  cwd: tempDir, timeoutMs: 5000,
+});
+assert.equal(malformedUtf8.errorCode, 'PROTOCOL', 'Malformed bytes must fail instead of silently replacing characters');
+
 // 1. T01 & T02: 中文多行、特殊字符、emoji、反斜杠、CRLF/LF 等完整 UTF-8 管道测试
 {
   const complexPrompt = `Line 1: 中文测试𠮷😀
@@ -128,6 +134,7 @@ Line 5: CRLF\r\nEnd of test`;
 
   assert.equal(res.timedOut, true);
   assert.equal(res.errorCode, 'TIMEOUT');
+  assert.equal(res.cleanupConfirmed, true);
   assert.ok(Date.now() - start >= 900, 'Must wait until timeout');
   console.log('  ✓ T10: Hanging process terminated and marked TIMEOUT');
 }
@@ -160,6 +167,7 @@ Line 5: CRLF\r\nEnd of test`;
   const [res1, res2] = await Promise.all([p1, p2]);
 
   assert.equal(res1.cancelled, true);
+  assert.equal(res1.cleanupConfirmed, true);
   assert.equal(res1.errorCode, 'CANCELLED');
 
   assert.equal(res2.cancelled, false);
@@ -180,6 +188,7 @@ Line 5: CRLF\r\nEnd of test`;
   });
 
   assert.equal(res.errorCode, 'OUTPUT_LIMIT');
+  assert.equal(res.cleanupConfirmed, true);
   console.log('  ✓ T13: Output exceeding limit terminated and reported OUTPUT_LIMIT');
 }
 

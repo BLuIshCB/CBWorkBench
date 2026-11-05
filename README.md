@@ -1,7 +1,7 @@
 # CBWorkBench 多 Agent 开发工作台
 
 > 从零构建的单机单用户、串行执行、强门禁保障的多 Agent 协作开发工作台。  
-> 核心实现 Worker（WorkBuddy / `deepseek-v4-flash`）编码开发、独立测试执行与 Verifier（Codex CLI / `gpt-5.6-sol` 只读沙箱）自动验收，以及严格的人工双重核对确认机制。
+> 通过 WorkBuddy、Codex、Antigravity 的独立 CLI 统一对话接口完成开发与验收；保留独立测试和人工确认，不需要启动桌面客户端。
 
 ---
 
@@ -14,10 +14,10 @@ flowchart TD
     A["主 Agent 对话 (cb-flow)"] -->|"生成独立无上下文任务包"| B["门禁 1: 聊天内上传授权"]
     B -->|"用户确认授权"| C["工作台 MCP 提交: workbench_submit_task"]
     C -->|"写入待启动状态: pending_confirm"| D["门禁 2: 工作台 Web 手动启动确认"]
-    D -->|"用户核对目标路径 & 点击【确认并开始】"| E["执行闭环: Worker 编码开发 (deepseek-v4-flash)"]
+    D -->|"用户核对目标路径 & 点击【确认并开始】"| E["执行闭环: 选定 CLI 执行开发提示词"]
     E --> F["工作台独立执行自动化测试 (tests.md)"]
     F -->|"测试未通过"| E
-    F -->|"测试通过"| G["Codex CLI 严格自动验收 (gpt-5.6-sol / read-only)"]
+    F -->|"测试通过"| G["选定 CLI 执行验收提示词"]
     G -->|"验收未通过 (needs_changes)"| E
     G -->|"验收通过 (passed)"| H["门禁 3: 最终人工审核 (human_review)"]
     H -->|"人工退回并附原因"| E
@@ -34,21 +34,15 @@ flowchart TD
 - 用户必须在 Web 控制台中亲自核对任务所属的工作目录（`target_cwd`）及 Git 变更状态，点击 **【确认并开始】** 按钮后，后台才开始串行调度。
 
 ### 3. 门禁三：最终人工审核门禁（最终人工审核）
-- Worker 开发修复、独立测试命令与 Codex 自动验收全通过后，任务进入 `human_review`。
-- 用户在 Web 控制台查阅代码完整 Working Tree Diff、各轮次运行记录和 Codex 验收报告。
+- 开发修复、独立测试命令与选定 CLI 的自动验收全通过后，任务进入 `human_review`。
+- 用户在 Web 控制台查阅代码完整 Working Tree Diff、各轮次运行记录和验收报告。
 - 用户点击 **【通过并完成】** 正式结项；或点击 **【退回修改】** 输入重修反馈，驱动引擎进入下一轮闭环修复。
 
 ---
 
-## 🤖 角色分工与模型配置
+## CLI 对话能力
 
-| 角色 | 接入实现 | 模型 | 沙箱与权限 | 职责说明 |
-| :--- | :--- | :--- | :--- | :--- |
-| **主 Agent** | 聊天对话端 | 用户当前模型 | 规划与协调 | 理解需求，生成无上下文独立任务包，获得授权后提交工作台。 |
-| **Worker (开发者)** | WorkBuddy MCP (`run_workbuddy_task`) | `deepseek-v4-flash` | 本地工作区读写 | 依据当前轮次提示词、上一轮测试失败摘要或验收问题，修改业务代码。 |
-| **Test Runner** | 工作台本地独立子进程 | 原生进程 | 超时熔断执行 | 独立执行项目构建与测试命令（如 `npm test`），不依赖 Worker 自测声称。 |
-| **Verifier (验收者)** | Codex CLI (`codex exec`) | `gpt-5.6-sol` | `-s read-only` 严格只读沙箱 | 检查代码快照、Diff 与测试证据，依据 JSON Schema 输出判定（通过/退回/阻断）。 |
-| **Human (最终审核)** | Web 控制台 UI | 人类用户 | 最终决定权 | 核验实际运行效果与界面展示，确认无误后结项或退回。 |
+WorkBuddy、Codex 和 Antigravity 都实现同一个 IAgentAdapter.execute()。开发、验收或普通问答由提示词决定；适配器不限制角色，不设置沙箱。权限与行为边界说明、安装和调用命令见 [CLI 接入与验证](docs/CLI接入与验证.md)。
 
 ---
 
@@ -56,58 +50,26 @@ flowchart TD
 
 ### 1. 环境准备
 CBWorkBench 内置跨运行时自检测引擎（`nodeResolver.js`）：
-- 系统默认 Node 18 或更高版本均可。
-- 若系统 Node 缺少原生 `node:sqlite`（如 Node 18），启动器会自动查找并桥接调用本地安装的 Node 24 运行时（位于 `.cache/codex-runtimes`），原生支持 `--experimental-strip-types`。
+- 源码运行需要 Node 24+ 和 `npm install` 安装的工作台依赖；本次验证版本为 Node 24.22.1。只有 Codex CLI 并不足以运行工作台。
+- 启动器可探测已存在的兼容 Node 24 运行时，也可通过 `CB_NODE_PATH` 指定；找不到时须先安装运行时。
 
 ### 2. 安装依赖
 ```bash
 npm install
 ```
 
-### WorkBuddy 适配器与 Direct CLI 配置
+### 统一 CLI 安装与验证
 
-Worker 和 Reviewer 默认基于 `IAgentAdapter` 规范体系调用 Direct CLI。执行过程中严格强制 **无会话持久化**（`--no-session-persistence` / `--ephemeral`）与 **UTF-8 stdin 提示词直接传递**，彻底杜绝在桌面客户端中新增对话或会话残留。
-
-系统支持通过环境变量 `CB_AGENT_CLI_CONFIG` 指定独立 JSON 配置文件：
-
-```json
-{
-  "workbuddy": {
-    "executable": "node",
-    "script": "C:/path/to/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy",
-    "env": {
-      "CODEBUDDY_CONFIG_DIR": "C:/Users/your-name/.workbuddy"
-    }
-  },
-  "codex": {
-    "executable": "codex"
-  }
-}
-```
-
-若未显式指定 `CB_AGENT_CLI_CONFIG`，工作台会自动按照优先级探测系统环境：
-1. 进程环境变量 `WB_COMMAND` / `WB_CLI_SCRIPT`。
-2. 本机已核验的默认安装路径（如 `WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy`）。
+详见 [CLI 接入与验证](docs/CLI接入与验证.md)。已有 Codex 时直接检查，无需安装其他两家 CLI：
 
 ```powershell
-# 验证 Direct CLI 连通性与帮助命令可启动性
-node bin/workbuddy.js status
-
-# 真实调用探测，退出码 0 且 verified=true 表示执行成功
-node bin/workbuddy.js verify
-
-# 交互式 CLI 登录（使用当前配置目录）
-node bin/workbuddy.js login
+node bin/agent.js list
+.\bin\check-codex.ps1
+npm start
+# 在运行时页面点击 Codex 的“验证真实对话”
 ```
 
-如果返回 `AUTH_REQUIRED`，需要完成登录或修复当前配置目录对应的登录态。
-桌面端登录不保证独立 CLI 登录态可用。仅含 `lite-wb` 的 WorkBuddy 安装没有交互式 CLI，
-登录命令会明确提示使用桌面端或完整 CLI。
-鉴权失败、超时、取消、协议异常都会如实返回；Reviewer 仅接受符合结构的 JSON 判定，
-不会根据测试摘要或“通过”等文本自动放行，也不会生成替代业务产物。
-
-修复配置或登录后，用户可在控制台重新确认启动受阻任务。
-诊断命令不会启动、完成或审核已有业务任务。
+入口检查与真实对话验证分开；三家都通过 UTF-8 stdin 接收完整提示词。WorkBuddy 首次使用需独立 CLI 登录，不能假定桌面版加密凭据可以直接复用。
 
 ### 3. 启动 Web 控制台与后台服务
 
@@ -122,7 +84,7 @@ npm start
 👉 **Web 访问地址**：[http://127.0.0.1:3721](http://127.0.0.1:3721)
 
 ### 4. 运行测试套件
-运行完整的单元测试与集成测试验证（100% 通过）：
+运行离线单元和集成测试；默认使用独立临时数据库：
 ```bash
 npm test
 ```
@@ -176,7 +138,7 @@ CBWorkBench 提供了标准 Stdio MCP 服务 `bin/cb-workbench-mcp.js`。
 6. **执行轮次与详细材料查阅**：
    - 折叠时间轴查阅每一轮的 Worker 提示词、Worker 实际输出、自动化测试输出、Codex 判定理由及全量任务材料。
 7. **运行环境与 CLI 探测页面 (`/runtime`)**：
-   - 查看工作台检测到的所有 CLI（WorkBuddy Desktop 桌面桥接、WorkBuddy CLI MCP、Codex CLI、Node.js 运行时与 Git）。
+   - 查看工作台检测到的所有 CLI（Codex、WorkBuddy 和 Antigravity 原生 CLI；其他 CLI 缺失不阻断 Codex）。
    - **交互式提示词探测控制台**：支持自选 CLI 与模型，使用简单提示词或一键预设（标准回声、PONG、身份问答等）即时探测连通性，秒级输出回包响应、耗时指标及鉴权诊断建议。
 
 ---
@@ -219,7 +181,7 @@ CBWorkBench/
 │   ├── BOUNDARIES.md         # 开发边界与追踪分支规范 (单分支策略/三道门禁/权限边界)
 │   └── ARCHITECTURE.md       # 从零版总体架构与使用流程完整说明
 ├── src/
-│   ├── adapters/             # 多 Agent 多态适配器中心 (WorkBuddy CLI / Codex CLI)
+│   ├── adapters/             # WorkBuddy / Codex / Antigravity 共用对话接口
 │   ├── config/
 │   │   └── constants.ts      # 常量、状态枚举与默认配置定义
 │   ├── server/
@@ -228,8 +190,9 @@ CBWorkBench/
 │   ├── services/
 │   │   ├── gitService.ts     # Git 工作区探测与全量 Diff 快照生成
 │   │   ├── testRunner.ts     # 独立自动化测试解析器与超时熔断执行器
-│   │   ├── workbuddyClient.ts# WorkBuddy MCP 客户端 (deepseek-v4-flash)
-│   │   ├── codexVerifier.ts  # Codex CLI 验收客户端 (gpt-5.6-sol / read-only)
+│   │   ├── cliConfig.ts      # 三家独立 CLI 启动配置
+│   │   ├── cliRunner.ts      # UTF-8 子进程、超时和取消
+│   │   ├── acceptanceService.ts # 验收提示词与业务结果校验
 │   │   ├── runtimeService.ts # 适配器状态检测与提示词即时探测服务
 │   │   └── workflowEngine.ts # 核心串行循环状态机、预算控制与门禁调度
 │   ├── storage/
@@ -244,8 +207,8 @@ CBWorkBench/
 │       └── nodeResolver.js   # 跨环境 Node.js 运行时探测器
 ├── skills/
 │   └── cb-flow/              # 主 Agent 专用的任务包制作与上传 Skill
-├── tests/                    # 完整单元与集成测试套件 (PASS 11/11)
-├── data/                     # 运行时 SQLite 数据库与任务包持久化目录 (已清空测试数据)
+├── tests/                    # 离线回归与显式真实 CLI 测试
+├── data/                     # 运行时配置、CLI、数据库、任务包和验证报告
 └── package.json
 ```
 
@@ -254,3 +217,13 @@ CBWorkBench/
 ## 📜 许可证
 
 本项目依据内部分布式 Agent 协同规范从零开发，遵循 MIT 协议。
+
+### 单次执行与首次使用
+
+源码版需要 Node 24+、Git 和项目依赖（`npm install`）。已有 Codex 时无需重装：先启动工作台检查入口与版本，再在运行时页面点击“验证真实对话”。认证失败时在原生终端运行 `codex login`；不读取或展示 token。默认模型“沿用CLI配置”不传 `-m`。选定项目后依照 MCP 配置上传完整任务包，在网页确认目录、执行器和单次执行超时时间，最终仍需人工审核。
+
+单次默认60分钟，范围1–1440整数分钟。一次开发、一次验收或每条独立测试命令各自重新计时；停止使用整个任务总预算，最多轮次规则继续生效。5分钟无输出仅提醒，任何输出都不延长硬上限。超时保留文件改动与输出，受阻后须人工重新确认，重试不恢复原CLI会话。
+
+当前 Codex 参数包含 `--dangerously-bypass-approvals-and-sandbox`：命令具有当前用户权限，工作目录不构成安全隔离，验收也不具备强制只读保护。本轮保持既有权限策略。原始日志属于敏感本地材料，任意输出无法保证自动脱敏。
+
+参考：[Codex 非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)。本轮提供源码运行，无发行包、内置运行时或安装器。

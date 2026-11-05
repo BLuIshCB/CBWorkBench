@@ -43,7 +43,7 @@ try {
   assert.strictEqual(sysRes.status, 200);
   const sysData = await sysRes.json();
   assert.strictEqual(sysData.success, true);
-  assert.strictEqual(sysData.status.workerModel, WORKER_FIXED_MODEL);
+  assert.strictEqual(sysData.status.workerModel, VERIFIER_DEFAULT_MODEL);
   assert.strictEqual(sysData.status.verifierModel, VERIFIER_DEFAULT_MODEL);
 
   // 3. List tasks API

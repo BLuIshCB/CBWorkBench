@@ -1,14 +1,17 @@
+import { resolveExecutionTimeout } from './executionPolicy.ts';
 import { db, type TaskRecord, type TaskRevisionRecord } from '../storage/db.ts';
 import { taskFileStore } from '../storage/fileStore.ts';
 import { GitService } from './gitService.ts';
 import { TestRunner, type TestCaseItem } from './testRunner.ts';
-import { WorkBuddyClient } from './workbuddyClient.ts';
+import { CliRunner } from './cliRunner.ts';
 import { adapterRegistry } from '../adapters/registry.ts';
-import { TaskStatus, RoundStage, DEFAULT_BUDGET_MAX_ROUNDS, DEFAULT_BUDGET_TIMEOUT_SECONDS, DEFAULT_WORKER_TIMEOUT_MS } from '../config/constants.ts';
+import { AcceptanceService } from './acceptanceService.ts';
+import { TaskStatus, RoundStage, DEFAULT_BUDGET_MAX_ROUNDS } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
 
 export class WorkflowEngine {
   private static instance: WorkflowEngine;
+  private taskController: AbortController | null = null;
   private isProcessing: boolean = false;
   private activeTaskId: string | null = null;
 
@@ -24,7 +27,7 @@ export class WorkflowEngine {
   }
 
   isBusy(): boolean {
-    return this.isProcessing;
+    return this.isProcessing || CliRunner.hasCleanupFailure();
   }
 
   /**
@@ -34,6 +37,7 @@ export class WorkflowEngine {
     taskId: string,
     confirmedCwd?: string,
     options?: {
+      executionTimeoutMs?: number;
       workerExecutor?: string;
       workerModel?: string;
       reviewerExecutor?: string;
@@ -49,7 +53,7 @@ export class WorkflowEngine {
       return { success: false, message: `Cannot start task with status: ${task.status}` };
     }
 
-    if (this.isProcessing && this.activeTaskId !== taskId) {
+    if (this.isProcessing || CliRunner.hasCleanupFailure()) {
       return { success: false, message: `Workbench is currently executing another task: ${this.activeTaskId}` };
     }
 
@@ -61,18 +65,44 @@ export class WorkflowEngine {
       return { success: false, message: `Invalid workspace path: ${e.message}` };
     }
 
-    // Update confirmed cwd, chosen executors and git info in DB
+    const workerExecutor = options?.workerExecutor || task.worker_executor || 'workbuddy';
+    const reviewerExecutor = options?.reviewerExecutor || task.reviewer_executor || 'workbuddy';
+    let workerModel: string;
+    let reviewerModel: string;
+    try {
+      const worker = adapterRegistry.getAdapter(workerExecutor);
+      const reviewer = adapterRegistry.getAdapter(reviewerExecutor);
+      workerModel = options?.workerModel || (workerExecutor === task.worker_executor ? task.worker_model : undefined) || worker.defaultModel;
+      reviewerModel = options?.reviewerModel || (reviewerExecutor === task.reviewer_executor ? task.reviewer_model : undefined) || reviewer.defaultModel;
+    } catch (error) {
+      return { success: false, message: String(error) };
+    }
+
+    const executionTimeoutMs = resolveExecutionTimeout(options?.executionTimeoutMs, task.execution_timeout_ms);
+    // 在排队前占用执行槽，避免异步调度之前重复确认。
+    this.isProcessing = true;
+    this.activeTaskId = taskId;
+    // 切换 CLI 时使用新厂商默认模型，不能沿用上一家保存的模型名。
+    try {
     db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
+      execution_timeout_ms: executionTimeoutMs,
+      stop_requested: 0,
+      blocked_reason: null,
       confirmed_cwd: targetCwd,
       started_at: Date.now(),
-      worker_executor: options?.workerExecutor || task.worker_executor || 'workbuddy',
-      worker_model: options?.workerModel || task.worker_model || 'deepseek-v4-flash',
-      reviewer_executor: options?.reviewerExecutor || task.reviewer_executor || 'workbuddy',
-      reviewer_model: options?.reviewerModel || task.reviewer_model || 'deepseek-v4-flash',
+      worker_executor: workerExecutor,
+      worker_model: workerModel,
+      reviewer_executor: reviewerExecutor,
+      reviewer_model: reviewerModel,
     });
+    } catch (error) {
+      this.isProcessing = false;
+      this.activeTaskId = null;
+      throw error;
+    }
 
     logger.info(
-      `[WorkflowEngine] Task ${taskId} confirmed and queued. Worker: ${options?.workerExecutor || task.worker_executor || 'workbuddy'}(${options?.workerModel || task.worker_model || 'deepseek-v4-flash'}), Reviewer: ${options?.reviewerExecutor || task.reviewer_executor || 'workbuddy'}(${options?.reviewerModel || task.reviewer_model || 'deepseek-v4-flash'}), Target cwd: ${targetCwd}`
+      `[WorkflowEngine] Task ${taskId} confirmed and queued. Development: ${workerExecutor}(${workerModel}), Acceptance: ${reviewerExecutor}(${reviewerModel}), Target cwd: ${targetCwd}`
     );
 
     // Trigger execution asynchronously
@@ -96,7 +126,8 @@ export class WorkflowEngine {
     if (!task) return { success: false, message: 'Task not found' };
 
     db.requestTaskStop(taskId);
-    WorkBuddyClient.requestStop(taskId);
+    if (this.activeTaskId === taskId) this.taskController?.abort();
+    void CliRunner.abort(taskId);
 
     if (task.status === TaskStatus.QUEUED || task.status === TaskStatus.PENDING_CONFIRM) {
       db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
@@ -109,29 +140,17 @@ export class WorkflowEngine {
   /**
    * Handle task deletion during active execution.
    */
-  handleTaskDeleted(taskId: string): void {
-    if (this.activeTaskId === taskId) {
-      try {
-        this.stopTask(taskId);
-      } catch {}
-      this.activeTaskId = null;
-      this.isProcessing = false;
-      logger.info(`[WorkflowEngine] Active task ${taskId} was deleted; reset engine state.`);
-    }
+  async handleTaskDeleted(taskId: string): Promise<void> {
+    if (this.activeTaskId !== taskId && !CliRunner.hasTaskRuns(taskId)) return;
+    this.stopTask(taskId);
+    await CliRunner.abort(taskId);
+    const deadline=Date.now()+10000;
+    while(this.activeTaskId===taskId && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,50));
+    if(this.activeTaskId===taskId || CliRunner.hasTaskRuns(taskId)) throw new Error('CLEANUP_FAILED: 进程回收未确认，保留任务与日志。');
   }
-
-  /**
-   * Handle all tasks deletion.
-   */
-  handleAllTasksDeleted(): void {
-    if (this.activeTaskId) {
-      try {
-        this.stopTask(this.activeTaskId);
-      } catch {}
-      this.activeTaskId = null;
-      this.isProcessing = false;
-      logger.info('[WorkflowEngine] All tasks cleared; reset engine state.');
-    }
+  async handleAllTasksDeleted(): Promise<void> {
+    if(this.activeTaskId) await this.handleTaskDeleted(this.activeTaskId);
+    if(CliRunner.hasCleanupFailure()) throw new Error('CLEANUP_FAILED: 存在未回收进程，保留任务与日志。'+CliRunner.pendingRunIds().join(','));
   }
 
   /**
@@ -149,6 +168,10 @@ export class WorkflowEngine {
       return { success: false, message: `Task is not in human review state (current: ${task.status})` };
     }
 
+    if (action === 'reject' && this.isBusy()) {
+      return { success: false, message: `Workbench is currently executing another task: ${this.activeTaskId}` };
+    }
+
     db.saveHumanDecision({ task_id: taskId, action, reason });
 
     if (action === 'approve') {
@@ -158,11 +181,20 @@ export class WorkflowEngine {
       logger.info(`[WorkflowEngine] Task ${taskId} approved by human reviewer. Completed!`);
       return { success: true, message: 'Task approved and completed.' };
     } else {
+      this.isProcessing = true;
+      this.activeTaskId = taskId;
       // Rejected with reason: loop back to repair
       logger.info(`[WorkflowEngine] Task ${taskId} rejected by human reviewer. Resuming loop with feedback: ${reason}`);
-      db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
-        blocked_reason: null,
-      });
+      try {
+        db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
+          blocked_reason: null,
+          stop_requested: 0,
+        });
+      } catch (error) {
+        this.isProcessing = false;
+        this.activeTaskId = null;
+        throw error;
+      }
 
       setImmediate(() => {
         this.runTaskLoop(taskId, `Human Reviewer Feedback: ${reason}`).catch((err) => {
@@ -180,6 +212,7 @@ export class WorkflowEngine {
   private async runTaskLoop(taskId: string, initialReworkFeedback?: string): Promise<void> {
     this.isProcessing = true;
     this.activeTaskId = taskId;
+    this.taskController = new AbortController();
 
     try {
       const task = db.getTask(taskId);
@@ -211,8 +244,6 @@ export class WorkflowEngine {
       let previousTestFailureSummary: string | null = null;
 
       const maxRounds = task.budget_max_rounds || DEFAULT_BUDGET_MAX_ROUNDS;
-      const timeoutSec = task.budget_timeout_sec || DEFAULT_BUDGET_TIMEOUT_SECONDS;
-      const startTime = task.started_at || Date.now();
 
       db.updateTaskStatus(taskId, TaskStatus.RUNNING);
 
@@ -234,17 +265,6 @@ export class WorkflowEngine {
           db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
             blocked_reason: reason,
             current_round: currentRound - 1,
-          });
-          logger.warn(`[WorkflowEngine] Task ${taskId} blocked: ${reason}`);
-          return;
-        }
-
-        const elapsedSec = (Date.now() - startTime) / 1000;
-        if (elapsedSec > timeoutSec) {
-          const reason = `Total execution time budget exceeded (${Math.round(elapsedSec)}s > ${timeoutSec}s).`;
-          db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
-            blocked_reason: reason,
-            current_round: currentRound,
           });
           logger.warn(`[WorkflowEngine] Task ${taskId} blocked: ${reason}`);
           return;
@@ -280,7 +300,7 @@ export class WorkflowEngine {
         }
 
         const fullWorkerPrompt = promptLines.join('\n');
-        const workerAdapter = adapterRegistry.getWorkerAdapter(task.worker_executor);
+        const workerAdapter = adapterRegistry.getAdapter(task.worker_executor || 'workbuddy');
         const workerModel = task.worker_model || workerAdapter.defaultModel;
 
         const roundDbId = db.createExecutionRound({
@@ -293,20 +313,14 @@ export class WorkflowEngine {
           input_prompt: fullWorkerPrompt,
         });
 
-        // Run Worker via Adapter (保底使用 DEFAULT_WORKER_TIMEOUT_MS，避免被短超时硬性截断)
-        const policyWorkerTimeout = manifest.executionPolicy?.workerTimeoutMs || manifest.executionPolicy?.timeoutMs;
-        const effectiveWorkerTimeoutMs = policyWorkerTimeout
-          ? Math.max(policyWorkerTimeout, DEFAULT_WORKER_TIMEOUT_MS)
-          : DEFAULT_WORKER_TIMEOUT_MS;
-
-        const workerResult = await workerAdapter.executeDevTask({
+        const workerResult = await workerAdapter.execute({
           taskId,
-          roundNumber: currentRound,
-          workerId: nextWorkerId,
+          roundId:roundDbId,
           model: workerModel,
           prompt: fullWorkerPrompt,
           cwd: confirmedCwd,
-          timeoutMs: effectiveWorkerTimeoutMs,
+          signal: this.taskController.signal,
+          timeoutMs: task.execution_timeout_ms || resolveExecutionTimeout(),
         });
 
         if (!workerResult.ok) {
@@ -317,7 +331,11 @@ export class WorkflowEngine {
             duration_ms: workerResult.durationMs,
           });
 
-          // If auth error or user stop
+          if (db.getTask(taskId)?.stop_requested) {
+            db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
+            return;
+          }
+
           const errorMsg = workerResult.error || 'Worker execution failed';
           db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
             blocked_reason: `Worker execution encountered error: ${errorMsg}`,
@@ -359,7 +377,7 @@ export class WorkflowEngine {
           input_prompt: `Executing ${testCases.length} automated test commands.`,
         });
 
-        const testAggResult = await TestRunner.runAllTests(testCases, confirmedCwd);
+        const testAggResult = await TestRunner.runAllTests(testCases, confirmedCwd, task.execution_timeout_ms || resolveExecutionTimeout(), { taskId, roundId:testRoundDbId, signal: this.taskController.signal });
 
         // Record individual tests in DB
         for (const tr of testAggResult.testRuns) {
@@ -377,6 +395,11 @@ export class WorkflowEngine {
           });
         }
 
+        if (testAggResult.interrupted || db.getTask(taskId)?.stop_requested) {
+          db.completeExecutionRound(testRoundDbId, { status: 'blocked', output_text: testAggResult.failureSummary });
+          db.updateTaskStatus(taskId, db.getTask(taskId)?.stop_requested ? TaskStatus.CANCELLED : TaskStatus.BLOCKED, { blocked_reason: testAggResult.failureSummary });
+          return;
+        }
         if (!testAggResult.allPassed) {
           db.completeExecutionRound(testRoundDbId, {
             status: 'failed',
@@ -404,7 +427,7 @@ export class WorkflowEngine {
         }
 
         // --- STAGE 3: REVIEWER ACCEPTANCE (VIA ADAPTER, NO SANDBOX) ---
-        const reviewerAdapter = adapterRegistry.getReviewerAdapter(task.reviewer_executor);
+        const reviewerAdapter = adapterRegistry.getAdapter(task.reviewer_executor || 'workbuddy');
         const reviewerModel = task.reviewer_model || reviewerAdapter.defaultModel;
 
         logger.info(
@@ -430,8 +453,11 @@ export class WorkflowEngine {
           .map((t) => `Test ${t.testCaseId} [${t.command}]: Exit code ${t.exitCode}`)
           .join('\n');
 
-        const verification = await reviewerAdapter.executeReview({
+        const verification = await new AcceptanceService().execute(reviewerAdapter, {
           taskId,
+          timeoutMs: task.execution_timeout_ms || resolveExecutionTimeout(),
+          roundId:codexRoundDbId,
+          signal:this.taskController.signal,
           roundNumber: currentRound,
           model: reviewerModel,
           revision: revisionRecord.revision,
@@ -442,6 +468,17 @@ export class WorkflowEngine {
           verifierPrompt: revisionRecord.verifier_prompt_md || 'Perform strict acceptance verification.',
           definedWorkerIds,
         });
+
+        if (db.getTask(taskId)?.stop_requested) {
+          db.completeExecutionRound(codexRoundDbId, {
+            status: 'blocked',
+            output_text: verification.rawOutput || verification.summary,
+            error_message: 'Execution cancelled by user.',
+            duration_ms: verification.durationMs,
+          });
+          db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
+          return;
+        }
 
         // Record acceptance run
         db.saveAcceptanceRun({
@@ -513,6 +550,7 @@ export class WorkflowEngine {
     } finally {
       this.isProcessing = false;
       this.activeTaskId = null;
+      this.taskController = null;
     }
   }
 }

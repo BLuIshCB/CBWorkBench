@@ -1,3 +1,6 @@
+import { CliRunner } from '../services/cliRunner.ts';
+import { ExecutionService } from '../services/executionService.ts';
+import { confirmStartSchema } from '../services/executionPolicy.ts';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -92,6 +95,54 @@ export function createHttpServer(): http.Server {
     }
 
     try {
+      const executionMatch=pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_-]+)\/execution$/);
+      if(executionMatch && method==='GET') {
+        if(!db.getTask(executionMatch[1])) {sendJson(res,404,{success:false,code:'NOT_FOUND',message:'Task not found'});return;}
+        const latest=db.latestRun(executionMatch[1]);
+        sendJson(res,200,{success:true,run:latest ? ExecutionService.snapshot(latest.runId) : null});return;
+      }
+      const cleanupMatch=pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/cleanup$/);
+      if(cleanupMatch && method==='POST') {
+        if(!db.getRun(cleanupMatch[1])){sendJson(res,404,{success:false,code:'NOT_FOUND',message:'Run not found'});return;}
+        const confirmed=await CliRunner.retryCleanup(cleanupMatch[1]);
+        sendJson(res,confirmed?200:409,{success:confirmed,...(confirmed?{}:{code:'CONFLICT'}),message:confirmed?'已确认回收':'无法安全确认回收，保留占用与现场；请检查原生进程。'});return;
+      }
+      const eventsMatch=pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/(events|stream)$/);
+      if(eventsMatch && method==='GET') {
+        const runId=eventsMatch[1];
+        const rawAfter=eventsMatch[2]==='stream' ? (req.headers['last-event-id'] ?? url.searchParams.get('after') ?? '0') : (url.searchParams.get('after') ?? '0');
+        const rawLimit=url.searchParams.get('limit') ?? '200';
+        const after=Number(rawAfter),limit=Number(rawLimit);
+        if(!/^\d+$/.test(String(rawAfter)) || !Number.isSafeInteger(after) || !/^\d+$/.test(rawLimit) || !Number.isSafeInteger(limit) || limit<1 || limit>500) {
+          sendJson(res,400,{success:false,code:'INVALID_INPUT',message:'Invalid event cursor or limit'});return;
+        }
+        if(!db.getRun(runId)) {sendJson(res,404,{success:false,code:'NOT_FOUND',message:'Run not found'});return;}
+        if(eventsMatch[2]==='events') {
+          const rows=db.runEvents(runId,after,limit+1);const events=rows.slice(0,limit);
+          sendJson(res,200,{success:true,events,nextAfter:events.at(-1)?.seq ?? after,hasMore:rows.length>limit});return;
+        }
+        res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache','Connection':'keep-alive'});
+        let cursor=after;let closed=false;let backpressured=false;
+        const pump=()=>{
+          if(closed || backpressured)return;
+          try {
+            const events=db.runEvents(runId,cursor,100);
+            if(!events.length && (!db.getRun(runId) || db.getRun(runId)?.finishedAt!==null)){res.end();return;}
+            for(const event of events) {
+              const frame='id: '+event.seq+'\nevent: execution\ndata: '+JSON.stringify(event)+'\n\n';
+              cursor=event.seq;
+              if(Buffer.byteLength(frame)>1048576 || res.writableLength>1048576) {res.end();return;}
+              if(!res.write(frame)) {backpressured=true;return;}
+              if(event.type==='finished') {res.end();return;}
+            }
+          } catch {res.destroy();}
+        };
+        const poll=setInterval(pump,100);
+        res.on('drain',()=>{backpressured=false;pump();});
+        const heartbeat=setInterval(()=>{if(!backpressured && !res.write(': heartbeat\n\n'))backpressured=true;},15000);
+        res.on('close',()=>{closed=true;clearInterval(poll);clearInterval(heartbeat);});
+        pump();return;
+      }
       // API Routes
       if (pathname === '/api/tasks' && method === 'GET') {
         const statusFilter = url.searchParams.get('status') as TaskStatus | undefined;
@@ -105,7 +156,7 @@ export function createHttpServer(): http.Server {
         (pathname === '/api/tasks/clear-all' && method === 'POST') ||
         (pathname === '/api/tasks' && method === 'DELETE')
       ) {
-        workflowEngine.handleAllTasksDeleted();
+        await workflowEngine.handleAllTasksDeleted();
         const { deletedCount } = db.deleteAllTasks();
         taskFileStore.deleteAllTaskFiles();
         logger.info(`[HttpServer] Cleared all tasks (${deletedCount} tasks) and deleted associated files`);
@@ -130,7 +181,7 @@ export function createHttpServer(): http.Server {
           return;
         }
 
-        workflowEngine.handleTaskDeleted(taskId);
+        await workflowEngine.handleTaskDeleted(taskId);
         db.deleteTask(taskId);
         taskFileStore.deleteTaskFiles(taskId);
         logger.info(`[HttpServer] Deleted task ${taskId} and its files`);
@@ -183,14 +234,17 @@ export function createHttpServer(): http.Server {
       const confirmStartMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/confirm-start$/);
       if (confirmStartMatch && method === 'POST') {
         const taskId = confirmStartMatch[1];
-        const body = await parseJsonBody(req);
+        const parsed=confirmStartSchema.safeParse(await parseJsonBody(req));
+        if(!parsed.success) {sendJson(res,400,{success:false,code:'INVALID_INPUT',message:'启动参数不合法，单次执行时限须为1–1440整数分钟（毫秒值）'});return;}
+        const body=parsed.data;
         const result = await workflowEngine.confirmAndStartTask(taskId, body.confirmed_cwd, {
+          executionTimeoutMs: body.execution_timeout_ms,
           workerExecutor: body.worker_executor,
           workerModel: body.worker_model,
           reviewerExecutor: body.reviewer_executor,
           reviewerModel: body.reviewer_model,
         });
-        sendJson(res, result.success ? 200 : 400, result);
+        sendJson(res, result.success ? 200 : 409, result);
         return;
       }
 
@@ -223,6 +277,10 @@ export function createHttpServer(): http.Server {
 
       if (pathname === '/api/runtime/probe' && method === 'POST') {
         const body = await parseJsonBody(req);
+        if ((body.verify !== undefined && typeof body.verify !== 'boolean') || (body.verify === true && body.prompt !== undefined)) {
+          sendJson(res, 400, {success:false,code:'INVALID_INPUT',message:'verify 必须是布尔值；标准验证不允许提供 prompt'});
+          return;
+        }
         if (!body.cliId) {
           sendJson(res, 400, { success: false, message: 'cliId is required' });
           return;
@@ -232,6 +290,7 @@ export function createHttpServer(): http.Server {
             cliId: body.cliId,
             prompt: body.prompt,
             model: body.model,
+            verify: body.verify,
             timeoutMs: body.timeoutMs,
             cwd: body.cwd,
           });
@@ -243,10 +302,12 @@ export function createHttpServer(): http.Server {
       }
 
       if (pathname === '/api/system/executors' && method === 'GET') {
+        const agents = await adapterRegistry.listModelAdapters();
         sendJson(res, 200, {
           success: true,
-          workers: adapterRegistry.listWorkers(),
-          reviewers: adapterRegistry.listReviewers(),
+          agents,
+          workers: agents,
+          reviewers: agents,
         });
         return;
       }
@@ -263,7 +324,7 @@ export function createHttpServer(): http.Server {
             nodeVersion: process.versions.node,
             nodeExec,
             sqliteSupported: true,
-            workerModel: WORKER_FIXED_MODEL,
+            workerModel: VERIFIER_DEFAULT_MODEL,
             verifierModel: VERIFIER_DEFAULT_MODEL,
             activeTaskId: workflowEngine.getActiveTaskId(),
             isBusy: workflowEngine.isBusy(),
@@ -303,7 +364,7 @@ export function createHttpServer(): http.Server {
       res.end('Not Found');
     } catch (err: any) {
       logger.error(`[HttpServer] Error processing ${method} ${pathname}:`, err);
-      sendJson(res, 500, { success: false, message: err?.message || 'Internal Server Error' });
+      sendJson(res, 500, { success: false, code:'INTERNAL', message: err?.message || 'Internal Server Error' });
     }
   });
 }
@@ -342,7 +403,7 @@ export async function startServer(
       console.log(`\n============================================================`);
       console.log(`🚀 CBWorkBench 多 Agent 开发工作台后台服务已启动！`);
       console.log(`🌐 访问地址: http://${host}:${port}`);
-      console.log(`🛠️ 接入模式: WorkBuddy (${WORKER_FIXED_MODEL}) + Codex (${VERIFIER_DEFAULT_MODEL})`);
+      console.log(`🛠️ 接入模式: ${adapterRegistry.listAdapters().map(adapter => adapter.name).join(' / ')}，统一 CLI 对话`);
       console.log(`============================================================\n`);
       resolve(server);
     });
