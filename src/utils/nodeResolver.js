@@ -57,8 +57,14 @@ export function resolveSupportedNode() {
     console.warn(`[NodeResolver] Specified CB_NODE_PATH (${customPath}) is invalid or does not support node:sqlite.`);
   }
 
-  // 2. Current running Node process if valid
-  if (hasNativeSqlite()) {
+  // 2. Current running Node process if valid (exclude SEA standalone binary)
+  let isSea = false;
+  try {
+    const sea = nodeRequire('node:sea');
+    if (sea && typeof sea.isSea === 'function') isSea = sea.isSea();
+  } catch {}
+
+  if (!isSea && hasNativeSqlite()) {
     cachedSupportedNode = process.execPath;
     return process.execPath;
   }

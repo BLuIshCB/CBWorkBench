@@ -12,7 +12,8 @@
     "agent": "node bin/agent.js",
     "start": "node bin/cb-workbench.js",
     "mcp": "node bin/cb-workbench-mcp.js",
-    "test": "node bin/test-runner.js"
+    "test": "node bin/test-runner.js",
+    "build:exe": "node bin/build-exe.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
@@ -20,5 +21,9 @@
   },
   "engines": {
     "node": ">=24.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6"
   }
 }

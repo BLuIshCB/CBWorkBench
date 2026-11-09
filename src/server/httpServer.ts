@@ -26,10 +26,28 @@ import {
   DEFAULT_WORKFLOW_NODES,
   type WorkflowNode,
 } from '../services/workflowDefinition.ts';
+import { EMBEDDED_ASSETS } from '../ui/embeddedAssets.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const UI_DIR = path.resolve(__dirname, '..', 'ui');
+
+function resolveUiDir(): string {
+  const candidates = [
+    path.resolve(__dirname, '..', 'ui'),
+    path.resolve(__dirname, 'src', 'ui'),
+    path.resolve(process.cwd(), 'src', 'ui'),
+    path.resolve(process.cwd(), 'ui'),
+  ];
+  if (typeof process.execPath === 'string') {
+    candidates.push(path.resolve(path.dirname(process.execPath), 'src', 'ui'));
+    candidates.push(path.resolve(path.dirname(process.execPath), 'ui'));
+  }
+  for (const c of candidates) {
+    if (fs.existsSync(path.join(c, 'index.html'))) return c;
+  }
+  return path.resolve(__dirname, '..', 'ui');
+}
+const UI_DIR = resolveUiDir();
 
 export async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -68,19 +86,38 @@ export function sendJson(res: http.ServerResponse, statusCode: number, data: any
   res.end(jsonStr);
 }
 
-export function sendFile(res: http.ServerResponse, filePath: string, contentType: string): void {
-  if (!fs.existsSync(filePath)) {
-    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Not Found');
+export function sendFile(
+  res: http.ServerResponse,
+  filePath: string,
+  contentType: string,
+  virtualKey?: string
+): void {
+  if (fs.existsSync(filePath)) {
+    const content = fs.readFileSync(filePath);
+    res.writeHead(200, {
+      'Content-Type': `${contentType}; charset=utf-8`,
+      'Content-Length': content.length,
+      'Cache-Control': 'no-cache',
+    });
+    res.end(content);
     return;
   }
-  const content = fs.readFileSync(filePath);
-  res.writeHead(200, {
-    'Content-Type': `${contentType}; charset=utf-8`,
-    'Content-Length': content.length,
-    'Cache-Control': 'no-cache',
-  });
-  res.end(content);
+
+  // Fallback to embedded asset if available (e.g. inside standalone SEA binary)
+  if (virtualKey && EMBEDDED_ASSETS[virtualKey]) {
+    const asset = EMBEDDED_ASSETS[virtualKey];
+    const buffer = Buffer.from(asset.content, 'utf-8');
+    res.writeHead(200, {
+      'Content-Type': `${asset.contentType}; charset=utf-8`,
+      'Content-Length': buffer.length,
+      'Cache-Control': 'no-cache',
+    });
+    res.end(buffer);
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Not Found');
 }
 
 export function createHttpServer(): http.Server {
@@ -517,17 +554,17 @@ export function createHttpServer(): http.Server {
 
       // Static UI Files
       if (pathname === '/' || pathname === '/runtime' || pathname === '/workflows' || pathname.startsWith('/tasks/')) {
-        sendFile(res, path.join(UI_DIR, 'index.html'), 'text/html');
+        sendFile(res, path.join(UI_DIR, 'index.html'), 'text/html', '/index.html');
         return;
       }
 
       if (pathname === '/styles.css') {
-        sendFile(res, path.join(UI_DIR, 'styles.css'), 'text/css');
+        sendFile(res, path.join(UI_DIR, 'styles.css'), 'text/css', '/styles.css');
         return;
       }
 
       if (pathname === '/app.js') {
-        sendFile(res, path.join(UI_DIR, 'app.js'), 'application/javascript');
+        sendFile(res, path.join(UI_DIR, 'app.js'), 'application/javascript', '/app.js');
         return;
       }
 
@@ -535,10 +572,9 @@ export function createHttpServer(): http.Server {
       if (pathname.startsWith('/js/') && pathname.endsWith('.js')) {
         const safePath = path.normalize(pathname).replace(/^(\.\.[\/\\])+/, '');
         const fullPath = path.join(UI_DIR, safePath);
-        if (fullPath.startsWith(UI_DIR) && fs.existsSync(fullPath)) {
-          sendFile(res, fullPath, 'application/javascript');
-          return;
-        }
+        const virtualKey = '/' + safePath.replace(/\\/g, '/').replace(/^\/+/, '');
+        sendFile(res, fullPath, 'application/javascript', virtualKey);
+        return;
       }
 
       // 404

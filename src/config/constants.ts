@@ -1,4 +1,5 @@
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -18,7 +19,24 @@ export const DEFAULT_WORKER_TIMEOUT_MS = DEFAULT_EXECUTION_TIMEOUT_MS;
 export const DEFAULT_VERIFIER_TIMEOUT_MS = DEFAULT_EXECUTION_TIMEOUT_MS;
 export const DEFAULT_TEST_TIMEOUT_MS = DEFAULT_EXECUTION_TIMEOUT_MS;
 
-export const ROOT_DIR = path.resolve(__dirname, '../../');
+function resolveRootDir(): string {
+  if (process.env.CB_ROOT_DIR) return path.resolve(process.env.CB_ROOT_DIR);
+  if (fs.existsSync(path.join(process.cwd(), 'src')) || fs.existsSync(path.join(process.cwd(), 'data'))) {
+    return process.cwd();
+  }
+  if (typeof __dirname !== 'undefined') {
+    if (fs.existsSync(path.join(__dirname, 'src')) || fs.existsSync(path.join(__dirname, 'data'))) {
+      return __dirname;
+    }
+    const upTwo = path.resolve(__dirname, '../../');
+    if (fs.existsSync(path.join(upTwo, 'src')) || fs.existsSync(path.join(upTwo, 'data'))) {
+      return upTwo;
+    }
+  }
+  return process.cwd();
+}
+
+export const ROOT_DIR = resolveRootDir();
 export const DATA_DIR = path.resolve(process.env.CB_DATA_DIR || path.join(ROOT_DIR, 'data'));
 export const TASKS_DATA_DIR = path.join(DATA_DIR, 'tasks');
 export const DB_PATH = path.join(DATA_DIR, 'workbench.db');
