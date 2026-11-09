@@ -36,9 +36,11 @@ export class WorkflowView {
         this.workflows = res.workflows || [];
         if (!this.currentWorkflow && this.workflows.length > 0) {
           const defaultWf = this.workflows.find((w) => w.id === 'default') || this.workflows[0];
-          await this.selectWorkflow(defaultWf.id, defaultWf.version);
+          await this.selectWorkflow(defaultWf.id);
         } else if (this.currentWorkflow) {
-          await this.selectWorkflow(this.currentWorkflow.id, this.currentWorkflow.version);
+          const currentId = this.currentWorkflow.id;
+          const exists = this.workflows.find((w) => w.id === currentId);
+          await this.selectWorkflow(exists ? currentId : (this.workflows[0]?.id || 'default'));
         }
       }
     } catch (e) {
@@ -46,9 +48,9 @@ export class WorkflowView {
     }
   }
 
-  async selectWorkflow(id, version) {
+  async selectWorkflow(id) {
     try {
-      const res = await api.getWorkflow(id, version);
+      const res = await api.getWorkflow(id);
       if (res && res.success) {
         this.currentWorkflow = res.workflow;
         this.currentNodes = JSON.parse(JSON.stringify(res.workflow.nodes || []));
@@ -71,6 +73,7 @@ export class WorkflowView {
     }
 
     const wf = this.currentWorkflow;
+    const isLocked = Boolean(wf.isReferenced);
     const selectedNode = this.currentNodes.find((n) => n.id === this.selectedNodeId);
 
     container.innerHTML = `
@@ -84,19 +87,31 @@ export class WorkflowView {
                 ${this.workflows
                   .map(
                     (w) =>
-                      `<option value="${w.id}:${w.version}" ${w.id === wf.id ? 'selected' : ''}>${escapeHtml(w.name)} (v${w.version})${w.isDefault ? ' [默认]' : ''}</option>`
+                      `<option value="${w.id}" ${w.id === wf.id ? 'selected' : ''}>${escapeHtml(w.name)}${w.isDefault ? ' [默认]' : ''}${w.isReferenced ? ' (引用锁定)' : ''}</option>`
                   )
                   .join('')}
               </select>
-              <span class="badge badge-blue">版本 v${wf.version}</span>
+              ${
+                isLocked
+                  ? `<span class="badge" style="background:#fef3c7; color:#92400e; border:1px solid #fcd34d;">🔒 任务引用中 (只读锁定)</span>`
+                  : `<span class="badge badge-green">可编辑</span>`
+              }
             </div>
           </div>
           <div class="action-group">
             <button class="btn btn-secondary" onclick="app.workflowView.showNewWorkflowModal()">➕ 新建工作流</button>
-            <button class="btn btn-secondary" onclick="app.workflowView.resetDefaultWorkflow()">🔄 恢复默认流程</button>
-            <button class="btn btn-primary" onclick="app.workflowView.saveWorkflow()">💾 保存新版本</button>
+            <button class="btn btn-secondary" ${wf.id === 'default' && isLocked ? 'disabled title="默认工作流正被任务引用，禁止重置"' : ''} onclick="app.workflowView.resetDefaultWorkflow()">🔄 恢复默认流程</button>
+            <button class="btn btn-primary" ${isLocked ? 'disabled title="该工作流正被任务引用，禁止修改"' : ''} onclick="app.workflowView.saveWorkflow()">💾 保存工作流</button>
           </div>
         </div>
+
+        ${
+          isLocked
+            ? `<div class="wf-lock-banner" style="background:#fffbeb; border:1px solid #fde68a; padding:10px 16px; border-radius:8px; margin-bottom:14px; font-size:13px; color:#92400e; display:flex; align-items:center; justify-content:space-between;">
+                <span>⚠️ <strong>工作流锁定保护</strong>：该工作流当前正被 ${wf.referencingTasks?.length || 0} 个任务引用，处于只读状态，禁止修改节点与配置。若需修改，请先清理引用该工作流的任务或新建独立工作流。</span>
+              </div>`
+            : ''
+        }
 
         ${
           this.connectPending
@@ -113,7 +128,7 @@ export class WorkflowView {
           <div class="wf-canvas-card">
             <div class="wf-canvas-header">
               <span class="canvas-hint">💡 点击节点查看/编辑右侧配置；成功连线为蓝色实线，失败连线为灰色虚线。</span>
-              <button class="btn btn-sm btn-secondary" onclick="app.workflowView.addNodePrompt()">➕ 添加任务节点</button>
+              ${!isLocked ? `<button class="btn btn-sm btn-secondary" onclick="app.workflowView.addNodePrompt()">➕ 添加任务节点</button>` : ''}
             </div>
             <div class="wf-svg-viewport" id="wf-svg-viewport">
               ${this.buildSvgDiagram()}
@@ -130,8 +145,7 @@ export class WorkflowView {
   }
 
   onWorkflowSelectChange(val) {
-    const [id, ver] = val.split(':');
-    this.selectWorkflow(id, parseInt(ver, 10));
+    this.selectWorkflow(val);
   }
 
   // --- SVG Diagram Rendering ---
@@ -345,6 +359,7 @@ export class WorkflowView {
       return '<div class="config-empty-hint">请在左侧画布中点击选择一个节点进行配置。</div>';
     }
 
+    const isLocked = Boolean(this.currentWorkflow?.isReferenced);
     const isStart = node.type === 'start';
     const isEnd = node.type === 'end';
     const otherNodes = this.currentNodes.filter((n) => n.id !== node.id && n.type !== 'start');
@@ -355,41 +370,46 @@ export class WorkflowView {
         <span class="badge ${isStart ? 'badge-blue' : isEnd ? 'badge-gray' : 'badge-green'}">${node.type === 'start' ? '开始节点' : node.type === 'end' ? '结束节点' : '任务节点'}</span>
       </div>
 
+      ${
+        isLocked
+          ? `<div style="background:#fef3c7; color:#92400e; padding:8px 12px; border-radius:6px; font-size:12px; margin-bottom:12px; border:1px solid #fde68a;">🔒 当前工作流正被任务引用，属性处于只读状态。</div>`
+          : ''
+      }
+
       <div class="node-config-form">
         <div class="form-group">
-          <label class="form-label">节点 ID (不可修改)</label>
-          <input type="text" class="input-text" value="${escapeHtml(node.id)}" disabled />
-        </div>
-
-        <div class="form-group">
           <label class="form-label">节点名称</label>
-          <input type="text" class="input-text" value="${escapeHtml(node.name || '')}" onchange="app.workflowView.updateCurrentNodeField('name', this.value)" ${isStart || isEnd ? 'disabled' : ''} />
+          <input type="text" class="input-text" value="${escapeHtml(node.name || '')}" onchange="app.workflowView.updateCurrentNodeField('name', this.value)" ${isStart || isEnd || isLocked ? 'disabled' : ''} />
         </div>
 
         ${
           !isStart && !isEnd
             ? `
           <div class="form-group">
-            <label class="form-label">执行方式 (Execution Mode)</label>
-            <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('execution_mode', this.value)">
-              <option value="agent" ${node.execution_mode === 'agent' ? 'selected' : ''}>Agent (调用 CLI 适配器)</option>
-              <option value="command" ${node.execution_mode === 'command' ? 'selected' : ''}>命令 (后台独立执行命令)</option>
-              <option value="manual" ${node.execution_mode === 'manual' ? 'selected' : ''}>人工 (等待用户核验确认)</option>
-            </select>
-          </div>
-
-          <div class="form-group">
             <label class="form-label">最大执行次数 (0 或留空为不限制)</label>
-            <input type="number" min="0" max="100" class="input-text" value="${node.max_executions || 0}" onchange="app.workflowView.updateCurrentNodeField('max_executions', parseInt(this.value, 10))" />
+            <input type="number" min="0" max="100" class="input-text" value="${node.max_executions || 0}" onchange="app.workflowView.updateCurrentNodeField('max_executions', parseInt(this.value, 10))" ${isLocked ? 'disabled' : ''} />
             <small class="form-hint">设置为 0 或留空表示节点不做次数限制。</small>
           </div>
 
           ${
-            node.execution_mode === 'agent'
+            node.execution_mode === 'command'
               ? `
             <div class="form-group">
+              <label class="form-label">测试/执行命令 (留空则执行测试清单)</label>
+              <input type="text" class="input-text" placeholder="npm test 或留空" value="${escapeHtml(node.command || '')}" onchange="app.workflowView.updateCurrentNodeField('command', this.value)" ${isLocked ? 'disabled' : ''} />
+            </div>
+          `
+              : node.execution_mode === 'manual'
+              ? `
+            <div class="form-group">
+              <label class="form-label">人工核验说明</label>
+              <textarea class="input-textarea" rows="3" onchange="app.workflowView.updateCurrentNodeField('prompt', this.value)" ${isLocked ? 'disabled' : ''}>${escapeHtml(node.prompt || '')}</textarea>
+            </div>
+          `
+              : `
+            <div class="form-group">
               <label class="form-label">执行器 (Executor)</label>
-              <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('executor', this.value)">
+              <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('executor', this.value)" ${isLocked ? 'disabled' : ''}>
                 <option value="workbuddy" ${node.executor === 'workbuddy' ? 'selected' : ''}>WorkBuddy</option>
                 <option value="codex" ${node.executor === 'codex' ? 'selected' : ''}>Codex</option>
                 <option value="antigravity" ${node.executor === 'antigravity' ? 'selected' : ''}>Antigravity</option>
@@ -397,29 +417,8 @@ export class WorkflowView {
             </div>
 
             <div class="form-group">
-              <label class="form-label">结果判定规则 (Result Rule)</label>
-              <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('result_rule', this.value)">
-                <option value="default" ${node.result_rule !== 'acceptance' ? 'selected' : ''}>普通完成规则</option>
-                <option value="acceptance" ${node.result_rule === 'acceptance' ? 'selected' : ''}>结构化验收规则 (Acceptance)</option>
-              </select>
-            </div>
-
-            <div class="form-group">
               <label class="form-label">节点提示词模板 (Prompt)</label>
-              <textarea class="input-textarea" rows="4" onchange="app.workflowView.updateCurrentNodeField('prompt', this.value)">${escapeHtml(node.prompt || '')}</textarea>
-            </div>
-          `
-              : node.execution_mode === 'command'
-              ? `
-            <div class="form-group">
-              <label class="form-label">测试/执行命令 (留空则执行测试清单)</label>
-              <input type="text" class="input-text" placeholder="npm test 或留空" value="${escapeHtml(node.command || '')}" onchange="app.workflowView.updateCurrentNodeField('command', this.value)" />
-            </div>
-          `
-              : `
-            <div class="form-group">
-              <label class="form-label">人工核验说明</label>
-              <textarea class="input-textarea" rows="3" onchange="app.workflowView.updateCurrentNodeField('prompt', this.value)">${escapeHtml(node.prompt || '')}</textarea>
+              <textarea class="input-textarea" rows="4" onchange="app.workflowView.updateCurrentNodeField('prompt', this.value)" ${isLocked ? 'disabled' : ''}>${escapeHtml(node.prompt || '')}</textarea>
             </div>
           `
           }
@@ -434,12 +433,12 @@ export class WorkflowView {
           <div class="form-group routing-group">
             <label class="form-label"><strong>成功后去向 (on_success)</strong></label>
             <div class="routing-row">
-              <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('on_success', this.value)">
+              <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('on_success', this.value)" ${isLocked ? 'disabled' : ''}>
                 ${otherNodes
                   .map((n) => `<option value="${n.id}" ${node.on_success === n.id ? 'selected' : ''}>${escapeHtml(n.name)} (${n.id})</option>`)
                   .join('')}
               </select>
-              <button class="btn btn-sm btn-secondary" onclick="app.workflowView.startConnect('${node.id}', 'on_success')">🎯 连线点击</button>
+              ${!isLocked ? `<button class="btn btn-sm btn-secondary" onclick="app.workflowView.startConnect('${node.id}', 'on_success')">🎯 连线点击</button>` : ''}
             </div>
           </div>
         `
@@ -452,14 +451,14 @@ export class WorkflowView {
           <div class="form-group routing-group">
             <label class="form-label"><strong>失败后去向 (on_failure)</strong></label>
             <div class="routing-row">
-              <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('on_failure', this.value || null)">
+              <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('on_failure', this.value || null)" ${isLocked ? 'disabled' : ''}>
                 <option value="" ${!node.on_failure ? 'selected' : ''}>-- 无（失败后暂停任务）--</option>
                 ${otherNodes
                   .filter((n) => n.type !== 'end')
                   .map((n) => `<option value="${n.id}" ${node.on_failure === n.id ? 'selected' : ''}>${escapeHtml(n.name)} (${n.id})</option>`)
                   .join('')}
               </select>
-              <button class="btn btn-sm btn-secondary" onclick="app.workflowView.startConnect('${node.id}', 'on_failure')">🎯 连线点击</button>
+              ${!isLocked ? `<button class="btn btn-sm btn-secondary" onclick="app.workflowView.startConnect('${node.id}', 'on_failure')">🎯 连线点击</button>` : ''}
             </div>
           </div>
         `
@@ -467,7 +466,7 @@ export class WorkflowView {
         }
 
         ${
-          !isStart && !isEnd
+          !isStart && !isEnd && !isLocked
             ? `
           <div class="node-actions-footer">
             <button class="btn btn-sm btn-danger" onclick="app.workflowView.deleteCurrentNode('${node.id}')">🗑️ 删除该节点</button>
@@ -531,6 +530,11 @@ export class WorkflowView {
   }
 
   addNodePrompt() {
+    if (this.currentWorkflow?.isReferenced) {
+      alert('该工作流正被任务引用，处于锁定状态，禁止添加节点！');
+      return;
+    }
+
     const name = prompt('请输入新任务节点名称 (如: 压力测试 / 代码重构):');
     if (!name || !name.trim()) return;
 
@@ -571,6 +575,11 @@ export class WorkflowView {
   }
 
   deleteCurrentNode(id) {
+    if (this.currentWorkflow?.isReferenced) {
+      alert('该工作流正被任务引用，处于锁定状态，禁止删除节点！');
+      return;
+    }
+
     const node = this.currentNodes.find((n) => n.id === id);
     if (!node || node.type === 'start' || node.type === 'end') {
       alert('开始节点和结束节点不可删除');
@@ -597,6 +606,11 @@ export class WorkflowView {
   async saveWorkflow() {
     if (!this.currentWorkflow) return;
 
+    if (this.currentWorkflow.isReferenced) {
+      alert('该工作流正被任务引用，禁止修改！若需修改，请先清理相关任务或新建独立工作流。');
+      return;
+    }
+
     try {
       const res = await api.saveWorkflow({
         id: this.currentWorkflow.id,
@@ -611,15 +625,20 @@ export class WorkflowView {
         return;
       }
 
-      alert(`工作流保存成功！产生新版本: v${res.workflow.version}`);
+      alert(`工作流 [${res.workflow?.name || this.currentWorkflow.name}] 保存成功！`);
       await this.loadWorkflows();
-      await this.selectWorkflow(res.workflow.id, res.workflow.version);
+      await this.selectWorkflow(this.currentWorkflow.id);
     } catch (e) {
       alert(`保存工作流失败: ${e.message}`);
     }
   }
 
   async resetDefaultWorkflow() {
+    if (this.currentWorkflow?.id === 'default' && this.currentWorkflow?.isReferenced) {
+      alert('默认工作流当前正被任务引用，禁止重置！若需重置请先清理相关任务。');
+      return;
+    }
+
     if (!confirm('确定将默认工作流恢复至系统内置标准模板（开始→开发→测试→验收→人工确认→结束）吗？')) return;
     try {
       const res = await api.resetDefaultWorkflow();
@@ -636,12 +655,46 @@ export class WorkflowView {
   }
 
   showNewWorkflowModal() {
-    const id = prompt('请输入新工作流唯一英文 ID (如: fast_track / full_regression):');
-    if (!id || !id.trim()) return;
-    const name = prompt('请输入新工作流中文名称 (如: 快速修复交付流程):');
-    if (!name || !name.trim()) return;
+    const modal = document.getElementById('modal-new-workflow');
+    if (!modal) return;
+    const nameInput = document.getElementById('new-wf-name');
+    const idInput = document.getElementById('new-wf-id');
+    const descInput = document.getElementById('new-wf-desc');
+    if (nameInput) nameInput.value = '';
+    if (idInput) idInput.value = '';
+    if (descInput) descInput.value = '';
+    modal.style.display = 'flex';
+    if (nameInput) setTimeout(() => nameInput.focus(), 50);
+  }
 
-    // Seed basic 3-node graph: start -> dev -> end
+  closeNewWorkflowModal() {
+    const modal = document.getElementById('modal-new-workflow');
+    if (modal) modal.style.display = 'none';
+  }
+
+  async confirmCreateWorkflow() {
+    const nameInput = document.getElementById('new-wf-name');
+    const idInput = document.getElementById('new-wf-id');
+    const descInput = document.getElementById('new-wf-desc');
+
+    const name = nameInput ? nameInput.value.trim() : '';
+    if (!name) {
+      alert('请输入工作流名称');
+      if (nameInput) nameInput.focus();
+      return;
+    }
+
+    let id = idInput ? idInput.value.trim() : '';
+    if (!id) {
+      // Auto-generate safe ASCII ID
+      const cleaned = name.toLowerCase().replace(/[^a-z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+      id = cleaned ? `wf_${cleaned}_${Date.now().toString(36)}` : `wf_${Date.now().toString(36)}`;
+    } else {
+      id = id.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+    }
+
+    const desc = descInput ? descInput.value.trim() : '';
+
     const nodes = [
       { id: 'start', name: '开始', type: 'start', on_success: 'development' },
       {
@@ -651,7 +704,7 @@ export class WorkflowView {
         execution_mode: 'agent',
         executor: 'workbuddy',
         model: 'default',
-        prompt: '实现需求',
+        prompt: '实现本次开发需求并完成交付。',
         max_executions: 0,
         on_success: 'end',
         on_failure: null,
@@ -659,19 +712,25 @@ export class WorkflowView {
       { id: 'end', name: '结束', type: 'end' },
     ];
 
-    api
-      .saveWorkflow({
-        id: id.trim(),
-        name: name.trim(),
-        description: '自定义新建工作流',
+    try {
+      const res = await api.saveWorkflow({
+        id,
+        name,
+        description: desc || '自定义新建工作流',
         nodes,
-      })
-      .then((res) => {
-        if (res.success) {
-          this.loadWorkflows().then(() => this.selectWorkflow(id.trim(), res.workflow.version));
-        } else {
-          alert(`创建失败: ${res.message || res.errors?.join('; ')}`);
-        }
       });
+
+      if (!res.success) {
+        alert(`创建工作流失败: ${res.message || res.errors?.join('; ')}`);
+        return;
+      }
+
+      this.closeNewWorkflowModal();
+      await this.loadWorkflows();
+      await this.selectWorkflow(id);
+      alert(`工作流 [${name}] 创建成功！`);
+    } catch (e) {
+      alert(`创建工作流失败: ${e.message}`);
+    }
   }
 }

@@ -68,8 +68,25 @@ try {
   assert.strictEqual(validRes.status, 200);
   const validData = await validRes.json();
   assert.strictEqual(validData.success, true);
-  assert.strictEqual(validData.workflow.version, 1);
+  assert.strictEqual(validData.workflow.id, 'good-wf');
   console.log('  ✓ POST /api/workflows saves valid workflow');
+
+  // Direct modification in place (no V versions)
+  const modifyRes = await fetch(`${baseUrl}/api/workflows`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: 'good-wf',
+      name: 'Good Workflow Modified',
+      description: 'Modified in place',
+      nodes: validGraph,
+    }),
+  });
+  assert.strictEqual(modifyRes.status, 200);
+  const modifyData = await modifyRes.json();
+  assert.strictEqual(modifyData.success, true);
+  assert.strictEqual(modifyData.workflow.name, 'Good Workflow Modified');
+  console.log('  ✓ POST /api/workflows modifies existing workflow directly in place');
 
   // 5. GET /api/tasks/:id/workflow
   const taskId = 'task-http-wf-' + randomUUID();
@@ -87,6 +104,28 @@ try {
   assert.strictEqual(taskWfRes.taskWorkflow.current_node_id, 'start');
   assert.strictEqual(taskWfRes.nodes.length, 6);
   console.log('  ✓ GET /api/tasks/:id/workflow returns task workflow state');
+
+  // 5.1 While default workflow is referenced by taskId, modifying it is blocked
+  const rejectInUseRes = await fetch(`${baseUrl}/api/workflows`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: 'default',
+      name: 'Illegal Edit',
+      nodes: DEFAULT_WORKFLOW_NODES,
+    }),
+  });
+  assert.strictEqual(rejectInUseRes.status, 403);
+  const rejectInUseData = await rejectInUseRes.json();
+  assert.strictEqual(rejectInUseData.code, 'WORKFLOW_IN_USE');
+  console.log('  ✓ POST /api/workflows rejects modification when referenced by a task');
+
+  // Reset default is also blocked while referenced
+  const resetBlockedRes = await fetch(`${baseUrl}/api/workflows/reset-default`, {
+    method: 'POST',
+  });
+  assert.strictEqual(resetBlockedRes.status, 403);
+  console.log('  ✓ POST /api/workflows/reset-default blocked while referenced by a task');
 
   // 6. POST /api/tasks/:id/workflow/manual-decision
   // Set task to HUMAN_REVIEW
@@ -107,13 +146,17 @@ try {
   assert.strictEqual(db.getTask(taskId)?.status, TaskStatus.COMPLETED);
   console.log('  ✓ POST /api/tasks/:id/workflow/manual-decision completes workflow');
 
-  // 7. POST /api/workflows/reset-default
+  // 7. After referencing tasks are cleared, reset default workflow succeeds
+  db.deleteTask(taskId);
+  for (const ref of db.getWorkflowReferencingTasks('default')) {
+    try { db.deleteTask(ref.id); } catch {}
+  }
   const resetRes = await fetch(`${baseUrl}/api/workflows/reset-default`, {
     method: 'POST',
   }).then((r) => r.json());
   assert.strictEqual(resetRes.success, true);
   assert.strictEqual(resetRes.workflow.id, 'default');
-  console.log('  ✓ POST /api/workflows/reset-default restores default template');
+  console.log('  ✓ POST /api/workflows/reset-default restores default template after task deleted');
 
   console.log('✅ workflowHttp.test.ts passed successfully!');
 } finally {

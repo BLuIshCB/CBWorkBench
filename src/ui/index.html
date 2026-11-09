@@ -449,6 +449,35 @@
     </div>
   </div>
 
+  <!-- Modal for Creating New Workflow -->
+  <div id="modal-new-workflow" class="modal-backdrop" style="display: none;">
+    <div class="modal-card" style="max-width: 520px;">
+      <div class="modal-header">
+        <h3>➕ 新建工作流</h3>
+        <button class="close-btn" onclick="app.workflowView.closeNewWorkflowModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group" style="margin-bottom: 14px;">
+          <label class="form-label" style="display: block; font-weight: 600; margin-bottom: 6px;">工作流名称 <span style="color: var(--danger);">*</span></label>
+          <input type="text" id="new-wf-name" class="form-control" placeholder="例如: 快速发布交付流程" style="width: 100%; box-sizing: border-box;" />
+        </div>
+        <div class="form-group" style="margin-bottom: 14px;">
+          <label class="form-label" style="display: block; font-weight: 600; margin-bottom: 6px;">工作流唯一标识 (ID)</label>
+          <input type="text" id="new-wf-id" class="form-control" placeholder="例如: fast_track (留空自动生成)" style="width: 100%; box-sizing: border-box;" />
+          <small style="color: var(--text-muted); font-size: 12px; display: block; margin-top: 4px;">由英文字母、数字、下划线组成；留空则基于名称或时间戳自动生成。</small>
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="display: block; font-weight: 600; margin-bottom: 6px;">流程描述 (选填)</label>
+          <textarea id="new-wf-desc" class="form-control" rows="2" placeholder="简要说明此工作流的使用场景..." style="width: 100%; box-sizing: border-box;"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="app.workflowView.closeNewWorkflowModal()">取消</button>
+        <button class="btn btn-primary" onclick="app.workflowView.confirmCreateWorkflow()">确认创建</button>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="/js/main.js"></script>
 </body>
 </html>

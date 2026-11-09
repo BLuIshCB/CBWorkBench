@@ -193,7 +193,7 @@ export const TaskDetail = {
       <div class="task-wf-header">
         <div class="wf-info">
           <h4>工作流推进进度</h4>
-          <span class="badge badge-blue">模板: ${escapeHtml(taskWorkflow.workflow_id)} (v${taskWorkflow.workflow_version})</span>
+          <span class="badge badge-blue">工作流: ${escapeHtml(taskWorkflow.workflow_id)}</span>
           <span class="badge badge-secondary">代码代次: G${taskWorkflow.code_generation}</span>
         </div>
         <div class="wf-current-hint">

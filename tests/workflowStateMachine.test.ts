@@ -231,4 +231,11 @@ assert(task4Record?.blocked_reason?.includes('segmentation fault') || task4Recor
 assert.strictEqual(devCallCount, 1, 'Crashed worker must not loop back or continue');
 console.log('  ✓ Test 4: Running fault pauses into BLOCKED and does not take failure edge');
 
+// Clean up test tasks
+for (const tid of [task1, task2, task3, task4]) {
+  try {
+    db.deleteTask(tid);
+  } catch {}
+}
+
 console.log('✅ workflowStateMachine.test.ts passed successfully!');

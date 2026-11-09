@@ -920,13 +920,29 @@ export class WorkbenchDatabase {
 
   // --- Workflow Definitions ---
 
+  isWorkflowReferenced(workflowId: string): boolean {
+    const row = this.db.prepare('SELECT 1 FROM task_workflows WHERE workflow_id = ? LIMIT 1').get(workflowId);
+    return Boolean(row);
+  }
+
+  getWorkflowReferencingTasks(workflowId: string): { id: string; title: string; status: string }[] {
+    const stmt = this.db.prepare(`
+      SELECT t.id, t.title, t.status
+      FROM task_workflows tw
+      INNER JOIN tasks t ON tw.task_id = t.id
+      WHERE tw.workflow_id = ?
+      ORDER BY t.created_at DESC
+    `);
+    return stmt.all(workflowId) as { id: string; title: string; status: string }[];
+  }
+
   getWorkflow(id: string, version?: number): WorkflowDefinitionRecord | null {
     if (version !== undefined) {
       const stmt = this.db.prepare('SELECT * FROM workflow_definitions WHERE id = ? AND version = ?');
       const row = stmt.get(id, version) as unknown as WorkflowDefinitionRecord | undefined;
-      return row ?? null;
+      if (row) return row;
     }
-    const stmt = this.db.prepare('SELECT * FROM workflow_definitions WHERE id = ? ORDER BY version DESC LIMIT 1');
+    const stmt = this.db.prepare('SELECT * FROM workflow_definitions WHERE id = ? ORDER BY updated_at DESC, version DESC LIMIT 1');
     const row = stmt.get(id) as unknown as WorkflowDefinitionRecord | undefined;
     return row ?? null;
   }
@@ -950,19 +966,34 @@ export class WorkbenchDatabase {
     nodes_json: string;
     is_default?: number;
   }): WorkflowDefinitionRecord {
-    const now = Date.now();
-    let version = data.version;
-    if (version === undefined) {
-      const row = this.db.prepare('SELECT MAX(version) as max_v FROM workflow_definitions WHERE id = ?').get(data.id) as { max_v: number | null } | undefined;
-      version = (row?.max_v ?? 0) + 1;
+    const existing = this.getWorkflow(data.id);
+    if (existing) {
+      if (this.isWorkflowReferenced(data.id)) {
+        throw new Error(`工作流 [${data.id}] 当前正被任务引用，禁止修改！若需调整请先清理相关任务或新建工作流。`);
+      }
+      const now = Date.now();
+      this.db.prepare(`
+        UPDATE workflow_definitions
+        SET name = ?, description = ?, nodes_json = ?, updated_at = ?, is_default = ?
+        WHERE id = ?
+      `).run(
+        data.name,
+        data.description || null,
+        data.nodes_json,
+        now,
+        data.is_default ?? existing.is_default,
+        data.id
+      );
+      return this.getWorkflow(data.id)!;
     }
 
-    const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO workflow_definitions (
+    const now = Date.now();
+    const version = 1;
+    this.db.prepare(`
+      INSERT INTO workflow_definitions (
         id, version, name, description, nodes_json, created_at, updated_at, is_default
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
+    `).run(
       data.id,
       version,
       data.name,
@@ -973,7 +1004,7 @@ export class WorkbenchDatabase {
       data.is_default ?? 0
     );
 
-    return this.getWorkflow(data.id, version)!;
+    return this.getWorkflow(data.id)!;
   }
 
   // --- Task Workflows ---

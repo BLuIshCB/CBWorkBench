@@ -402,6 +402,7 @@ export function createHttpServer(): http.Server {
           try {
             nodes = JSON.parse(wf.nodes_json);
           } catch {}
+          const referencingTasks = db.getWorkflowReferencingTasks(wf.id);
           return {
             id: wf.id,
             version: wf.version,
@@ -409,6 +410,8 @@ export function createHttpServer(): http.Server {
             description: wf.description,
             nodeCount: nodes.length,
             isDefault: Boolean(wf.is_default),
+            isReferenced: referencingTasks.length > 0,
+            referencingCount: referencingTasks.length,
             nodes,
             createdAt: wf.created_at,
             updatedAt: wf.updated_at,
@@ -419,6 +422,14 @@ export function createHttpServer(): http.Server {
       }
 
       if (pathname === '/api/workflows/reset-default' && method === 'POST') {
+        if (db.isWorkflowReferenced(DEFAULT_WORKFLOW_ID)) {
+          sendJson(res, 403, {
+            success: false,
+            code: 'WORKFLOW_IN_USE',
+            message: '默认工作流当前正被任务引用，禁止重置！若需重置请先清理相关任务。',
+          });
+          return;
+        }
         const saved = db.saveWorkflowDefinition({
           id: DEFAULT_WORKFLOW_ID,
           name: '默认开发交付流程',
@@ -430,9 +441,9 @@ export function createHttpServer(): http.Server {
         return;
       }
 
-      const workflowDetailMatch = pathname.match(/^\/api\/workflows\/([a-zA-Z0-9_\-]+)$/);
-      if (workflowDetailMatch && method === 'GET') {
-        const wfId = workflowDetailMatch[1];
+      const workflowDetailMatch = pathname.match(/^\/api\/workflows\/([^\/]+)$/);
+      if (workflowDetailMatch && method === 'GET' && pathname !== '/api/workflows/reset-default') {
+        const wfId = decodeURIComponent(workflowDetailMatch[1]);
         const versionParam = url.searchParams.get('version');
         const version = versionParam ? parseInt(versionParam, 10) : undefined;
         const wf = db.getWorkflow(wfId, Number.isNaN(version) ? undefined : version);
@@ -444,6 +455,7 @@ export function createHttpServer(): http.Server {
         try {
           nodes = JSON.parse(wf.nodes_json);
         } catch {}
+        const referencingTasks = db.getWorkflowReferencingTasks(wf.id);
         sendJson(res, 200, {
           success: true,
           workflow: {
@@ -452,6 +464,8 @@ export function createHttpServer(): http.Server {
             name: wf.name,
             description: wf.description,
             isDefault: Boolean(wf.is_default),
+            isReferenced: referencingTasks.length > 0,
+            referencingTasks,
             nodes,
             createdAt: wf.created_at,
             updatedAt: wf.updated_at,
@@ -475,7 +489,20 @@ export function createHttpServer(): http.Server {
           return;
         }
 
-        const validation = validateWorkflowNodes(body.nodes, body.id);
+        const trimmedId = body.id.trim();
+
+        // 检查是否已被任务引用，被引用的工作流禁止修改
+        if (db.isWorkflowReferenced(trimmedId)) {
+          sendJson(res, 403, {
+            success: false,
+            code: 'WORKFLOW_IN_USE',
+            message: `工作流 [${trimmedId}] 当前正被任务引用，禁止修改！若需修改，请先清理相关任务或新建独立工作流。`,
+            referencingTasks: db.getWorkflowReferencingTasks(trimmedId),
+          });
+          return;
+        }
+
+        const validation = validateWorkflowNodes(body.nodes, trimmedId);
         if (!validation.valid) {
           sendJson(res, 400, {
             success: false,
@@ -486,19 +513,26 @@ export function createHttpServer(): http.Server {
           return;
         }
 
-        const saved = db.saveWorkflowDefinition({
-          id: body.id.trim(),
-          name: body.name.trim(),
-          description: body.description || null,
-          nodes_json: JSON.stringify(body.nodes),
-          is_default: body.is_default ? 1 : 0,
-        });
+        try {
+          const saved = db.saveWorkflowDefinition({
+            id: trimmedId,
+            name: body.name.trim(),
+            description: body.description || null,
+            nodes_json: JSON.stringify(body.nodes),
+            is_default: body.is_default ? 1 : 0,
+          });
 
-        sendJson(res, 200, {
-          success: true,
-          message: `工作流 ${saved.id} (v${saved.version}) 保存成功`,
-          workflow: saved,
-        });
+          sendJson(res, 200, {
+            success: true,
+            message: `工作流 [${saved.name || saved.id}] 保存成功`,
+            workflow: saved,
+          });
+        } catch (e: any) {
+          sendJson(res, 400, {
+            success: false,
+            message: e.message || '保存工作流失败',
+          });
+        }
         return;
       }
 

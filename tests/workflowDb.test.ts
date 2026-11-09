@@ -29,32 +29,62 @@ try {
   assert.strictEqual(workflows[0].id, 'default');
   console.log('  ✓ listWorkflows returns default workflow');
 
-  // 3. Save new workflow definition and versioning
+  // 3. Save new workflow definition and direct modification (no V versions)
   const customNodes = [
     { id: 'start', name: '开始', type: 'start', on_success: 'step1' },
     { id: 'step1', name: '步骤1', type: 'task', execution_mode: 'command', command: 'echo 1', on_success: 'end' },
     { id: 'end', name: '结束', type: 'end' },
   ];
-  const v1 = testDb.saveWorkflowDefinition({
+  const createdWf = testDb.saveWorkflowDefinition({
     id: 'custom_wf',
     name: '自定义流程',
     nodes_json: JSON.stringify(customNodes),
   });
-  assert.strictEqual(v1.version, 1);
+  assert.strictEqual(createdWf.id, 'custom_wf');
+  assert.strictEqual(createdWf.name, '自定义流程');
 
-  // Saving again without version increments version
-  const v2 = testDb.saveWorkflowDefinition({
+  // Saving again modifies in-place directly without creating new V versions
+  const updatedWf = testDb.saveWorkflowDefinition({
     id: 'custom_wf',
-    name: '自定义流程 V2',
+    name: '自定义流程修改版',
     nodes_json: JSON.stringify(customNodes),
   });
-  assert.strictEqual(v2.version, 2);
+  assert.strictEqual(updatedWf.id, 'custom_wf');
+  assert.strictEqual(updatedWf.name, '自定义流程修改版');
+  const fetchedWf = testDb.getWorkflow('custom_wf');
+  assert.strictEqual(fetchedWf?.name, '自定义流程修改版');
+  console.log('  ✓ Workflow definition modified directly in place (no V versions)');
 
-  const fetchedLatest = testDb.getWorkflow('custom_wf');
-  assert.strictEqual(fetchedLatest?.version, 2);
-  const fetchedV1 = testDb.getWorkflow('custom_wf', 1);
-  assert.strictEqual(fetchedV1?.version, 1);
-  console.log('  ✓ Workflow definition versioning works correctly');
+  // 3.1 If workflow is referenced by a task, modification is strictly prohibited
+  const refTask = testDb.createTask({
+    id: 'task-locking-wf',
+    task_key: 'lock-key',
+    title: '引用工作流的任务',
+    target_cwd: tmpDir,
+  });
+  testDb.initTaskWorkflow('task-locking-wf', { workflowId: 'custom_wf' });
+  assert.strictEqual(testDb.isWorkflowReferenced('custom_wf'), true);
+
+  assert.throws(() => {
+    testDb.saveWorkflowDefinition({
+      id: 'custom_wf',
+      name: '非法修改测试',
+      nodes_json: JSON.stringify(customNodes),
+    });
+  }, /正被任务引用/);
+  console.log('  ✓ Modifying workflow referenced by a task is strictly rejected');
+
+  // Clean up referencing task to allow subsequent modifications
+  testDb.deleteTask('task-locking-wf');
+  assert.strictEqual(testDb.isWorkflowReferenced('custom_wf'), false);
+
+  const allowedAfterDelete = testDb.saveWorkflowDefinition({
+    id: 'custom_wf',
+    name: '任务清理后允许修改',
+    nodes_json: JSON.stringify(customNodes),
+  });
+  assert.strictEqual(allowedAfterDelete.name, '任务清理后允许修改');
+  console.log('  ✓ Workflow can be modified again once referencing tasks are removed');
 
   // 4. Task workflow creation & initialization
   const task = testDb.createTask({

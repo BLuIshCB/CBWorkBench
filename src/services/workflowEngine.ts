@@ -480,8 +480,8 @@ export class WorkflowEngine {
             }
           }
           // Branch 3: Agent execution node
-          else if (currentNode.execution_mode === 'agent') {
-            const isAcceptance = currentNode.result_rule === 'acceptance';
+          else if (currentNode.execution_mode === 'agent' || !currentNode.execution_mode) {
+            const isAcceptance = currentNode.result_rule === 'acceptance' || currentNode.id === 'acceptance';
 
             // If developer node: increment code generation
             if (!isAcceptance) {
