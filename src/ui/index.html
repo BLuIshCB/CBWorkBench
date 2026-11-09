@@ -3,38 +3,49 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CBWorkBench - 多 Agent 开发工作台</title>
+  <title>CBWorkBench - 工作流编排与多 Agent 开发工作台</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <!-- Header / Navigation -->
-  <header class="navbar">
-    <div class="nav-container">
-      <div class="nav-brand">
+  <div class="app-layout">
+    <!-- Left Fixed Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
         <a href="/" class="brand-link" onclick="app.navigateTo('/'); return false;">
           <span class="brand-icon">⚡</span>
-          <span class="brand-title">CBWorkBench</span>
-          <span class="brand-subtitle">多 Agent 开发工作台</span>
+          <div class="brand-info">
+            <span class="brand-title">CBWorkBench</span>
+            <span class="brand-subtitle">工作流工作台</span>
+          </div>
         </a>
       </div>
-      <nav class="nav-menu">
+
+      <nav class="sidebar-menu">
         <a href="/" class="nav-tab active" id="nav-tab-tasks" onclick="app.navigateTo('/'); return false;">
-          <span class="tab-icon">📋</span> 任务看板
+          <span class="tab-icon">📋</span>
+          <span class="tab-label">任务看板</span>
+        </a>
+        <a href="/workflows" class="nav-tab" id="nav-tab-workflows" onclick="app.navigateTo('/workflows'); return false;">
+          <span class="tab-icon">🔄</span>
+          <span class="tab-label">工作流编排</span>
         </a>
         <a href="/runtime" class="nav-tab" id="nav-tab-runtime" onclick="app.navigateTo('/runtime'); return false;">
-          <span class="tab-icon">🧩</span> 适配器中心 (Workers)
+          <span class="tab-icon">🧩</span>
+          <span class="tab-label">CLI 连接</span>
         </a>
       </nav>
-      <div class="nav-status" id="system-status-pills">
-        <span class="status-pill pill-node" id="pill-node">Node 24 SQLite</span>
-        <span class="status-pill pill-wb" id="pill-wb">WorkBuddy: deepseek-v4-flash</span>
-        <span class="status-pill pill-codex" id="pill-codex">Codex: gpt-5.6-sol</span>
-      </div>
-    </div>
-  </header>
 
-  <!-- Main Container -->
-  <main class="main-container">
+      <div class="sidebar-footer">
+        <div class="sidebar-status-box" id="system-status-pills">
+          <div class="status-pill pill-node" id="pill-node">Node 24 SQLite</div>
+          <div class="status-pill pill-wb" id="pill-wb">WorkBuddy 就绪</div>
+          <div class="status-pill pill-codex" id="pill-codex">Codex 就绪</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Container -->
+    <main class="main-container">
     <!-- View 1: Task List View -->
     <section id="view-task-list" class="view-section">
       <div class="section-header">
@@ -95,6 +106,11 @@
         </div>
       </div>
 
+      <!-- Task Workflow Tracker Card -->
+      <div class="card task-wf-card" id="task-wf-tracker-card" style="display: none;">
+        <!-- Dynamic task workflow timeline injected by JS -->
+      </div>
+
       <!-- Gate 2: Confirmation Card (Visible when pending_confirm) -->
       <div class="card confirmation-card" id="gate2-card" style="display: none;">
         <h3>门禁 2：用户确认并开始执行</h3>
@@ -102,9 +118,9 @@
         <p class="desc">执行使用当前用户权限，工作目录不构成安全隔离。开发和验收 CLI 均可能写文件；当前参数沿用厂商的跳过审批策略。</p>
         
         <!-- Executor & Model Selection -->
-        <div class="form-row-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; background: #0d1117; padding: 14px; border-radius: 6px; border: 1px solid var(--surface-border);">
+        <div class="form-row-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; background: #ffffff; padding: 14px; border-radius: 6px; border: 1px solid var(--surface-border);">
           <div class="form-group">
-            <label for="select-worker-executor" style="font-weight: 600; color: #58a6ff; display: block; margin-bottom: 6px; font-size: 13px;">
+            <label for="select-worker-executor" style="font-weight: 600; color: #2563eb; display: block; margin-bottom: 6px; font-size: 13px;">
               👨‍💻 WORKER (开发执行者)：
             </label>
             <div style="display: flex; gap: 8px;">
@@ -119,7 +135,7 @@
           </div>
 
           <div class="form-group">
-            <label for="select-reviewer-executor" style="font-weight: 600; color: #bc8cff; display: block; margin-bottom: 6px; font-size: 13px;">
+            <label for="select-reviewer-executor" style="font-weight: 600; color: #7c3aed; display: block; margin-bottom: 6px; font-size: 13px;">
               ⚖️ REVIEWER (审查验收者)：
             </label>
             <div style="display: flex; gap: 8px;">
@@ -260,7 +276,12 @@
       </div>
     </section>
 
-    <!-- View 3: Adapters & Workers Diagnostics View -->
+    <!-- View 3: Workflow Editor View -->
+    <section id="view-workflows" class="view-section" style="display: none;">
+      <!-- Populated dynamically by WorkflowView.render() -->
+    </section>
+
+    <!-- View 4: CLI Connections View -->
     <section id="view-runtime" class="view-section" style="display: none;">
       <div class="section-header">
         <div class="title-group">
@@ -369,6 +390,7 @@
       </div>
     </section>
   </main>
+  </div>
 
   <!-- Modal for Reject / Rework Feedback -->
   <div id="modal-reject" class="modal-backdrop" style="display: none;">
@@ -391,18 +413,18 @@
   <!-- Modal for Clear All Confirmation (Two-step confirmation) -->
   <div id="modal-clear-all" class="modal-backdrop" style="display: none;">
     <div class="modal-card" style="max-width: 520px; border: 1px solid var(--danger);">
-      <div class="modal-header" style="border-bottom-color: rgba(218, 54, 51, 0.4);">
-        <h3 style="color: #ff7b72; display: flex; align-items: center; gap: 8px;">
+      <div class="modal-header" style="border-bottom-color: #fca5a5;">
+        <h3 style="color: #dc2626; display: flex; align-items: center; gap: 8px;">
           <span>⚠️</span> 一键删除所有任务 (高危操作)
         </h3>
         <button class="close-btn" onclick="app.closeClearAllModal()">×</button>
       </div>
       <div class="modal-body">
-        <p style="margin-bottom: 12px; color: #f0f6fc; font-weight: 500;">
+        <p style="margin-bottom: 12px; color: #1e293b; font-weight: 500;">
           您正在执行一键清空全部任务操作，该操作完全不可逆！
         </p>
-        <div style="background: rgba(218, 54, 51, 0.1); border: 1px solid rgba(218, 54, 51, 0.3); padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; color: #ffa198;">
-          <p style="font-weight: 600; margin-bottom: 6px; color: #ff7b72;">确认后将一并清理以下全部内容：</p>
+        <div style="background: #fef2f2; border: 1px solid #fecaca; padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; color: #991b1b;">
+          <p style="font-weight: 600; margin-bottom: 6px; color: #dc2626;">确认后将一并清理以下全部内容：</p>
           <ul style="padding-left: 18px; margin: 0; line-height: 1.6;">
             <li>永久删除系统内<strong>所有开发任务</strong>与执行记录；</li>
             <li>物理删除所有任务的<strong>方案文档与材料包</strong>（manifest, task.md, dev.md, tests.md, acceptance.md 等）；</li>
@@ -411,7 +433,7 @@
           </ul>
         </div>
         
-        <div style="margin-top: 14px; padding: 12px; background: rgba(0, 0, 0, 0.25); border-radius: 6px; border: 1px solid var(--surface-border);">
+        <div style="margin-top: 14px; padding: 12px; background: #f8fafc; border-radius: 6px; border: 1px solid var(--surface-border);">
           <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; user-select: none; font-size: 13px; color: var(--text-main);">
             <input type="checkbox" id="checkbox-confirm-clear" onchange="app.handleClearCheckboxChange()" style="margin-top: 3px; width: 16px; height: 16px; cursor: pointer;" />
             <span><strong>二次确认</strong>：我已明确知晓此操作将彻底删除所有任务、方案文档和磁盘文件，并确认执行清空。</span>

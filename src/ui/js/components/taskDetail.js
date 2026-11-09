@@ -111,6 +111,9 @@ export const TaskDetail = {
       }
     }
 
+    // 5.5 Workflow Tracker
+    this.renderWorkflowTracker(data);
+
     // 6. Stepper States
     this.updateStepper(task.current_stage, task.status);
 
@@ -135,6 +138,72 @@ export const TaskDetail = {
       acceptance_md: latestRevision?.acceptance_md || '# 无验收标准',
       workerPrompts: workerPrompts || [],
     }, currentMaterialSubtab);
+  },
+
+  renderWorkflowTracker(data) {
+    const card = document.getElementById('task-wf-tracker-card');
+    if (!card) return;
+
+    const { task, taskWorkflow, nodeExecutionCounts } = data;
+    if (!taskWorkflow) {
+      card.style.display = 'none';
+      return;
+    }
+
+    card.style.display = 'block';
+    let nodes = [];
+    try {
+      nodes = JSON.parse(taskWorkflow.nodes_json);
+    } catch {}
+
+    const currentNodeId = taskWorkflow.current_node_id;
+    const currentNode = nodes.find((n) => n.id === currentNodeId);
+
+    const nodesHtml = nodes
+      .map((n) => {
+        const isCurrent = n.id === currentNodeId && task.status !== 'completed';
+        const execCount = (nodeExecutionCounts && nodeExecutionCounts[n.id]) || 0;
+        const isTask = n.type === 'task';
+        const isStart = n.type === 'start';
+        const isEnd = n.type === 'end';
+
+        let statusBadge = '';
+        if (isCurrent) {
+          statusBadge = '<span class="wf-status-badge badge-active">当前节点</span>';
+        } else if (execCount > 0) {
+          statusBadge = '<span class="wf-status-badge badge-done">✓ 已跑</span>';
+        }
+
+        const modeLabel = isStart ? '开始' : isEnd ? '结束' : (n.execution_mode === 'agent' ? 'Agent' : n.execution_mode === 'command' ? '命令' : '人工');
+
+        return `
+          <div class="wf-tracker-node ${isCurrent ? 'active' : ''} ${isStart ? 'node-start' : isEnd ? 'node-end' : 'node-task'}">
+            <div class="node-top">
+              <span class="node-type-label">${modeLabel}</span>
+              ${statusBadge}
+            </div>
+            <div class="node-name">${escapeHtml(n.name || n.id)}</div>
+            ${isTask ? `<div class="node-count">已执行 <strong>${execCount}</strong>${n.max_executions ? ` / ${n.max_executions}` : ''} 次</div>` : ''}
+          </div>
+        `;
+      })
+      .join('<div class="wf-tracker-arrow">→</div>');
+
+    card.innerHTML = `
+      <div class="task-wf-header">
+        <div class="wf-info">
+          <h4>工作流推进进度</h4>
+          <span class="badge badge-blue">模板: ${escapeHtml(taskWorkflow.workflow_id)} (v${taskWorkflow.workflow_version})</span>
+          <span class="badge badge-secondary">代码代次: G${taskWorkflow.code_generation}</span>
+        </div>
+        <div class="wf-current-hint">
+          当前节点：<strong class="text-blue">${escapeHtml(currentNode?.name || currentNodeId)}</strong>
+        </div>
+      </div>
+      <div class="task-wf-timeline">
+        ${nodesHtml}
+      </div>
+    `;
   },
 
   updateStepper(stage, status) {
@@ -194,8 +263,8 @@ export const TaskDetail = {
         <div class="card round-card" style="margin-bottom: 20px;">
           <div class="round-card-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--surface-border); padding-bottom: 10px; margin-bottom: 14px;">
             <div style="display: flex; align-items: center; gap: 10px;">
-              <h4 style="font-size: 15px; color: #f0f6fc;">第 ${rn} 轮执行与模型调试</h4>
-              <span class="dbg-pill" style="color: #79c0ff; border-color: rgba(56, 139, 253, 0.4);">
+              <h4 style="font-size: 15px; color: #0f172a;">第 ${rn} 轮执行与模型调试</h4>
+              <span class="dbg-pill" style="color: #2563eb; border-color: #bfdbfe; background: #eff6ff;">
                 Stage: ${formatStage(roundRounds[roundRounds.length - 1]?.stage)}
               </span>
             </div>
@@ -211,11 +280,11 @@ export const TaskDetail = {
                   const adapterLabel = r.adapter_id ? `${r.adapter_id} (${r.model_name || 'default'})` : (r.worker_id || 'workbuddy');
 
                   return `
-              <div style="background: #0d1117; padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border);">
+              <div style="background: var(--surface-hover); padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border);">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                   <div style="display: flex; align-items: center; gap: 8px;">
-                    <span style="font-weight: 600; color: #58a6ff; font-size: 13px;">${formatStage(r.stage)}</span>
-                    <span class="dbg-pill" style="color: #a371f7; background: rgba(163, 113, 247, 0.1);">
+                    <span style="font-weight: 600; color: var(--primary); font-size: 13px;">${formatStage(r.stage)}</span>
+                    <span class="dbg-pill" style="color: var(--purple); background: rgba(124, 58, 237, 0.1);">
                       ${escapeHtml(adapterLabel)}
                     </span>
                     <span style="font-size: 11px; color: var(--text-muted);">耗时: ${durationSec}</span>
@@ -250,7 +319,7 @@ export const TaskDetail = {
                   </div>
                 ` : ''}
 
-                ${r.error_message ? `<div style="color: #ff7b72; font-size: 12px; margin-top: 6px; padding: 6px 10px; background: rgba(255, 123, 114, 0.1); border-radius: 4px;">❌ 错误信息：${escapeHtml(r.error_message)}</div>` : ''}
+                ${r.error_message ? `<div style="color: #dc2626; font-size: 12px; margin-top: 6px; padding: 6px 10px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px;">❌ 错误信息：${escapeHtml(r.error_message)}</div>` : ''}
               </div>
             `;
                 }
@@ -260,21 +329,21 @@ export const TaskDetail = {
             ${
               roundTests.length > 0
                 ? `
-              <div style="background: #0d1117; padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border);">
-                <div style="font-weight: 600; color: #79c0ff; margin-bottom: 8px; font-size: 13px;">独立自动化测试命令执行结果：</div>
+              <div style="background: var(--surface-hover); padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border);">
+                <div style="font-weight: 600; color: var(--primary); margin-bottom: 8px; font-size: 13px;">独立自动化测试命令执行结果：</div>
                 ${roundTests
                   .map(
                     (t) => `
-                  <div style="font-size: 12px; margin-bottom: 6px; padding: 6px 10px; background: rgba(255,255,255,0.02); border-radius: 4px;">
+                  <div style="font-size: 12px; margin-bottom: 6px; padding: 6px 10px; background: #ffffff; border: 1px solid var(--surface-border); border-radius: 4px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                       <div>
-                        <span style="color: ${t.passed ? '#56d364' : '#ff7b72'}; font-weight: bold;">[${t.passed ? 'PASS' : 'FAIL'}]</span>
+                        <span style="color: ${t.passed ? 'var(--success)' : 'var(--danger)'}; font-weight: bold;">[${t.passed ? 'PASS' : 'FAIL'}]</span>
                         <code style="margin-left: 6px;">${escapeHtml(t.command)}</code>
                       </div>
                       <span style="color: var(--text-muted); font-size: 11px;">Exit: ${t.exit_code}</span>
                     </div>
-                    ${t.stderr && !t.passed ? `<pre style="color: #ff7b72; font-size: 11px; background: rgba(255,0,0,0.1); padding: 6px; margin-top: 4px; border-radius: 4px; overflow-x: auto;">${escapeHtml(t.stderr)}</pre>` : ''}
-                    ${t.stdout && !t.passed ? `<pre style="color: #8b949e; font-size: 11px; padding: 4px; margin-top: 2px; overflow-x: auto;">${escapeHtml(t.stdout)}</pre>` : ''}
+                    ${t.stderr && !t.passed ? `<pre style="color: var(--danger); font-size: 11px; background: #fee2e2; padding: 6px; margin-top: 4px; border-radius: 4px; overflow-x: auto;">${escapeHtml(t.stderr)}</pre>` : ''}
+                    ${t.stdout && !t.passed ? `<pre style="color: var(--text-muted); font-size: 11px; padding: 4px; margin-top: 2px; overflow-x: auto;">${escapeHtml(t.stdout)}</pre>` : ''}
                   </div>
                 `
                   )
@@ -287,16 +356,16 @@ export const TaskDetail = {
             ${
               roundAcceptance
                 ? `
-              <div style="background: #0d1117; padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border); border-left: 4px solid #bc8cff;">
+              <div style="background: var(--surface-hover); padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border); border-left: 4px solid var(--primary);">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                  <span style="font-weight: 600; color: #bc8cff; font-size: 13px;">Reviewer 自动验收评估报告：</span>
+                  <span style="font-weight: 600; color: var(--primary); font-size: 13px;">Reviewer 自动验收评估报告：</span>
                   <span class="badge ${roundAcceptance.decision === 'passed' ? 'badge-completed' : roundAcceptance.decision === 'needs_changes' ? 'badge-pending_confirm' : 'badge-blocked'}">${roundAcceptance.decision}</span>
                 </div>
-                <div style="font-size: 13px; color: #f0f6fc; margin-bottom: 8px; line-height: 1.5;">${escapeHtml(roundAcceptance.summary)}</div>
+                <div style="font-size: 13px; color: var(--text-main); margin-bottom: 8px; line-height: 1.5;">${escapeHtml(roundAcceptance.summary)}</div>
                 ${roundAcceptance.issues_json && roundAcceptance.issues_json !== '[]' ? `
-                  <div style="margin-top: 8px; padding: 8px 10px; background: rgba(255, 123, 114, 0.08); border-radius: 4px;">
-                    <div style="color: #ff7b72; font-weight: 600; font-size: 12px; margin-bottom: 4px;">待修复 Issues 清单：</div>
-                    <pre style="color: #ff7b72; font-size: 11px; white-space: pre-wrap;">${escapeHtml(roundAcceptance.issues_json)}</pre>
+                  <div style="margin-top: 8px; padding: 8px 10px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px;">
+                    <div style="color: #991b1b; font-weight: 600; font-size: 12px; margin-bottom: 4px;">待修复 Issues 清单：</div>
+                    <pre style="color: #dc2626; font-size: 11px; white-space: pre-wrap;">${escapeHtml(roundAcceptance.issues_json)}</pre>
                   </div>
                 ` : ''}
               </div>

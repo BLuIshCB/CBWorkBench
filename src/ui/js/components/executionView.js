@@ -25,7 +25,7 @@ export async function refreshExecution(taskId,task) {
   panel.hidden=false;
   document.getElementById('execution-live-status').textContent=run.kind+' · '+run.state+' · 已运行 '+Math.floor(run.elapsedMs/1000)+' 秒 · 剩余 '+Math.ceil(run.remainingMs/1000)+' 秒 · 最近输出 '+(run.lastOutputAt?new Date(run.lastOutputAt).toLocaleTimeString():'暂无')+(run.activity==='quiet'?' · 长时间无新输出，仍在执行':'')+(run.stopReason?' · '+run.stopReason:'')+' · 回收确认 '+run.cleanupConfirmed;
   let cleanup=document.getElementById('execution-cleanup');
-  if(!cleanup){cleanup=document.createElement('button');cleanup.id='execution-cleanup';cleanup.textContent='重试清理';panel.append(cleanup);}
+  if(!cleanup){cleanup=document.createElement('button');cleanup.id='execution-cleanup';cleanup.className='btn btn-sm btn-secondary';cleanup.textContent='重试清理';panel.append(cleanup);}
   cleanup.hidden=run.stopReason!=='CLEANUP_FAILED' || run.cleanupConfirmed;
   cleanup.onclick=async()=>{const result=await fetch('/api/runs/'+encodeURIComponent(run.runId)+'/cleanup',{method:'POST'}).then(r=>r.json());alert(result.message);};
   const executor=run.kind==='reviewer'?task?.reviewer_executor:task?.worker_executor;
