@@ -25,6 +25,10 @@ const testSuites = [
   'mcpServer.test.ts',
   'workflowEngine.test.ts',
   'workflowExecutionPolicy.test.ts',
+  'workflowDefinition.test.ts',
+  'workflowDb.test.ts',
+  'workflowStateMachine.test.ts',
+  'workflowHttp.test.ts',
 ];
 
 console.log('============================================================');

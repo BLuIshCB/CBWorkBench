@@ -9,6 +9,7 @@ import { GitService } from '../services/gitService.ts';
 import { workflowEngine } from '../services/workflowEngine.ts';
 import { DEFAULT_PORT, DEFAULT_HOST, TaskStatus } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
+import { DEFAULT_WORKFLOW_ID, type WorkflowNode } from '../services/workflowDefinition.ts';
 
 export function createWorkbenchMcpServer(): McpServer {
   const server = new McpServer({
@@ -33,6 +34,9 @@ export function createWorkbenchMcpServer(): McpServer {
       worker_prompts: z
         .record(z.string())
         .describe('各 Worker 提示词映射，键为 workerId（如 "worker-dev"），值为独立提示词正文'),
+      workflow_id: z.string().optional().describe('工作流模板 ID（默认为 "default"）'),
+      workflow_version: z.number().optional().describe('工作流版本号（默认最新版）'),
+      node_prompts: z.record(z.string()).optional().describe('工作流各 Agent 节点独立提示词映射（键为节点 ID，值为提示词）'),
       execution_timeout_ms: executionTimeoutSchema.optional(),
       budget_max_rounds: z.number().optional().describe('可选：最大执行轮次预算（默认 10）'),
       budget_timeout_sec: z.number().optional().describe('可选：已废弃：仅兼容接收，不再限制执行时间'),
@@ -61,6 +65,23 @@ export function createWorkbenchMcpServer(): McpServer {
           };
         }
 
+        // Validate workflow
+        const wfId = args.workflow_id || DEFAULT_WORKFLOW_ID;
+        const wfDef = db.getWorkflow(wfId, args.workflow_version);
+        if (!wfDef) {
+          throw new Error(`未找到指定工作流模板: ${wfId}${args.workflow_version ? ` (v${args.workflow_version})` : ''}`);
+        }
+        if (args.node_prompts) {
+          const nodes = JSON.parse(wfDef.nodes_json) as WorkflowNode[];
+          for (const [nodeId] of Object.entries(args.node_prompts)) {
+            const node = nodes.find((n) => n.id === nodeId);
+            if (!node) throw new Error(`node_prompts 中的节点 ID 不存在: ${nodeId}`);
+            if (node.type !== 'task' || node.execution_mode !== 'agent') {
+              throw new Error(`节点 ${nodeId} 执行方式不是 Agent，不可配置 node_prompts`);
+            }
+          }
+        }
+
         // Save into DB atomically via transaction
         db.transaction(() => {
           db.createTask({
@@ -76,6 +97,13 @@ export function createWorkbenchMcpServer(): McpServer {
             execution_timeout_ms: executionTimeoutMs,
             budget_max_rounds: args.budget_max_rounds,
             budget_timeout_sec: args.budget_timeout_sec,
+          });
+
+          // Initialize task workflow
+          db.initTaskWorkflow(taskId, {
+            workflowId: wfDef.id,
+            workflowVersion: wfDef.version,
+            nodePrompts: args.node_prompts,
           });
 
           // Save Revision
@@ -127,6 +155,8 @@ export function createWorkbenchMcpServer(): McpServer {
                   taskKey: args.task_key,
                   revision,
                   status: TaskStatus.PENDING_CONFIRM,
+                  workflowId: wfDef.id,
+                  workflowVersion: wfDef.version,
                   execution_timeout_ms:executionTimeoutMs,
                   executionTimeoutSource,
                   statusDescription: '待启动确认',
@@ -259,6 +289,23 @@ export function createWorkbenchMcpServer(): McpServer {
         };
       }
 
+      const taskWf = db.getTaskWorkflow(args.task_id);
+      let currentExecCount = 0;
+      let currentMaxExec = 3;
+      let currentNodeName = task.current_stage || '';
+
+      if (taskWf) {
+        try {
+          const nodes = JSON.parse(taskWf.nodes_json) as WorkflowNode[];
+          const node = nodes.find((n) => n.id === taskWf.current_node_id);
+          if (node) {
+            currentNodeName = node.name;
+            currentMaxExec = node.max_executions || 0;
+            currentExecCount = db.getNodeRunCount(args.task_id, node.id);
+          }
+        } catch {}
+      }
+
       const webUrl = `http://${DEFAULT_HOST}:${DEFAULT_PORT}/tasks/${args.task_id}`;
       return {
         content: [
@@ -271,6 +318,12 @@ export function createWorkbenchMcpServer(): McpServer {
                 revision: task.revision,
                 title: task.title,
                 status: task.status,
+                workflowId: taskWf?.workflow_id || 'default',
+                workflowVersion: taskWf?.workflow_version || 1,
+                currentNodeId: taskWf?.current_node_id || 'start',
+                currentNodeName,
+                currentNodeExecutionCount: currentExecCount,
+                currentNodeMaxExecutions: currentMaxExec,
                 currentRound: task.current_round,
                 currentStage: task.current_stage,
                 activeWorkerId: task.active_worker_id,
@@ -362,6 +415,142 @@ export function createWorkbenchMcpServer(): McpServer {
                 success: true,
                 taskId: args.task_id,
                 message: `任务 ${args.task_id} 及其相关方案和文件已成功删除`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // 6. Tool: workbench_list_workflows
+  server.tool(
+    'workbench_list_workflows',
+    '获取工作台中所有可用的工作流模板列表及其版本信息与节点数量。',
+    {},
+    async () => {
+      const list = db.listWorkflows().map((wf) => {
+        let nodeCount = 0;
+        try {
+          nodeCount = JSON.parse(wf.nodes_json).length;
+        } catch {}
+        return {
+          id: wf.id,
+          name: wf.name,
+          version: wf.version,
+          description: wf.description,
+          isDefault: Boolean(wf.is_default),
+          nodeCount,
+          updatedAt: wf.updated_at,
+        };
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ success: true, workflows: list }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // 7. Tool: workbench_get_workflow
+  server.tool(
+    'workbench_get_workflow',
+    '获取指定工作流的完整节点图定义（包含稳定节点 ID、执行方式、提示词模板、成功/失败去向和最大执行次数）。',
+    {
+      workflow_id: z.string().describe('工作流唯一标识（如 "default"）'),
+      version: z.number().optional().describe('可选：指定版本号，不传则返回最新版本'),
+    },
+    async (args) => {
+      const wf = db.getWorkflow(args.workflow_id, args.version);
+      if (!wf) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `未找到工作流: ${args.workflow_id}` }],
+        };
+      }
+
+      let nodes = [];
+      try {
+        nodes = JSON.parse(wf.nodes_json);
+      } catch {}
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                workflow: {
+                  id: wf.id,
+                  name: wf.name,
+                  version: wf.version,
+                  description: wf.description,
+                  isDefault: Boolean(wf.is_default),
+                  nodes,
+                  createdAt: wf.created_at,
+                  updatedAt: wf.updated_at,
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // 8. Tool: workbench_advance_workflow
+  server.tool(
+    'workbench_advance_workflow',
+    '当前正在运行的 Agent 报告本节点执行完成或失败并请求推进。后台结合连线配置统一推进，调用方无需也不得指定下一节点。',
+    {
+      task_id: z.string().describe('任务唯一标识'),
+      node_id: z.string().describe('当前节点 ID（如 "acceptance" 或 "development"）'),
+      attempt_id: z.string().describe('本次节点执行唯一 ID (run_id)'),
+      completion_token: z.string().describe('本次节点执行分配的安全凭据'),
+      request_id: z.string().describe('本次报告调用的唯一幂等请求 ID'),
+      outcome: z.enum(['passed', 'failed']).describe('本次节点业务判定结果：passed (成功) 或 failed (失败)'),
+      summary: z.string().describe('本次节点完成摘要或失败原因说明'),
+    },
+    async (args) => {
+      const res = db.registerAdvanceReport(
+        args.task_id,
+        args.node_id,
+        args.attempt_id,
+        args.completion_token,
+        args.request_id,
+        args.outcome,
+        args.summary
+      );
+
+      if (!res.success) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `报告推进失败: ${res.message}` }],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                taskId: args.task_id,
+                nodeId: args.node_id,
+                attemptId: args.attempt_id,
+                requestId: args.request_id,
+                duplicate: res.duplicate || false,
+                message: res.message,
               },
               null,
               2

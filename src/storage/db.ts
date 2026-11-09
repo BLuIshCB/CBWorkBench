@@ -5,6 +5,55 @@ import path from 'node:path';
 import { DB_PATH, DATA_DIR, TaskStatus, RoundStage } from '../config/constants.ts';
 import { resolveExecutionTimeout } from '../services/executionPolicy.ts';
 import { logger } from '../utils/logger.ts';
+import crypto from 'node:crypto';
+import {
+  type WorkflowNode,
+  type WorkflowNodeType,
+  type TaskExecutionMode,
+  type TaskResultRule,
+  DEFAULT_WORKFLOW_ID,
+  DEFAULT_WORKFLOW_NODES,
+  DEFAULT_MAX_EXECUTIONS,
+} from '../services/workflowDefinition.ts';
+
+export interface WorkflowDefinitionRecord {
+  id: string;
+  version: number;
+  name: string;
+  description: string | null;
+  nodes_json: string;
+  created_at: number;
+  updated_at: number;
+  is_default: number;
+}
+
+export interface TaskWorkflowRecord {
+  task_id: string;
+  workflow_id: string;
+  workflow_version: number;
+  nodes_json: string;
+  current_node_id: string;
+  current_run_id: string | null;
+  code_generation: number;
+  tests_passed_generation: number;
+  acceptance_passed_generation: number;
+  updated_at: number;
+}
+
+export interface WorkflowNodeRunRecord {
+  id: number;
+  run_id: string;
+  task_id: string;
+  node_id: string;
+  execution_index: number;
+  status: 'running' | 'passed' | 'failed' | 'blocked' | 'waiting_manual' | 'cancelled';
+  result_summary: string | null;
+  completion_token: string | null;
+  request_id: string | null;
+  execution_run_id: string | null;
+  created_at: number;
+  finished_at: number | null;
+}
 
 export interface TaskRecord {
   id: string;
@@ -33,6 +82,8 @@ export interface TaskRecord {
   worker_model?: string;
   reviewer_executor?: string;
   reviewer_model?: string;
+  workflow_id?: string;
+  current_node_id?: string;
 }
 
 export interface TaskRevisionRecord {
@@ -183,6 +234,11 @@ export class WorkbenchDatabase {
           WHERE id = ?
         `).run(TaskStatus.BLOCKED, reason, now, t.id);
       }
+      this.db.prepare(`
+        UPDATE workflow_node_runs
+        SET status = 'blocked', result_summary = '服务意外终止或重启：执行已安全挂起', finished_at = ?
+        WHERE status = 'running'
+      `).run(now);
     });
 
     logger.info(`[WorkbenchDatabase] Crash recovery check: recovered ${taskIds.length} unfinished tasks: ${taskIds.join(', ')}`);
@@ -298,10 +354,76 @@ export class WorkbenchDatabase {
         decided_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS workflow_definitions (
+        id TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        name TEXT NOT NULL,
+        description TEXT,
+        nodes_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (id, version)
+      );
+
+      CREATE TABLE IF NOT EXISTS task_workflows (
+        task_id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        workflow_version INTEGER NOT NULL,
+        nodes_json TEXT NOT NULL,
+        current_node_id TEXT NOT NULL,
+        current_run_id TEXT,
+        code_generation INTEGER NOT NULL DEFAULT 0,
+        tests_passed_generation INTEGER NOT NULL DEFAULT 0,
+        acceptance_passed_generation INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS workflow_node_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL UNIQUE,
+        task_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        execution_index INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        result_summary TEXT,
+        completion_token TEXT,
+        request_id TEXT,
+        execution_run_id TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        UNIQUE(task_id, node_id, execution_index)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
       CREATE INDEX IF NOT EXISTS idx_task_revisions_task_id ON task_revisions(task_id);
       CREATE INDEX IF NOT EXISTS idx_execution_rounds_task_id ON execution_rounds(task_id);
+      CREATE INDEX IF NOT EXISTS idx_workflow_defs_id ON workflow_definitions(id);
+      CREATE INDEX IF NOT EXISTS idx_task_workflows_task ON task_workflows(task_id);
+      CREATE INDEX IF NOT EXISTS idx_wf_node_runs_task ON workflow_node_runs(task_id);
+      CREATE INDEX IF NOT EXISTS idx_wf_node_runs_token ON workflow_node_runs(completion_token);
+      CREATE INDEX IF NOT EXISTS idx_wf_node_runs_req ON workflow_node_runs(request_id);
     `);
+
+    // Ensure default workflow template exists
+    try {
+      const defRow = this.db.prepare('SELECT id FROM workflow_definitions WHERE id = ?').get('default');
+      if (!defRow) {
+        const now = Date.now();
+        this.db.prepare(`
+          INSERT INTO workflow_definitions (id, version, name, description, nodes_json, created_at, updated_at, is_default)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+        `).run(
+          DEFAULT_WORKFLOW_ID,
+          1,
+          '默认开发交付流程',
+          '经典流程：开始 -> 开发实现 -> 独立测试 -> 整体验收 -> 人工确认 -> 结束',
+          JSON.stringify(DEFAULT_WORKFLOW_NODES),
+          now,
+          now
+        );
+      }
+    } catch {}
 
     this.db.exec(`CREATE TABLE IF NOT EXISTS execution_runs (run_id TEXT PRIMARY KEY, task_id TEXT, snapshot_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS execution_events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, at INTEGER NOT NULL, type TEXT NOT NULL, data_json TEXT NOT NULL, PRIMARY KEY(run_id,seq));
@@ -438,21 +560,40 @@ export class WorkbenchDatabase {
     );
 
     this.db.prepare('UPDATE tasks SET execution_timeout_ms = ? WHERE id = ?').run(resolveExecutionTimeout(data.execution_timeout_ms), data.id);
+    if (!this.getTaskWorkflow(data.id)) {
+      this.initTaskWorkflow(data.id);
+    }
     return this.getTask(data.id)!;
   }
 
   getTask(id: string): TaskRecord | null {
-    const stmt = this.db.prepare(`SELECT * FROM tasks WHERE id = ?`);
+    const stmt = this.db.prepare(`
+      SELECT t.*, tw.workflow_id, tw.current_node_id 
+      FROM tasks t
+      LEFT JOIN task_workflows tw ON t.id = tw.task_id
+      WHERE t.id = ?
+    `);
     const row = stmt.get(id) as unknown as TaskRecord | undefined;
     return row ?? null;
   }
 
   listTasks(statusFilter?: TaskStatus): TaskRecord[] {
     if (statusFilter) {
-      const stmt = this.db.prepare(`SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC`);
+      const stmt = this.db.prepare(`
+        SELECT t.*, tw.workflow_id, tw.current_node_id 
+        FROM tasks t
+        LEFT JOIN task_workflows tw ON t.id = tw.task_id
+        WHERE t.status = ? 
+        ORDER BY t.created_at DESC
+      `);
       return stmt.all(statusFilter) as unknown as TaskRecord[];
     }
-    const stmt = this.db.prepare(`SELECT * FROM tasks ORDER BY created_at DESC`);
+    const stmt = this.db.prepare(`
+      SELECT t.*, tw.workflow_id, tw.current_node_id 
+      FROM tasks t
+      LEFT JOIN task_workflows tw ON t.id = tw.task_id
+      ORDER BY t.created_at DESC
+    `);
     return stmt.all() as unknown as TaskRecord[];
   }
 
@@ -777,6 +918,349 @@ export class WorkbenchDatabase {
     return stmt.all(taskId) as unknown as HumanDecisionRecord[];
   }
 
+  // --- Workflow Definitions ---
+
+  getWorkflow(id: string, version?: number): WorkflowDefinitionRecord | null {
+    if (version !== undefined) {
+      const stmt = this.db.prepare('SELECT * FROM workflow_definitions WHERE id = ? AND version = ?');
+      const row = stmt.get(id, version) as unknown as WorkflowDefinitionRecord | undefined;
+      return row ?? null;
+    }
+    const stmt = this.db.prepare('SELECT * FROM workflow_definitions WHERE id = ? ORDER BY version DESC LIMIT 1');
+    const row = stmt.get(id) as unknown as WorkflowDefinitionRecord | undefined;
+    return row ?? null;
+  }
+
+  listWorkflows(): WorkflowDefinitionRecord[] {
+    const stmt = this.db.prepare(`
+      SELECT wd.* FROM workflow_definitions wd
+      INNER JOIN (
+        SELECT id, MAX(version) AS max_v FROM workflow_definitions GROUP BY id
+      ) latest ON wd.id = latest.id AND wd.version = latest.max_v
+      ORDER BY wd.is_default DESC, wd.id ASC
+    `);
+    return stmt.all() as unknown as WorkflowDefinitionRecord[];
+  }
+
+  saveWorkflowDefinition(data: {
+    id: string;
+    version?: number;
+    name: string;
+    description?: string | null;
+    nodes_json: string;
+    is_default?: number;
+  }): WorkflowDefinitionRecord {
+    const now = Date.now();
+    let version = data.version;
+    if (version === undefined) {
+      const row = this.db.prepare('SELECT MAX(version) as max_v FROM workflow_definitions WHERE id = ?').get(data.id) as { max_v: number | null } | undefined;
+      version = (row?.max_v ?? 0) + 1;
+    }
+
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO workflow_definitions (
+        id, version, name, description, nodes_json, created_at, updated_at, is_default
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      data.id,
+      version,
+      data.name,
+      data.description || null,
+      data.nodes_json,
+      now,
+      now,
+      data.is_default ?? 0
+    );
+
+    return this.getWorkflow(data.id, version)!;
+  }
+
+  // --- Task Workflows ---
+
+  getTaskWorkflow(taskId: string): TaskWorkflowRecord | null {
+    const stmt = this.db.prepare('SELECT * FROM task_workflows WHERE task_id = ?');
+    const row = stmt.get(taskId) as unknown as TaskWorkflowRecord | undefined;
+    return row ?? null;
+  }
+
+  initTaskWorkflow(
+    taskId: string,
+    options?: {
+      workflowId?: string;
+      workflowVersion?: number;
+      nodePrompts?: Record<string, string>;
+      nodesOverride?: WorkflowNode[];
+    }
+  ): TaskWorkflowRecord {
+    const wfId = options?.workflowId || DEFAULT_WORKFLOW_ID;
+    let nodes: WorkflowNode[];
+    let wfVersion = options?.workflowVersion || 1;
+
+    if (options?.nodesOverride) {
+      nodes = JSON.parse(JSON.stringify(options.nodesOverride));
+    } else {
+      const def = this.getWorkflow(wfId, options?.workflowVersion);
+      if (def) {
+        wfVersion = def.version;
+        nodes = JSON.parse(def.nodes_json);
+      } else {
+        nodes = JSON.parse(JSON.stringify(DEFAULT_WORKFLOW_NODES));
+      }
+    }
+
+    // Apply node prompts override if provided
+    if (options?.nodePrompts) {
+      for (const node of nodes) {
+        if (node.type === 'task' && node.execution_mode === 'agent' && options.nodePrompts[node.id]) {
+          node.prompt = options.nodePrompts[node.id];
+        }
+      }
+    }
+
+    const startNode = nodes.find((n) => n.type === 'start') || nodes[0];
+    const initialNodeId = startNode ? startNode.id : 'start';
+    const now = Date.now();
+
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO task_workflows (
+        task_id, workflow_id, workflow_version, nodes_json,
+        current_node_id, current_run_id, code_generation,
+        tests_passed_generation, acceptance_passed_generation, updated_at
+      ) VALUES (?, ?, ?, ?, ?, NULL, 0, 0, 0, ?)
+    `);
+
+    stmt.run(taskId, wfId, wfVersion, JSON.stringify(nodes), initialNodeId, now);
+    return this.getTaskWorkflow(taskId)!;
+  }
+
+  updateTaskWorkflow(
+    taskId: string,
+    updates: Partial<{
+      current_node_id: string;
+      current_run_id: string | null;
+      code_generation: number;
+      tests_passed_generation: number;
+      acceptance_passed_generation: number;
+      nodes_json: string;
+    }>
+  ): void {
+    const sets: string[] = ['updated_at = ?'];
+    const params: unknown[] = [Date.now()];
+
+    if (updates.current_node_id !== undefined) {
+      sets.push('current_node_id = ?');
+      params.push(updates.current_node_id);
+    }
+    if (updates.current_run_id !== undefined) {
+      sets.push('current_run_id = ?');
+      params.push(updates.current_run_id);
+    }
+    if (updates.code_generation !== undefined) {
+      sets.push('code_generation = ?');
+      params.push(updates.code_generation);
+    }
+    if (updates.tests_passed_generation !== undefined) {
+      sets.push('tests_passed_generation = ?');
+      params.push(updates.tests_passed_generation);
+    }
+    if (updates.acceptance_passed_generation !== undefined) {
+      sets.push('acceptance_passed_generation = ?');
+      params.push(updates.acceptance_passed_generation);
+    }
+    if (updates.nodes_json !== undefined) {
+      sets.push('nodes_json = ?');
+      params.push(updates.nodes_json);
+    }
+
+    params.push(taskId);
+    this.db.prepare(`UPDATE task_workflows SET ${sets.join(', ')} WHERE task_id = ?`).run(...params);
+  }
+
+  // --- Workflow Node Runs ---
+
+  createNodeRun(data: {
+    run_id: string;
+    task_id: string;
+    node_id: string;
+    execution_index: number;
+    status?: 'running' | 'passed' | 'failed' | 'blocked' | 'waiting_manual' | 'cancelled';
+    completion_token?: string | null;
+    execution_run_id?: string | null;
+    result_summary?: string | null;
+  }): WorkflowNodeRunRecord {
+    const now = Date.now();
+    const status = data.status || 'running';
+    const stmt = this.db.prepare(`
+      INSERT INTO workflow_node_runs (
+        run_id, task_id, node_id, execution_index, status,
+        result_summary, completion_token, request_id,
+        execution_run_id, created_at, finished_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)
+    `);
+
+    stmt.run(
+      data.run_id,
+      data.task_id,
+      data.node_id,
+      data.execution_index,
+      status,
+      data.result_summary || null,
+      data.completion_token || null,
+      data.execution_run_id || null,
+      now
+    );
+
+    return this.getNodeRunByRunId(data.run_id)!;
+  }
+
+  updateNodeRun(
+    runId: string,
+    updates: Partial<{
+      status: 'running' | 'passed' | 'failed' | 'blocked' | 'waiting_manual' | 'cancelled';
+      result_summary: string | null;
+      completion_token: string | null;
+      request_id: string | null;
+      execution_run_id: string | null;
+      finished_at: number | null;
+    }>
+  ): void {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+
+    if (updates.status !== undefined) {
+      sets.push('status = ?');
+      params.push(updates.status);
+    }
+    if (updates.result_summary !== undefined) {
+      sets.push('result_summary = ?');
+      params.push(updates.result_summary);
+    }
+    if (updates.completion_token !== undefined) {
+      sets.push('completion_token = ?');
+      params.push(updates.completion_token);
+    }
+    if (updates.request_id !== undefined) {
+      sets.push('request_id = ?');
+      params.push(updates.request_id);
+    }
+    if (updates.execution_run_id !== undefined) {
+      sets.push('execution_run_id = ?');
+      params.push(updates.execution_run_id);
+    }
+    if (updates.finished_at !== undefined) {
+      sets.push('finished_at = ?');
+      params.push(updates.finished_at);
+    }
+
+    if (sets.length === 0) return;
+    params.push(runId);
+    this.db.prepare(`UPDATE workflow_node_runs SET ${sets.join(', ')} WHERE run_id = ?`).run(...params);
+  }
+
+  getNodeRuns(taskId: string, nodeId?: string): WorkflowNodeRunRecord[] {
+    if (nodeId) {
+      const stmt = this.db.prepare(
+        'SELECT * FROM workflow_node_runs WHERE task_id = ? AND node_id = ? ORDER BY execution_index ASC, id ASC'
+      );
+      return stmt.all(taskId, nodeId) as unknown as WorkflowNodeRunRecord[];
+    }
+    const stmt = this.db.prepare(
+      'SELECT * FROM workflow_node_runs WHERE task_id = ? ORDER BY id ASC'
+    );
+    return stmt.all(taskId) as unknown as WorkflowNodeRunRecord[];
+  }
+
+  getLatestNodeRun(taskId: string, nodeId?: string): WorkflowNodeRunRecord | null {
+    if (nodeId) {
+      const stmt = this.db.prepare(
+        'SELECT * FROM workflow_node_runs WHERE task_id = ? AND node_id = ? ORDER BY execution_index DESC, id DESC LIMIT 1'
+      );
+      const row = stmt.get(taskId, nodeId) as unknown as WorkflowNodeRunRecord | undefined;
+      return row ?? null;
+    }
+    const stmt = this.db.prepare(
+      'SELECT * FROM workflow_node_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1'
+    );
+    const row = stmt.get(taskId) as unknown as WorkflowNodeRunRecord | undefined;
+    return row ?? null;
+  }
+
+  getNodeRunByRunId(runId: string): WorkflowNodeRunRecord | null {
+    const stmt = this.db.prepare('SELECT * FROM workflow_node_runs WHERE run_id = ?');
+    const row = stmt.get(runId) as unknown as WorkflowNodeRunRecord | undefined;
+    return row ?? null;
+  }
+
+  getNodeRunByToken(taskId: string, token: string): WorkflowNodeRunRecord | null {
+    const stmt = this.db.prepare('SELECT * FROM workflow_node_runs WHERE task_id = ? AND completion_token = ?');
+    const row = stmt.get(taskId, token) as unknown as WorkflowNodeRunRecord | undefined;
+    return row ?? null;
+  }
+
+  getNodeRunCount(taskId: string, nodeId: string): number {
+    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM workflow_node_runs WHERE task_id = ? AND node_id = ?');
+    const row = stmt.get(taskId, nodeId) as { count: number } | undefined;
+    return row?.count ?? 0;
+  }
+
+  registerAdvanceReport(
+    taskId: string,
+    nodeId: string,
+    attemptId: string,
+    completionToken: string,
+    requestId: string,
+    outcome: 'passed' | 'failed',
+    summary: string
+  ): { success: boolean; message: string; duplicate?: boolean; run?: WorkflowNodeRunRecord } {
+    return this.transaction(() => {
+      const existingReq = this.db
+        .prepare('SELECT * FROM workflow_node_runs WHERE request_id = ?')
+        .get(requestId) as unknown as WorkflowNodeRunRecord | undefined;
+
+      if (existingReq) {
+        return {
+          success: true,
+          duplicate: true,
+          message: '请求已接收（幂等处理）',
+          run: existingReq,
+        };
+      }
+
+      const run = this.getNodeRunByRunId(attemptId);
+      if (!run) {
+        return { success: false, message: `未找到执行记录: ${attemptId}` };
+      }
+      if (run.task_id !== taskId || run.node_id !== nodeId) {
+        return { success: false, message: `执行记录与任务或节点不匹配` };
+      }
+      if (run.completion_token !== completionToken) {
+        return { success: false, message: `完成凭据 (completion_token) 不正确` };
+      }
+      if (run.request_id && run.request_id !== requestId) {
+        return { success: false, message: `本次执行已绑定其他请求标识，不得重复报告` };
+      }
+
+      const task = this.getTask(taskId);
+      if (!task || task.status !== TaskStatus.RUNNING) {
+        return { success: false, message: `任务当前状态不可推进: ${task?.status}` };
+      }
+
+      this.db.prepare(`
+        UPDATE workflow_node_runs
+        SET request_id = ?, result_summary = ?
+        WHERE run_id = ?
+      `).run(requestId, summary, attemptId);
+
+      const updated = this.getNodeRunByRunId(attemptId)!;
+      return {
+        success: true,
+        message: '报告已登记，等待当前执行退出后统一推进',
+        run: updated,
+      };
+    });
+  }
+
   // --- Delete Tasks ---
 
   deleteTask(taskId: string): boolean {
@@ -787,6 +1271,8 @@ export class WorkbenchDatabase {
       this.db.prepare('DELETE FROM execution_events WHERE run_id IN (SELECT run_id FROM execution_runs WHERE task_id=?)').run(taskId);
       this.db.prepare('DELETE FROM execution_runs WHERE task_id=?').run(taskId);
       this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+      this.db.prepare('DELETE FROM task_workflows WHERE task_id = ?').run(taskId);
+      this.db.prepare('DELETE FROM workflow_node_runs WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM task_revisions WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM worker_prompts WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM execution_rounds WHERE task_id = ?').run(taskId);
@@ -802,6 +1288,8 @@ export class WorkbenchDatabase {
       const row = this.db.prepare('SELECT count(*) as count FROM tasks').get() as { count: number };
       const deletedCount = row ? Number(row.count) : 0;
       this.db.exec('DELETE FROM execution_events WHERE run_id IN (SELECT run_id FROM execution_runs WHERE task_id IS NOT NULL); DELETE FROM execution_runs WHERE task_id IS NOT NULL; DELETE FROM tasks;');
+      this.db.exec('DELETE FROM task_workflows;');
+      this.db.exec('DELETE FROM workflow_node_runs;');
       this.db.exec('DELETE FROM task_revisions;');
       this.db.exec('DELETE FROM worker_prompts;');
       this.db.exec('DELETE FROM execution_rounds;');

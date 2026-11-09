@@ -1,13 +1,15 @@
+import crypto from 'node:crypto';
 import { resolveExecutionTimeout } from './executionPolicy.ts';
 import { db, type TaskRecord, type TaskRevisionRecord } from '../storage/db.ts';
 import { taskFileStore } from '../storage/fileStore.ts';
 import { GitService } from './gitService.ts';
-import { TestRunner, type TestCaseItem } from './testRunner.ts';
+import { TestRunner } from './testRunner.ts';
 import { CliRunner } from './cliRunner.ts';
 import { adapterRegistry } from '../adapters/registry.ts';
 import { AcceptanceService } from './acceptanceService.ts';
 import { TaskStatus, RoundStage, DEFAULT_BUDGET_MAX_ROUNDS } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
+import { type WorkflowNode, DEFAULT_MAX_EXECUTIONS } from './workflowDefinition.ts';
 
 export class WorkflowEngine {
   private static instance: WorkflowEngine;
@@ -82,19 +84,25 @@ export class WorkflowEngine {
     // 在排队前占用执行槽，避免异步调度之前重复确认。
     this.isProcessing = true;
     this.activeTaskId = taskId;
-    // 切换 CLI 时使用新厂商默认模型，不能沿用上一家保存的模型名。
+
     try {
-    db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
-      execution_timeout_ms: executionTimeoutMs,
-      stop_requested: 0,
-      blocked_reason: null,
-      confirmed_cwd: targetCwd,
-      started_at: Date.now(),
-      worker_executor: workerExecutor,
-      worker_model: workerModel,
-      reviewer_executor: reviewerExecutor,
-      reviewer_model: reviewerModel,
-    });
+      db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
+        execution_timeout_ms: executionTimeoutMs,
+        stop_requested: 0,
+        blocked_reason: null,
+        confirmed_cwd: targetCwd,
+        started_at: Date.now(),
+        worker_executor: workerExecutor,
+        worker_model: workerModel,
+        reviewer_executor: reviewerExecutor,
+        reviewer_model: reviewerModel,
+      });
+
+      // Ensure task workflow is initialized
+      let taskWf = db.getTaskWorkflow(taskId);
+      if (!taskWf) {
+        taskWf = db.initTaskWorkflow(taskId);
+      }
     } catch (error) {
       this.isProcessing = false;
       this.activeTaskId = null;
@@ -144,13 +152,14 @@ export class WorkflowEngine {
     if (this.activeTaskId !== taskId && !CliRunner.hasTaskRuns(taskId)) return;
     this.stopTask(taskId);
     await CliRunner.abort(taskId);
-    const deadline=Date.now()+10000;
-    while(this.activeTaskId===taskId && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,50));
-    if(this.activeTaskId===taskId || CliRunner.hasTaskRuns(taskId)) throw new Error('CLEANUP_FAILED: 进程回收未确认，保留任务与日志。');
+    const deadline = Date.now() + 10000;
+    while (this.activeTaskId === taskId && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    if (this.activeTaskId === taskId || CliRunner.hasTaskRuns(taskId)) throw new Error('CLEANUP_FAILED: 进程回收未确认，保留任务与日志。');
   }
+
   async handleAllTasksDeleted(): Promise<void> {
-    if(this.activeTaskId) await this.handleTaskDeleted(this.activeTaskId);
-    if(CliRunner.hasCleanupFailure()) throw new Error('CLEANUP_FAILED: 存在未回收进程，保留任务与日志。'+CliRunner.pendingRunIds().join(','));
+    if (this.activeTaskId) await this.handleTaskDeleted(this.activeTaskId);
+    if (CliRunner.hasCleanupFailure()) throw new Error('CLEANUP_FAILED: 存在未回收进程，保留任务与日志。' + CliRunner.pendingRunIds().join(','));
   }
 
   /**
@@ -174,40 +183,75 @@ export class WorkflowEngine {
 
     db.saveHumanDecision({ task_id: taskId, action, reason });
 
-    if (action === 'approve') {
-      db.updateTaskStatus(taskId, TaskStatus.COMPLETED, {
-        completed_at: Date.now(),
-      });
-      logger.info(`[WorkflowEngine] Task ${taskId} approved by human reviewer. Completed!`);
-      return { success: true, message: 'Task approved and completed.' };
-    } else {
-      this.isProcessing = true;
-      this.activeTaskId = taskId;
-      // Rejected with reason: loop back to repair
-      logger.info(`[WorkflowEngine] Task ${taskId} rejected by human reviewer. Resuming loop with feedback: ${reason}`);
-      try {
-        db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
-          blocked_reason: null,
-          stop_requested: 0,
-        });
-      } catch (error) {
-        this.isProcessing = false;
-        this.activeTaskId = null;
-        throw error;
-      }
-
-      setImmediate(() => {
-        this.runTaskLoop(taskId, `Human Reviewer Feedback: ${reason}`).catch((err) => {
-          logger.error(`[WorkflowEngine] Error resuming task after rejection:`, err);
-        });
-      });
-
-      return { success: true, message: 'Rework feedback submitted. Resuming execution loop.' };
+    let taskWf = db.getTaskWorkflow(taskId);
+    if (!taskWf) {
+      taskWf = db.initTaskWorkflow(taskId);
     }
+
+    let nodes: WorkflowNode[] = [];
+    try {
+      nodes = JSON.parse(taskWf.nodes_json);
+    } catch {}
+
+    const currentNodeId = taskWf.current_node_id;
+    let currentNode = nodes.find((n) => n.id === currentNodeId);
+    if (!currentNode || currentNode.execution_mode !== 'manual') {
+      const manualNode = nodes.find((n) => n.execution_mode === 'manual');
+      if (manualNode) currentNode = manualNode;
+    }
+
+    const latestRun = db.getLatestNodeRun(taskId, currentNode?.id || currentNodeId);
+    if (latestRun && latestRun.status === 'waiting_manual') {
+      db.updateNodeRun(latestRun.run_id, {
+        status: action === 'approve' ? 'passed' : 'failed',
+        result_summary: reason || (action === 'approve' ? '人工审核通过' : '人工审核退回'),
+        finished_at: Date.now(),
+      });
+    }
+
+    const nextNodeId = action === 'approve'
+      ? (currentNode?.on_success || 'end')
+      : (currentNode?.on_failure || 'development');
+
+    db.updateTaskWorkflow(taskId, { current_node_id: nextNodeId });
+
+    if (action === 'approve') {
+      const nextNode = nodes.find((n) => n.id === nextNodeId);
+      if (!nextNode || nextNode.type === 'end') {
+        db.updateTaskStatus(taskId, TaskStatus.COMPLETED, {
+          completed_at: Date.now(),
+        });
+        logger.info(`[WorkflowEngine] Task ${taskId} approved by human reviewer. Completed!`);
+        return { success: true, message: 'Task approved and completed.' };
+      }
+    }
+
+    this.isProcessing = true;
+    this.activeTaskId = taskId;
+    logger.info(`[WorkflowEngine] Task ${taskId} human review decision [${action}]. Resuming loop with feedback: ${reason}`);
+
+    try {
+      db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
+        blocked_reason: null,
+        stop_requested: 0,
+      });
+    } catch (error) {
+      this.isProcessing = false;
+      this.activeTaskId = null;
+      throw error;
+    }
+
+    setImmediate(() => {
+      this.runTaskLoop(taskId, reason ? `Human Reviewer Feedback: ${reason}` : undefined).catch((err) => {
+        logger.error(`[WorkflowEngine] Error resuming task after rejection:`, err);
+      });
+    });
+
+    return { success: true, message: 'Rework feedback submitted. Resuming execution loop.' };
   }
 
   /**
-   * Main task execution loop.
+   * Main task execution loop (State Machine).
    */
   private async runTaskLoop(taskId: string, initialReworkFeedback?: string): Promise<void> {
     this.isProcessing = true;
@@ -226,30 +270,36 @@ export class WorkflowEngine {
         return;
       }
 
-      const confirmedCwd = task.confirmed_cwd || task.target_cwd;
-      const taskPkg = taskFileStore.loadTaskPackage(taskId, revisionRecord.revision);
-      const manifest = revisionRecord.manifest_json ? JSON.parse(revisionRecord.manifest_json) : {};
+      let taskWorkflow = db.getTaskWorkflow(taskId);
+      if (!taskWorkflow) {
+        taskWorkflow = db.initTaskWorkflow(taskId);
+      }
 
-      // Determine defined workers
+      let nodes: WorkflowNode[];
+      try {
+        nodes = JSON.parse(taskWorkflow.nodes_json);
+      } catch (e: any) {
+        db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+          blocked_reason: `工作流节点解析失败: ${e.message}`,
+        });
+        return;
+      }
+
+      const confirmedCwd = task.confirmed_cwd || task.target_cwd;
       const workerPrompts = db.getWorkerPrompts(taskId, revisionRecord.revision);
       const definedWorkerIds = workerPrompts.map((w) => w.worker_id);
-      const defaultWorkerId = definedWorkerIds[0] || 'worker-dev';
+      let nextWorkerId = definedWorkerIds[0] || 'worker-dev';
 
-      // Parse test cases
-      const testCases = TestRunner.parseTestCases(revisionRecord.tests_md, revisionRecord.manifest_json);
-
-      let currentRound = task.current_round || 0;
-      let nextWorkerId = defaultWorkerId;
-      let previousRoundIssues: string = initialReworkFeedback || '';
+      let previousRoundIssues = initialReworkFeedback || '';
       let previousTestFailureSummary: string | null = null;
-
+      let currentRound = task.current_round || 0;
       const maxRounds = task.budget_max_rounds || DEFAULT_BUDGET_MAX_ROUNDS;
 
       db.updateTaskStatus(taskId, TaskStatus.RUNNING);
 
-      // --- LOOP ---
+      // --- STATE MACHINE LOOP ---
       while (true) {
-        // 1. Check stop requested
+        // 1. Check stop request
         const freshTask = db.getTask(taskId);
         if (freshTask?.stop_requested) {
           db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
@@ -257,295 +307,407 @@ export class WorkflowEngine {
           return;
         }
 
-        currentRound++;
+        taskWorkflow = db.getTaskWorkflow(taskId)!;
+        const currentNodeId = taskWorkflow.current_node_id;
+        const currentNode = nodes.find((n) => n.id === currentNodeId);
 
-        // 2. Check budget limits
-        if (currentRound > maxRounds) {
-          const reason = `Maximum execution budget exceeded (${maxRounds} rounds). Execution paused.`;
-          db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
-            blocked_reason: reason,
-            current_round: currentRound - 1,
-          });
-          logger.warn(`[WorkflowEngine] Task ${taskId} blocked: ${reason}`);
+        if (!currentNode) {
+          const reason = `未找到当前工作流节点: ${currentNodeId}`;
+          db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: reason });
+          logger.error(`[WorkflowEngine] ${reason}`);
           return;
         }
 
-        logger.info(`[WorkflowEngine] === Starting Round ${currentRound} for Task ${taskId} (Worker: ${nextWorkerId}) ===`);
-        db.updateTaskStatus(taskId, TaskStatus.RUNNING, {
-          current_round: currentRound,
-          active_worker_id: nextWorkerId,
-          current_stage: RoundStage.WORKER_DEV,
-        });
-
-        // --- STAGE 1: WORKER DEV / FIX ---
-        const workerPromptRec = workerPrompts.find((w) => w.worker_id === nextWorkerId) || workerPrompts[0];
-        const baseWorkerPrompt = workerPromptRec?.prompt_text || 'You are the developer worker.';
-
-        // Compose full round prompt
-        const promptLines = [
-          baseWorkerPrompt,
-          '',
-          '---',
-          '## Current Execution Round Context',
-          `Round Number: ${currentRound}`,
-          `Task Root: ${taskFileStore.getRevisionDir(taskId, revisionRecord.revision)}`,
-          `Working Directory: ${confirmedCwd}`,
-        ];
-
-        if (previousTestFailureSummary) {
-          promptLines.push('', '### Previous Test Failures to Fix', previousTestFailureSummary);
-        }
-        if (previousRoundIssues) {
-          promptLines.push('', '### Previous Acceptance Issues / Feedback', previousRoundIssues);
+        // Start node: direct advance
+        if (currentNode.type === 'start') {
+          const targetId = currentNode.on_success;
+          if (!targetId || !nodes.some((n) => n.id === targetId)) {
+            const reason = `开始节点的后继节点无效: ${targetId}`;
+            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: reason });
+            return;
+          }
+          db.updateTaskWorkflow(taskId, { current_node_id: targetId });
+          continue;
         }
 
-        const fullWorkerPrompt = promptLines.join('\n');
-        const workerAdapter = adapterRegistry.getAdapter(task.worker_executor || 'workbuddy');
-        const workerModel = task.worker_model || workerAdapter.defaultModel;
-
-        const roundDbId = db.createExecutionRound({
-          task_id: taskId,
-          round_number: currentRound,
-          stage: RoundStage.WORKER_DEV,
-          worker_id: nextWorkerId,
-          adapter_id: workerAdapter.id,
-          model_name: workerModel,
-          input_prompt: fullWorkerPrompt,
-        });
-
-        const workerResult = await workerAdapter.execute({
-          taskId,
-          roundId:roundDbId,
-          model: workerModel,
-          prompt: fullWorkerPrompt,
-          cwd: confirmedCwd,
-          signal: this.taskController.signal,
-          timeoutMs: task.execution_timeout_ms || resolveExecutionTimeout(),
-        });
-
-        if (!workerResult.ok) {
-          db.completeExecutionRound(roundDbId, {
-            status: 'failed',
-            output_text: workerResult.output,
-            error_message: workerResult.error,
-            duration_ms: workerResult.durationMs,
-          });
-
-          if (db.getTask(taskId)?.stop_requested) {
-            db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
+        // End node: completion
+        if (currentNode.type === 'end') {
+          // Check final gate prerequisite: tests and acceptance must match current code generation
+          if (
+            taskWorkflow.code_generation > 0 &&
+            (taskWorkflow.tests_passed_generation !== taskWorkflow.code_generation ||
+              taskWorkflow.acceptance_passed_generation !== taskWorkflow.code_generation)
+          ) {
+            const reason = `流程到达结束节点，但测试或验收代次未对齐当前代码代次 (代码: ${taskWorkflow.code_generation}, 测试: ${taskWorkflow.tests_passed_generation}, 验收: ${taskWorkflow.acceptance_passed_generation})。`;
+            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: reason });
             return;
           }
 
-          const errorMsg = workerResult.error || 'Worker execution failed';
-          db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
-            blocked_reason: `Worker execution encountered error: ${errorMsg}`,
+          db.updateTaskStatus(taskId, TaskStatus.COMPLETED, {
+            completed_at: Date.now(),
           });
-          logger.warn(`[WorkflowEngine] Task ${taskId} paused due to worker failure: ${errorMsg}`);
+          logger.info(`[WorkflowEngine] Task ${taskId} completed successfully at end node.`);
           return;
         }
 
-        db.completeExecutionRound(roundDbId, {
-          status: 'passed',
-          output_text: workerResult.output,
-          duration_ms: workerResult.durationMs,
-        });
+        // Task node
+        if (currentNode.type === 'task') {
+          const runCount = db.getNodeRunCount(taskId, currentNode.id);
+          const maxExecutions = currentNode.max_executions || DEFAULT_MAX_EXECUTIONS;
 
-        // Save worker output artifact
-        taskFileStore.saveArtifact(
-          taskId,
-          revisionRecord.revision,
-          `round_${currentRound}_worker_output.txt`,
-          workerResult.output
-        );
-
-        // Check stop requested after worker run
-        if (db.getTask(taskId)?.stop_requested) {
-          db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
-          return;
-        }
-
-        // --- STAGE 2: WORKBENCH INDEPENDENT TESTS ---
-        logger.info(`[WorkflowEngine] Round ${currentRound}: Running independent automated tests...`);
-        db.updateTaskStatus(taskId, TaskStatus.RUNNING, {
-          current_stage: RoundStage.RUNNING_TESTS,
-        });
-
-        const testRoundDbId = db.createExecutionRound({
-          task_id: taskId,
-          round_number: currentRound,
-          stage: RoundStage.RUNNING_TESTS,
-          input_prompt: `Executing ${testCases.length} automated test commands.`,
-        });
-
-        const testAggResult = await TestRunner.runAllTests(testCases, confirmedCwd, task.execution_timeout_ms || resolveExecutionTimeout(), { taskId, roundId:testRoundDbId, signal: this.taskController.signal });
-
-        // Record individual tests in DB
-        for (const tr of testAggResult.testRuns) {
-          db.saveTestRun({
-            task_id: taskId,
-            round_number: currentRound,
-            test_case_id: tr.testCaseId,
-            command: tr.command,
-            exit_code: tr.exitCode,
-            stdout: tr.stdout,
-            stderr: tr.stderr,
-            report_path: tr.reportPath,
-            report_content: tr.reportContent,
-            passed: tr.passed,
-          });
-        }
-
-        if (testAggResult.interrupted || db.getTask(taskId)?.stop_requested) {
-          db.completeExecutionRound(testRoundDbId, { status: 'blocked', output_text: testAggResult.failureSummary });
-          db.updateTaskStatus(taskId, db.getTask(taskId)?.stop_requested ? TaskStatus.CANCELLED : TaskStatus.BLOCKED, { blocked_reason: testAggResult.failureSummary });
-          return;
-        }
-        if (!testAggResult.allPassed) {
-          db.completeExecutionRound(testRoundDbId, {
-            status: 'failed',
-            output_text: testAggResult.failureSummary,
-            error_message: 'Required automated tests failed.',
-          });
-
-          logger.warn(`[WorkflowEngine] Round ${currentRound}: Tests failed. Dispatching repair worker for next round.`);
-          previousTestFailureSummary = testAggResult.failureSummary;
-          previousRoundIssues = '';
-          // Loop back to worker
-          continue;
-        }
-
-        db.completeExecutionRound(testRoundDbId, {
-          status: 'passed',
-          output_text: 'All required test commands executed with exit code 0.',
-        });
-        previousTestFailureSummary = null;
-
-        // Check stop requested after tests
-        if (db.getTask(taskId)?.stop_requested) {
-          db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
-          return;
-        }
-
-        // --- STAGE 3: REVIEWER ACCEPTANCE (VIA ADAPTER, NO SANDBOX) ---
-        const reviewerAdapter = adapterRegistry.getAdapter(task.reviewer_executor || 'workbuddy');
-        const reviewerModel = task.reviewer_model || reviewerAdapter.defaultModel;
-
-        logger.info(
-          `[WorkflowEngine] Round ${currentRound}: Running acceptance review via ${reviewerAdapter.name} (model: ${reviewerModel})...`
-        );
-        db.updateTaskStatus(taskId, TaskStatus.RUNNING, {
-          current_stage: RoundStage.CODEX_ACCEPTANCE,
-        });
-
-        const codexRoundDbId = db.createExecutionRound({
-          task_id: taskId,
-          round_number: currentRound,
-          stage: RoundStage.CODEX_ACCEPTANCE,
-          worker_id: null,
-          adapter_id: reviewerAdapter.id,
-          model_name: reviewerModel,
-          input_prompt: `${reviewerAdapter.name} automated acceptance verification (model: ${reviewerModel}).`,
-        });
-
-        // Get diff snapshot
-        const diffSnapshot = GitService.getDiffSnapshot(confirmedCwd);
-        const testSummaryText = testAggResult.testRuns
-          .map((t) => `Test ${t.testCaseId} [${t.command}]: Exit code ${t.exitCode}`)
-          .join('\n');
-
-        const verification = await new AcceptanceService().execute(reviewerAdapter, {
-          taskId,
-          timeoutMs: task.execution_timeout_ms || resolveExecutionTimeout(),
-          roundId:codexRoundDbId,
-          signal:this.taskController.signal,
-          roundNumber: currentRound,
-          model: reviewerModel,
-          revision: revisionRecord.revision,
-          confirmedCwd,
-          taskPackageDir: taskFileStore.getRevisionDir(taskId, revisionRecord.revision),
-          testRunsSummary: testSummaryText,
-          gitDiff: diffSnapshot.diff,
-          verifierPrompt: revisionRecord.verifier_prompt_md || 'Perform strict acceptance verification.',
-          definedWorkerIds,
-        });
-
-        if (db.getTask(taskId)?.stop_requested) {
-          db.completeExecutionRound(codexRoundDbId, {
-            status: 'blocked',
-            output_text: verification.rawOutput || verification.summary,
-            error_message: 'Execution cancelled by user.',
-            duration_ms: verification.durationMs,
-          });
-          db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
-          return;
-        }
-
-        // Record acceptance run
-        db.saveAcceptanceRun({
-          task_id: taskId,
-          round_number: currentRound,
-          decision: verification.decision,
-          summary: verification.summary,
-          criteria_results_json: JSON.stringify(verification.criteriaResults),
-          issues_json: JSON.stringify(verification.issues),
-          manual_checks_json: JSON.stringify(verification.manualChecksPending),
-          code_snapshot_json: JSON.stringify(diffSnapshot),
-          raw_output: verification.rawOutput || JSON.stringify(verification),
-        });
-
-        if (verification.decision === 'blocked') {
-          db.completeExecutionRound(codexRoundDbId, {
-            status: 'blocked',
-            output_text: verification.summary,
-            issues_json: JSON.stringify(verification.issues),
-            duration_ms: verification.durationMs,
-          });
-          db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
-            blocked_reason: `Reviewer acceptance blocked: ${verification.summary}`,
-          });
-          logger.warn(`[WorkflowEngine] Task ${taskId} blocked by Reviewer: ${verification.summary}`);
-          return;
-        }
-
-        if (verification.decision === 'needs_changes') {
-          db.completeExecutionRound(codexRoundDbId, {
-            status: 'failed',
-            output_text: verification.summary,
-            issues_json: JSON.stringify(verification.issues),
-            duration_ms: verification.durationMs,
-          });
-
-          // Find target worker assigned by Reviewer or default
-          const firstIssue = verification.issues[0];
-          if (firstIssue?.targetWorkerId && definedWorkerIds.includes(firstIssue.targetWorkerId)) {
-            nextWorkerId = firstIssue.targetWorkerId;
-          } else {
-            nextWorkerId = defaultWorkerId;
+          // Increment current round when returning to developer
+          if (currentNode.id === 'development' || !currentNode.on_failure) {
+            currentRound++;
+          } else if (currentRound === 0) {
+            currentRound = 1;
           }
 
-          previousRoundIssues = verification.issues
-            .map((i) => `Issue ${i.id}: ${i.description}\nEvidence: ${i.evidence || 'N/A'}`)
-            .join('\n\n');
+          // Check budget max rounds limit
+          if (task.budget_max_rounds && currentRound > maxRounds) {
+            const reason = `Maximum execution budget exceeded (${maxRounds} rounds). Execution paused.`;
+            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+              blocked_reason: reason,
+              current_round: currentRound - 1,
+            });
+            logger.warn(`[WorkflowEngine] Task ${taskId} blocked: ${reason}`);
+            return;
+          }
 
-          logger.info(`[WorkflowEngine] Reviewer rejected (needs_changes). Assigned to ${nextWorkerId}. Cycling to next round.`);
-          continue;
+          // 用户明确要求：每个节点不做次数限制（节点可随状态机路由多次循环，仅受全局任务轮数预算限制）
+          // 节点执行序号（runCount + 1）正常递增并持久化，供执行追踪与审计
+          const currentExecIndex = runCount + 1;
+          const runId = `run-${crypto.randomUUID()}`;
+          const completionToken = crypto.randomBytes(16).toString('hex');
+
+          // Branch 1: Manual confirmation node
+          if (currentNode.execution_mode === 'manual') {
+            db.createNodeRun({
+              run_id: runId,
+              task_id: taskId,
+              node_id: currentNode.id,
+              execution_index: currentExecIndex,
+              status: 'waiting_manual',
+              completion_token: completionToken,
+            });
+
+            db.updateTaskStatus(taskId, TaskStatus.HUMAN_REVIEW, {
+              current_stage: RoundStage.HUMAN_REVIEW,
+              active_worker_id: null,
+              current_round: currentRound,
+            });
+
+            logger.info(`[WorkflowEngine] Task ${taskId} reached manual node [${currentNode.name}]. Waiting for human review.`);
+            return; // Loop pauses until manual decision submitted
+          }
+
+          let outcome: 'passed' | 'failed' = 'passed';
+          let summary = '';
+
+          // Branch 2: Command execution node (e.g. independent testing)
+          if (currentNode.execution_mode === 'command') {
+            db.createNodeRun({
+              run_id: runId,
+              task_id: taskId,
+              node_id: currentNode.id,
+              execution_index: currentExecIndex,
+              status: 'running',
+              completion_token: completionToken,
+            });
+
+            db.updateTaskStatus(taskId, TaskStatus.RUNNING, {
+              current_stage: RoundStage.RUNNING_TESTS,
+              current_round: currentRound,
+            });
+
+            const testRoundDbId = db.createExecutionRound({
+              task_id: taskId,
+              round_number: currentRound,
+              stage: RoundStage.RUNNING_TESTS,
+              input_prompt: currentNode.command ? `Executing command: ${currentNode.command}` : 'Running automated test commands.',
+            });
+
+            const testCases = (currentNode.command && currentNode.command.trim())
+              ? [{ id: 'TEST-CMD', command: currentNode.command.trim(), required: true }]
+              : TestRunner.parseTestCases(revisionRecord.tests_md, revisionRecord.manifest_json);
+
+            const testAggResult = await TestRunner.runAllTests(
+              testCases,
+              confirmedCwd,
+              task.execution_timeout_ms || resolveExecutionTimeout(),
+              { taskId, roundId: testRoundDbId, signal: this.taskController.signal }
+            );
+
+            for (const tr of testAggResult.testRuns) {
+              db.saveTestRun({
+                task_id: taskId,
+                round_number: currentRound,
+                test_case_id: tr.testCaseId,
+                command: tr.command,
+                exit_code: tr.exitCode,
+                stdout: tr.stdout,
+                stderr: tr.stderr,
+                report_path: tr.reportPath,
+                report_content: tr.reportContent,
+                passed: tr.passed,
+              });
+            }
+
+            if (testAggResult.interrupted || db.getTask(taskId)?.stop_requested) {
+              db.completeExecutionRound(testRoundDbId, { status: 'blocked', output_text: testAggResult.failureSummary });
+              db.updateNodeRun(runId, { status: 'blocked', result_summary: testAggResult.failureSummary, finished_at: Date.now() });
+              db.updateTaskStatus(taskId, db.getTask(taskId)?.stop_requested ? TaskStatus.CANCELLED : TaskStatus.BLOCKED, {
+                blocked_reason: testAggResult.failureSummary,
+              });
+              return;
+            }
+
+            if (!testAggResult.allPassed) {
+              outcome = 'failed';
+              summary = testAggResult.failureSummary || 'Automated tests failed.';
+              previousTestFailureSummary = summary;
+              db.completeExecutionRound(testRoundDbId, {
+                status: 'failed',
+                output_text: summary,
+                error_message: 'Required automated tests failed.',
+              });
+            } else {
+              outcome = 'passed';
+              summary = 'All required test commands executed with exit code 0.';
+              previousTestFailureSummary = null;
+              db.completeExecutionRound(testRoundDbId, { status: 'passed', output_text: summary });
+              db.updateTaskWorkflow(taskId, { tests_passed_generation: taskWorkflow.code_generation });
+              taskWorkflow.tests_passed_generation = taskWorkflow.code_generation;
+            }
+          }
+          // Branch 3: Agent execution node
+          else if (currentNode.execution_mode === 'agent') {
+            const isAcceptance = currentNode.result_rule === 'acceptance';
+
+            // If developer node: increment code generation
+            if (!isAcceptance) {
+              taskWorkflow.code_generation += 1;
+              db.updateTaskWorkflow(taskId, { code_generation: taskWorkflow.code_generation });
+            }
+
+            // Prerequisite check for acceptance: tests must be passed on the current code generation
+            if (isAcceptance && taskWorkflow.code_generation > 0 && taskWorkflow.tests_passed_generation !== taskWorkflow.code_generation) {
+              logger.warn(`[WorkflowEngine] Acceptance requires valid tests for code generation ${taskWorkflow.code_generation}, but tests passed generation is ${taskWorkflow.tests_passed_generation}. Routing to tests.`);
+              // Route to test node if exists
+              const testNode = nodes.find((n) => n.id === 'test' || n.execution_mode === 'command');
+              if (testNode) {
+                db.updateTaskWorkflow(taskId, { current_node_id: testNode.id });
+                continue;
+              }
+            }
+
+            db.createNodeRun({
+              run_id: runId,
+              task_id: taskId,
+              node_id: currentNode.id,
+              execution_index: currentExecIndex,
+              status: 'running',
+              completion_token: completionToken,
+            });
+
+            const executorName = (isAcceptance ? (task.reviewer_executor || currentNode.executor) : (task.worker_executor || currentNode.executor)) || 'workbuddy';
+            const adapter = adapterRegistry.getAdapter(executorName);
+            const modelName = (isAcceptance ? (task.reviewer_model || currentNode.model) : (task.worker_model || currentNode.model)) || adapter.defaultModel;
+
+            const roundStage = isAcceptance ? RoundStage.CODEX_ACCEPTANCE : RoundStage.WORKER_DEV;
+
+            let basePrompt = currentNode.prompt || '';
+            if (!basePrompt) {
+              if (isAcceptance) {
+                basePrompt = revisionRecord.verifier_prompt_md || 'Perform strict acceptance verification.';
+              } else {
+                const promptRec = workerPrompts.find((w) => w.worker_id === nextWorkerId) || workerPrompts[0];
+                basePrompt = promptRec?.prompt_text || 'Develop the requested changes.';
+              }
+            }
+
+            const promptLines = [
+              basePrompt,
+              '',
+              '---',
+              '## Current Execution Round Context',
+              `Round Number: ${currentRound}`,
+              `Task Root: ${taskFileStore.getRevisionDir(taskId, revisionRecord.revision)}`,
+              `Working Directory: ${confirmedCwd}`,
+            ];
+            if (previousTestFailureSummary) {
+              promptLines.push('', '### Previous Test Failures to Fix', previousTestFailureSummary);
+            }
+            if (previousRoundIssues) {
+              promptLines.push('', '### Previous Acceptance Issues / Feedback', previousRoundIssues);
+            }
+
+            const fullPrompt = promptLines.join('\n');
+
+            const roundDbId = db.createExecutionRound({
+              task_id: taskId,
+              round_number: currentRound,
+              stage: roundStage,
+              worker_id: isAcceptance ? null : nextWorkerId,
+              adapter_id: adapter.id,
+              model_name: modelName,
+              input_prompt: fullPrompt,
+            });
+
+            db.updateTaskStatus(taskId, TaskStatus.RUNNING, {
+              current_stage: roundStage,
+              active_worker_id: isAcceptance ? null : nextWorkerId,
+              current_round: currentRound,
+            });
+
+            if (isAcceptance) {
+              const diffSnapshot = GitService.getDiffSnapshot(confirmedCwd);
+              const testRuns = db.getTestRuns(taskId, currentRound);
+              const testSummaryText = testRuns.map((t) => `Test ${t.test_case_id} [${t.command}]: Exit code ${t.exit_code}`).join('\n');
+
+              const verification = await new AcceptanceService().execute(adapter, {
+                taskId,
+                timeoutMs: task.execution_timeout_ms || resolveExecutionTimeout(),
+                roundId: roundDbId,
+                signal: this.taskController.signal,
+                roundNumber: currentRound,
+                model: modelName,
+                revision: revisionRecord.revision,
+                confirmedCwd,
+                taskPackageDir: taskFileStore.getRevisionDir(taskId, revisionRecord.revision),
+                testRunsSummary: testSummaryText,
+                gitDiff: diffSnapshot.diff,
+                verifierPrompt: basePrompt,
+                definedWorkerIds,
+              });
+
+              if (db.getTask(taskId)?.stop_requested) {
+                db.completeExecutionRound(roundDbId, { status: 'blocked', output_text: verification.rawOutput });
+                db.updateNodeRun(runId, { status: 'cancelled', finished_at: Date.now() });
+                db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
+                return;
+              }
+
+              db.saveAcceptanceRun({
+                task_id: taskId,
+                round_number: currentRound,
+                decision: verification.decision,
+                summary: verification.summary,
+                criteria_results_json: JSON.stringify(verification.criteriaResults),
+                issues_json: JSON.stringify(verification.issues),
+                manual_checks_json: JSON.stringify(verification.manualChecksPending),
+                code_snapshot_json: JSON.stringify(diffSnapshot),
+                raw_output: verification.rawOutput || JSON.stringify(verification),
+              });
+
+              if (verification.decision === 'blocked') {
+                db.completeExecutionRound(roundDbId, { status: 'blocked', output_text: verification.summary });
+                db.updateNodeRun(runId, { status: 'blocked', result_summary: verification.summary, finished_at: Date.now() });
+                db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+                  blocked_reason: `Reviewer acceptance blocked: ${verification.summary}`,
+                });
+                return;
+              }
+
+              if (verification.decision === 'needs_changes') {
+                outcome = 'failed';
+                summary = verification.summary;
+                const firstIssue = verification.issues[0];
+                if (firstIssue?.targetWorkerId && definedWorkerIds.includes(firstIssue.targetWorkerId)) {
+                  nextWorkerId = firstIssue.targetWorkerId;
+                } else {
+                  nextWorkerId = definedWorkerIds[0] || 'worker-dev';
+                }
+
+                previousRoundIssues = verification.issues.map((i) => `Issue ${i.id}: ${i.description}\nEvidence: ${i.evidence || 'N/A'}`).join('\n\n') || summary;
+                db.completeExecutionRound(roundDbId, { status: 'failed', output_text: summary, issues_json: JSON.stringify(verification.issues), duration_ms: verification.durationMs });
+              } else {
+                outcome = 'passed';
+                summary = verification.summary;
+                previousRoundIssues = '';
+                db.completeExecutionRound(roundDbId, { status: 'passed', output_text: summary, duration_ms: verification.durationMs });
+                db.updateTaskWorkflow(taskId, { acceptance_passed_generation: taskWorkflow.code_generation });
+                taskWorkflow.acceptance_passed_generation = taskWorkflow.code_generation;
+              }
+            } else {
+              // Regular worker execution
+              const workerResult = await adapter.execute({
+                taskId,
+                roundId: roundDbId,
+                model: modelName,
+                prompt: fullPrompt,
+                cwd: confirmedCwd,
+                signal: this.taskController.signal,
+                timeoutMs: task.execution_timeout_ms || resolveExecutionTimeout(),
+                kind: 'worker',
+              });
+
+              if (!workerResult.ok) {
+                db.completeExecutionRound(roundDbId, {
+                  status: 'failed',
+                  output_text: workerResult.output,
+                  error_message: workerResult.error,
+                  duration_ms: workerResult.durationMs,
+                });
+                db.updateNodeRun(runId, {
+                  status: 'blocked',
+                  result_summary: workerResult.error || 'Worker execution failed',
+                  finished_at: Date.now(),
+                });
+
+                if (db.getTask(taskId)?.stop_requested) {
+                  db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
+                  return;
+                }
+
+                const errorMsg = workerResult.error || 'Worker execution failed';
+                db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+                  blocked_reason: `Worker execution encountered error: ${errorMsg}`,
+                });
+                return;
+              }
+
+              db.completeExecutionRound(roundDbId, {
+                status: 'passed',
+                output_text: workerResult.output,
+                duration_ms: workerResult.durationMs,
+              });
+
+              taskFileStore.saveArtifact(
+                taskId,
+                revisionRecord.revision,
+                `round_${currentRound}_worker_output.txt`,
+                workerResult.output
+              );
+
+              const updatedRun = db.getNodeRunByRunId(runId);
+              summary = updatedRun?.result_summary || 'Worker execution completed successfully.';
+              outcome = 'passed';
+            }
+          }
+
+          // Advance logic
+          const nextTargetId = outcome === 'passed' ? currentNode.on_success : currentNode.on_failure;
+
+          db.updateNodeRun(runId, {
+            status: outcome,
+            result_summary: summary,
+            finished_at: Date.now(),
+          });
+
+          if (!nextTargetId) {
+            const pauseReason = `节点 [${currentNode.name}] ${outcome === 'failed' ? '失败' : '完成'}后未配置去向，已暂停。`;
+            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: pauseReason });
+            logger.warn(`[WorkflowEngine] Task ${taskId} paused: ${pauseReason}`);
+            return;
+          }
+
+          db.updateTaskWorkflow(taskId, {
+            current_node_id: nextTargetId,
+            current_run_id: runId,
+          });
+
+          logger.info(`[WorkflowEngine] Node [${currentNode.name}] ${outcome}. Transitioning to node [${nextTargetId}].`);
         }
-
-        // --- STAGE 4: REVIEWER PASSED -> TRANSITION TO FINAL HUMAN REVIEW (GATE 3) ---
-        db.completeExecutionRound(codexRoundDbId, {
-          status: 'passed',
-          output_text: verification.summary,
-          duration_ms: verification.durationMs,
-        });
-
-        logger.info(`[WorkflowEngine] Codex acceptance passed! Transitioning task ${taskId} to HUMAN_REVIEW (Gate 3).`);
-        db.updateTaskStatus(taskId, TaskStatus.HUMAN_REVIEW, {
-          current_stage: RoundStage.HUMAN_REVIEW,
-          active_worker_id: null,
-        });
-
-        // Exit loop and wait for user's approval or rejection in Web UI
-        return;
       }
     } finally {
       this.isProcessing = false;

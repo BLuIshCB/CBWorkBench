@@ -20,6 +20,12 @@ import {
 } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
 import { resolveSupportedNode } from '../utils/nodeResolver.js';
+import {
+  validateWorkflowNodes,
+  DEFAULT_WORKFLOW_ID,
+  DEFAULT_WORKFLOW_NODES,
+  type WorkflowNode,
+} from '../services/workflowDefinition.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -217,6 +223,21 @@ export function createHttpServer(): http.Server {
           }
         } catch {}
 
+        let taskWorkflow = db.getTaskWorkflow(taskId);
+        if (!taskWorkflow) {
+          taskWorkflow = db.initTaskWorkflow(taskId);
+        }
+        const workflowNodeRuns = db.getNodeRuns(taskId);
+        const nodeExecutionCounts: Record<string, number> = {};
+        if (taskWorkflow) {
+          try {
+            const nodes = JSON.parse(taskWorkflow.nodes_json) as WorkflowNode[];
+            for (const n of nodes) {
+              nodeExecutionCounts[n.id] = db.getNodeRunCount(taskId, n.id);
+            }
+          } catch {}
+        }
+
         sendJson(res, 200, {
           success: true,
           task,
@@ -227,6 +248,9 @@ export function createHttpServer(): http.Server {
           acceptanceRuns,
           humanDecisions,
           diffSnapshot,
+          taskWorkflow,
+          workflowNodeRuns,
+          nodeExecutionCounts,
         });
         return;
       }
@@ -333,8 +357,166 @@ export function createHttpServer(): http.Server {
         return;
       }
 
+      // Workflow Definitions APIs
+      if (pathname === '/api/workflows' && method === 'GET') {
+        const raw = db.listWorkflows();
+        const workflows = raw.map((wf) => {
+          let nodes: WorkflowNode[] = [];
+          try {
+            nodes = JSON.parse(wf.nodes_json);
+          } catch {}
+          return {
+            id: wf.id,
+            version: wf.version,
+            name: wf.name,
+            description: wf.description,
+            nodeCount: nodes.length,
+            isDefault: Boolean(wf.is_default),
+            nodes,
+            createdAt: wf.created_at,
+            updatedAt: wf.updated_at,
+          };
+        });
+        sendJson(res, 200, { success: true, workflows });
+        return;
+      }
+
+      if (pathname === '/api/workflows/reset-default' && method === 'POST') {
+        const saved = db.saveWorkflowDefinition({
+          id: DEFAULT_WORKFLOW_ID,
+          name: '默认开发交付流程',
+          description: '标准交付：开始 -> 开发实现 -> 独立测试 -> 整体验收 -> 人工确认 -> 结束',
+          nodes_json: JSON.stringify(DEFAULT_WORKFLOW_NODES),
+          is_default: 1,
+        });
+        sendJson(res, 200, { success: true, message: '已恢复默认开发交付工作流', workflow: saved });
+        return;
+      }
+
+      const workflowDetailMatch = pathname.match(/^\/api\/workflows\/([a-zA-Z0-9_\-]+)$/);
+      if (workflowDetailMatch && method === 'GET') {
+        const wfId = workflowDetailMatch[1];
+        const versionParam = url.searchParams.get('version');
+        const version = versionParam ? parseInt(versionParam, 10) : undefined;
+        const wf = db.getWorkflow(wfId, Number.isNaN(version) ? undefined : version);
+        if (!wf) {
+          sendJson(res, 404, { success: false, message: `Workflow not found: ${wfId}` });
+          return;
+        }
+        let nodes = [];
+        try {
+          nodes = JSON.parse(wf.nodes_json);
+        } catch {}
+        sendJson(res, 200, {
+          success: true,
+          workflow: {
+            id: wf.id,
+            version: wf.version,
+            name: wf.name,
+            description: wf.description,
+            isDefault: Boolean(wf.is_default),
+            nodes,
+            createdAt: wf.created_at,
+            updatedAt: wf.updated_at,
+          },
+        });
+        return;
+      }
+
+      if (pathname === '/api/workflows' && method === 'POST') {
+        const body = await parseJsonBody(req);
+        if (!body.id || typeof body.id !== 'string') {
+          sendJson(res, 400, { success: false, message: '工作流 ID (id) 为必填项' });
+          return;
+        }
+        if (!body.name || typeof body.name !== 'string') {
+          sendJson(res, 400, { success: false, message: '工作流名称 (name) 为必填项' });
+          return;
+        }
+        if (!Array.isArray(body.nodes)) {
+          sendJson(res, 400, { success: false, message: '节点列表 (nodes) 必须为数组' });
+          return;
+        }
+
+        const validation = validateWorkflowNodes(body.nodes, body.id);
+        if (!validation.valid) {
+          sendJson(res, 400, {
+            success: false,
+            code: 'INVALID_WORKFLOW',
+            message: `工作流校验未通过: ${validation.errors.join('；')}`,
+            errors: validation.errors,
+          });
+          return;
+        }
+
+        const saved = db.saveWorkflowDefinition({
+          id: body.id.trim(),
+          name: body.name.trim(),
+          description: body.description || null,
+          nodes_json: JSON.stringify(body.nodes),
+          is_default: body.is_default ? 1 : 0,
+        });
+
+        sendJson(res, 200, {
+          success: true,
+          message: `工作流 ${saved.id} (v${saved.version}) 保存成功`,
+          workflow: saved,
+        });
+        return;
+      }
+
+      // Task Workflow Progress API
+      const taskWfMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/workflow$/);
+      if (taskWfMatch && method === 'GET') {
+        const taskId = taskWfMatch[1];
+        const task = db.getTask(taskId);
+        if (!task) {
+          sendJson(res, 404, { success: false, message: 'Task not found' });
+          return;
+        }
+        let taskWorkflow = db.getTaskWorkflow(taskId);
+        if (!taskWorkflow) {
+          taskWorkflow = db.initTaskWorkflow(taskId);
+        }
+        let nodes: WorkflowNode[] = [];
+        try {
+          nodes = JSON.parse(taskWorkflow.nodes_json);
+        } catch {}
+        const nodeRuns = db.getNodeRuns(taskId);
+        const nodeExecutionCounts: Record<string, number> = {};
+        for (const n of nodes) {
+          nodeExecutionCounts[n.id] = db.getNodeRunCount(taskId, n.id);
+        }
+        const currentNode = nodes.find((n) => n.id === taskWorkflow.current_node_id);
+
+        sendJson(res, 200, {
+          success: true,
+          taskId,
+          taskWorkflow,
+          nodes,
+          currentNode,
+          nodeRuns,
+          nodeExecutionCounts,
+        });
+        return;
+      }
+
+      // Task Manual Decision API
+      const manualDecisionMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/workflow\/manual-decision$/);
+      if (manualDecisionMatch && method === 'POST') {
+        const taskId = manualDecisionMatch[1];
+        const body = await parseJsonBody(req);
+        if (!body.action || !['approve', 'reject'].includes(body.action)) {
+          sendJson(res, 400, { success: false, message: 'action must be "approve" or "reject"' });
+          return;
+        }
+        const result = await workflowEngine.submitHumanDecision(taskId, body.action, body.reason || '');
+        sendJson(res, result.success ? 200 : 400, result);
+        return;
+      }
+
       // Static UI Files
-      if (pathname === '/' || pathname === '/runtime' || pathname.startsWith('/tasks/')) {
+      if (pathname === '/' || pathname === '/runtime' || pathname === '/workflows' || pathname.startsWith('/tasks/')) {
         sendFile(res, path.join(UI_DIR, 'index.html'), 'text/html');
         return;
       }
