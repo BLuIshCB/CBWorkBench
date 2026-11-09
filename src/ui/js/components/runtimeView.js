@@ -64,7 +64,7 @@ export const RuntimeView = {
           </div>
 
           <div class="cli-card-body">
-            <p style="color: #8b949e; font-size: 12px; margin-bottom: 8px;">${escapeHtml(cli.description || '')}</p>
+            <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 8px;">${escapeHtml(cli.description || '')}</p>
             ${connHtml}
             ${modelsHtml}
             <p>真实对话验证：${escapeHtml(cli.verification?.state || "unknown")} ${escapeHtml(cli.verification?.model || "")} ${escapeHtml(cli.verification?.message || "请点击验证真实对话")}</p>

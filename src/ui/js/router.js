@@ -12,6 +12,8 @@ export class Router {
     const path = window.location.pathname;
     if (path === '/runtime') {
       this.handlers.onRuntime(false);
+    } else if (path === '/workflows') {
+      this.handlers.onWorkflows(false);
     } else {
       const taskMatch = path.match(/^\/tasks\/([a-zA-Z0-9_\-]+)/);
       if (taskMatch) {
@@ -31,8 +33,11 @@ export class Router {
 
   updateNavTabs(activeTab) {
     const tabTasks = document.getElementById('nav-tab-tasks');
+    const tabWorkflows = document.getElementById('nav-tab-workflows');
     const tabRuntime = document.getElementById('nav-tab-runtime');
+
     if (tabTasks) tabTasks.classList.toggle('active', activeTab === 'tasks');
+    if (tabWorkflows) tabWorkflows.classList.toggle('active', activeTab === 'workflows');
     if (tabRuntime) tabRuntime.classList.toggle('active', activeTab === 'runtime');
   }
 }

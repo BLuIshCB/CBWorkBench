@@ -9,14 +9,17 @@ import { Router } from './router.js';
 import { TaskList } from './components/taskList.js';
 import { TaskDetail } from './components/taskDetail.js';
 import { RuntimeView } from './components/runtimeView.js';
+import { WorkflowView } from './components/workflowView.js';
 import { populateModelPicker, updateModelPicker, getModelValue } from './components/modelPicker.js';
 import { escapeHtml, copyToClipboard, toggleDrawer } from './utils.js';
 
 export class App {
   constructor() {
+    this.workflowView = new WorkflowView(this);
     this.router = new Router({
       onTaskList: (push) => this.showTaskList(push),
       onTaskDetail: (id, push) => this.showTaskDetails(id, push),
+      onWorkflows: (push) => this.showWorkflowView(push),
       onRuntime: (push) => this.showRuntimeView(push),
     });
 
@@ -25,11 +28,10 @@ export class App {
   }
 
   async init() {
-    // 监听路由初始状态
-
-    // 加载全局状态
+    // 加载全局状态与工作流
     await this.fetchSystemStatus();
     await this.fetchExecutors();
+    await this.workflowView.init();
 
     this.router.handleRoute();
 
@@ -53,6 +55,8 @@ export class App {
     if (viewRuntime) viewRuntime.style.display = 'none';
     const viewDetail = document.getElementById('view-task-details');
     if (viewDetail) viewDetail.style.display = 'none';
+    const viewWorkflows = document.getElementById('view-workflows');
+    if (viewWorkflows) viewWorkflows.style.display = 'none';
     const viewList = document.getElementById('view-task-list');
     if (viewList) viewList.style.display = 'block';
 
@@ -68,10 +72,30 @@ export class App {
     if (viewList) viewList.style.display = 'none';
     const viewRuntime = document.getElementById('view-runtime');
     if (viewRuntime) viewRuntime.style.display = 'none';
+    const viewWorkflows = document.getElementById('view-workflows');
+    if (viewWorkflows) viewWorkflows.style.display = 'none';
     const viewDetail = document.getElementById('view-task-details');
     if (viewDetail) viewDetail.style.display = 'block';
 
     await this.fetchTaskDetail(taskId, false);
+  }
+
+  async showWorkflowView(pushHistory = true) {
+    closeExecution();
+    store.setState({ currentTaskId: null });
+    if (pushHistory) window.history.pushState({}, '', '/workflows');
+    this.router.updateNavTabs('workflows');
+
+    const viewList = document.getElementById('view-task-list');
+    if (viewList) viewList.style.display = 'none';
+    const viewDetail = document.getElementById('view-task-details');
+    if (viewDetail) viewDetail.style.display = 'none';
+    const viewRuntime = document.getElementById('view-runtime');
+    if (viewRuntime) viewRuntime.style.display = 'none';
+    const viewWorkflows = document.getElementById('view-workflows');
+    if (viewWorkflows) viewWorkflows.style.display = 'block';
+
+    this.workflowView.render();
   }
 
   async showRuntimeView(pushHistory = true) {
@@ -83,6 +107,8 @@ export class App {
     if (viewList) viewList.style.display = 'none';
     const viewDetail = document.getElementById('view-task-details');
     if (viewDetail) viewDetail.style.display = 'none';
+    const viewWorkflows = document.getElementById('view-workflows');
+    if (viewWorkflows) viewWorkflows.style.display = 'none';
     const viewRuntime = document.getElementById('view-runtime');
     if (viewRuntime) viewRuntime.style.display = 'block';
 

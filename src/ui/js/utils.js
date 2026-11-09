@@ -2,6 +2,13 @@
  * CBWorkBench UI 基础工具库
  */
 
+export function formatTime(ts) {
+  if (!ts) return '--';
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 export function escapeHtml(str) {
   if (!str) return '';
   return String(str)

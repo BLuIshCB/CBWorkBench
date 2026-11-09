@@ -48,4 +48,20 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(body),
   }),
+
+  // Workflow APIs
+  getWorkflows: () => request('/api/workflows'),
+  getWorkflow: (id, version) => request(`/api/workflows/${encodeURIComponent(id)}${version ? `?version=${version}` : ''}`),
+  saveWorkflow: (body) => request('/api/workflows', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
+  resetDefaultWorkflow: () => request('/api/workflows/reset-default', {
+    method: 'POST',
+  }),
+  getTaskWorkflow: (taskId) => request(`/api/tasks/${encodeURIComponent(taskId)}/workflow`),
+  submitManualDecision: (taskId, body) => request(`/api/tasks/${encodeURIComponent(taskId)}/workflow/manual-decision`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }),
 };
