@@ -23,8 +23,8 @@ adapterRegistry.register({
 });
 function createTask(testsMd='') {
   const id='policy-'+randomUUID();
-  db.createTask({id,task_key:id,title:'Policy fixture',target_cwd:process.cwd(),budget_timeout_sec:-1,budget_max_rounds:1});
-  db.saveRevision({task_id:id,revision:1,manifest_json:JSON.stringify({executionPolicy:{workerTimeoutMs:9999999}}),task_md:'# Fixture',development_md:'# Fixture',tests_md:testsMd,acceptance_md:'# Fixture',verifier_prompt_md:'# Fixture'});
+  db.createTask({id,task_key:id,title:'Policy fixture',target_cwd:process.cwd(),budget_max_rounds:1});
+  db.saveRevision({task_id:id,revision:1,manifest_json:JSON.stringify({packageVersion:1}),task_md:'# Fixture',development_md:'# Fixture',tests_md:testsMd,acceptance_md:'# Fixture',verifier_prompt_md:'# Fixture'});
   return id;
 }
 async function waitFor(predicate:()=>boolean) {

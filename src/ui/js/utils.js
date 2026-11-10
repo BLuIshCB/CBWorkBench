@@ -43,6 +43,12 @@ export function formatStage(stage) {
   return map[stage] || stage;
 }
 
+export function formatExecutor(executor) {
+  if (!executor) return 'codebuddycli';
+  if (String(executor).toLowerCase() === 'workbuddy') return 'codebuddycli';
+  return executor;
+}
+
 export function copyToClipboard(elementId) {
   const el = document.getElementById(elementId);
   if (!el) return;

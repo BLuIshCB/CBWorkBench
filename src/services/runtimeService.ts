@@ -27,7 +27,6 @@ export interface CliProbeRequest {
   verify?: boolean;
   prompt?: string;
   model?: string;
-  timeoutMs?: number;
   cwd?: string;
 }
 

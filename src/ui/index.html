@@ -38,7 +38,7 @@
       <div class="sidebar-footer">
         <div class="sidebar-status-box" id="system-status-pills">
           <div class="status-pill pill-node" id="pill-node">Node 24 SQLite</div>
-          <div class="status-pill pill-wb" id="pill-wb">WorkBuddy 就绪</div>
+          <div class="status-pill pill-wb" id="pill-wb">CodeBuddy CLI 就绪</div>
           <div class="status-pill pill-codex" id="pill-codex">Codex 就绪</div>
         </div>
       </div>
@@ -96,8 +96,8 @@
             <span>任务标识：<code id="detail-task-key">key</code></span>
             <span>材料版本：<code id="detail-task-rev">r1</code></span>
             <span>轮次：<b id="detail-current-round">0</b> / <span id="detail-max-rounds">10</span></span>
-            <span>Worker：<code id="detail-worker-info">workbuddy</code></span>
-            <span>Reviewer：<code id="detail-reviewer-info">workbuddy</code></span>
+            <span>Worker：<code id="detail-worker-info">codebuddycli</code></span>
+            <span>Reviewer：<code id="detail-reviewer-info">codebuddycli</code></span>
             <span>提交时间：<span id="detail-created-at">--</span></span>
           </div>
         </div>
@@ -125,7 +125,7 @@
             </label>
             <div style="display: flex; gap: 8px;">
               <select id="select-worker-executor" class="form-control" style="flex: 1;" onchange="app.handleWorkerExecutorChange()">
-                <option value="workbuddy">WorkBuddy (本地执行 · 无沙箱)</option>
+                <option value="workbuddy">CodeBuddy CLI (本地执行 · 无沙箱)</option>
               </select>
               <div style="flex: 1; min-width: 0;">
                 <select id="select-worker-model" class="form-control" onchange="app.handleModelSelectionChange('select-worker-model')"></select>
@@ -140,7 +140,7 @@
             </label>
             <div style="display: flex; gap: 8px;">
               <select id="select-reviewer-executor" class="form-control" style="flex: 1;" onchange="app.handleReviewerExecutorChange()">
-                <option value="workbuddy">WorkBuddy (质量审查 · 无沙箱)</option>
+                <option value="workbuddy">CodeBuddy CLI (质量审查 · 无沙箱)</option>
               </select>
               <div style="flex: 1; min-width: 0;">
                 <select id="select-reviewer-model" class="form-control" onchange="app.handleModelSelectionChange('select-reviewer-model')"></select>
@@ -153,7 +153,7 @@
         <div class="form-row">
           <label for="execution-timeout-minutes">单次执行超时时间（分钟）</label>
           <input id="execution-timeout-minutes" type="number" min="1" max="1440" step="1" value="60" class="form-control">
-          <p>每次 CLI 调用或每条独立测试命令分别计时。旧分阶段和总预算已停用。</p>
+          <p>每次 CLI 调用或每条独立测试命令分别计时。</p>
         </div>
         <div class="form-row">
           <label for="input-confirmed-cwd">执行目录 (工作台识别的真实项目路径)：</label>
@@ -205,7 +205,7 @@
             <div class="step-item" id="step-worker">
               <div class="step-icon">1</div>
               <div class="step-label">Worker 开发修复</div>
-              <div class="step-sub" id="stepper-worker-sub">WorkBuddy (直连)</div>
+              <div class="step-sub" id="stepper-worker-sub">CodeBuddy CLI (直连)</div>
             </div>
             <div class="step-arrow">→</div>
             <div class="step-item" id="step-tests">
@@ -285,38 +285,16 @@
     <section id="view-runtime" class="view-section" style="display: none;">
       <div class="section-header">
         <div class="title-group">
-          <h2>🧩 CLI 适配器中心</h2>
-          <p class="subtitle">Codex、WorkBuddy、Antigravity 共用同一个对话接口；开发或验收由提示词决定，不限制适配器角色。</p>
+          <h2>🧩 CLI 适配器</h2>
         </div>
         <div class="action-group">
-          <button class="btn btn-secondary" onclick="app.fetchRuntimeClis()">刷新适配器状态</button>
-        </div>
-      </div>
-
-      <!-- Quick Summary Row -->
-      <div class="runtime-summary-bar">
-        <div class="summary-stat-item">
-          <span class="stat-label">已注册适配器总数</span>
-          <span class="stat-value" id="runtime-stat-total">--</span>
-        </div>
-        <div class="summary-stat-item">
-          <span class="stat-label">当前活跃 Worker</span>
-          <span class="stat-value text-blue" id="runtime-stat-wb" style="font-size: 15px;">WorkBuddy CLI</span>
-        </div>
-        <div class="summary-stat-item">
-          <span class="stat-label">核心模型</span>
-          <span class="stat-value text-green" id="runtime-stat-wb-model">deepseek-v4-flash</span>
-        </div>
-        <div class="summary-stat-item">
-          <span class="stat-label">架构解耦特性</span>
-          <span class="stat-value text-purple" style="font-size: 14px;">无沙箱直连 · 热插拔注册</span>
+          <button class="btn btn-secondary" onclick="app.fetchRuntimeClis()">刷新状态</button>
         </div>
       </div>
 
       <!-- Configured Adapters Grid -->
       <div class="runtime-section-title">
-        <h3>已注册的 Agent 适配器清单 (Registered Adapters)</h3>
-        <span class="badge badge-secondary" id="runtime-cli-count">加载中...</span>
+        <h3>已注册适配器</h3>
       </div>
       <div id="runtime-cli-grid" class="runtime-cli-grid">
         <div class="loading-state">正在探测已注册适配器...</div>
@@ -326,8 +304,7 @@
       <div class="card probe-card" id="probe-console-card">
         <div class="probe-header">
           <div class="probe-title-group">
-            <h3>🎯 适配器提示词即时探测控制台</h3>
-            <p class="desc">通过统一 execute() 接口发送提示词，直接验证独立 CLI 的登录态与模型响应。开发和验收使用相同调用能力。</p>
+            <h3>🎯 快速探测控制台</h3>
           </div>
         </div>
 
@@ -340,38 +317,26 @@
           </div>
 
           <div class="form-group">
-            <label for="probe-model-select">执行模型 (可选)：</label>
+            <label for="probe-model-select">执行模型：</label>
             <select id="probe-model-select" class="form-control" onchange="app.handleModelSelectionChange('probe-model-select')"></select>
             <input id="probe-model-select-custom" class="form-control" style="display: none; margin-top: 6px;" aria-label="手动输入执行模型" placeholder="输入模型名称，default 使用 CLI 默认模型">
           </div>
 
           <div class="form-group">
-            <p>CLI 连通性检查使用内部固定时限。</p>
+            <label for="probe-cwd-input">工作区目录 (CWD)：</label>
+            <input type="text" id="probe-cwd-input" class="form-control" placeholder="D:/CODE/..." />
           </div>
         </div>
 
         <div class="form-row" style="margin-top: 12px;">
-          <label for="probe-cwd-input">工作区执行目录 (CWD)：</label>
-          <input type="text" id="probe-cwd-input" class="form-control" placeholder="D:/CODE/..." />
-        </div>
-
-        <div class="prompt-preset-bar">
-          <span class="preset-label">快捷预设：</span>
-          <button type="button" class="preset-btn" onclick="app.setProbePreset('wb_echo')">⚡ WorkBuddy 标准回声</button>
-          <button type="button" class="preset-btn" onclick="app.setProbePreset('codex')">💻 Codex 对话探测</button>
-          <button type="button" class="preset-btn" onclick="app.setProbePreset('pong')">🏓 极简响应 (PONG)</button>
-        </div>
-
-        <div class="form-row" style="margin-top: 8px;">
           <label for="probe-prompt-input">探测提示词 (Prompt)：</label>
-          <textarea id="probe-prompt-input" class="form-control prompt-textarea" rows="4" placeholder="输入简单的提示词用于探测..."></textarea>
+          <textarea id="probe-prompt-input" class="form-control prompt-textarea" rows="3" placeholder="输入简单的提示词用于探测..."></textarea>
         </div>
 
         <div class="probe-action-row">
           <button id="btn-run-probe" class="btn btn-primary" onclick="app.runCliProbe()">
-            <span id="probe-btn-icon">🚀</span> <span id="probe-btn-text">发送提示词探测</span>
+            <span id="probe-btn-icon">🚀</span> <span id="probe-btn-text">发送探测</span>
           </button>
-          <span class="probe-hint" id="probe-exec-hint">探测仅测试通信协议与模型回包，不会对工作区代码造成破坏。</span>
         </div>
 
         <!-- Probe Output Result Box -->

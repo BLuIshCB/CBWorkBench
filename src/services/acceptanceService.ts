@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import path from 'node:path';
 import type { IAgentAdapter, ReviewerExecutionContext, ReviewerExecutionResult } from '../adapters/types.ts';
-import { DEFAULT_VERIFIER_TIMEOUT_MS } from '../config/constants.ts';
+import { DEFAULT_EXECUTION_TIMEOUT_MS } from '../config/constants.ts';
 
 const nonEmpty = z.string().trim().min(1);
 const reviewSchema = z.object({
@@ -51,7 +51,7 @@ export class AcceptanceService {
       cwd: context.confirmedCwd,
       model: modelUsed,
       signal: context.signal,
-      timeoutMs: context.timeoutMs ?? DEFAULT_VERIFIER_TIMEOUT_MS,
+      timeoutMs: context.timeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS,
     });
 
     const metadata = {

@@ -2,7 +2,7 @@
  * CBWorkBench 任务详情视图组件
  */
 
-import { escapeHtml, formatStatus, formatStage, renderMarkdown } from '../utils.js';
+import { escapeHtml, formatStatus, formatStage, renderMarkdown, formatExecutor } from '../utils.js';
 
 export const TaskDetail = {
   render(data, availableWorkers, availableReviewers, activeDetailTab, currentMaterialSubtab) {
@@ -24,11 +24,11 @@ export const TaskDetail = {
 
     const workerEl = document.getElementById('detail-worker-info');
     if (workerEl) {
-      workerEl.textContent = `${task.worker_executor || 'workbuddy'}:${task.worker_model || 'deepseek-v4-flash'}`;
+      workerEl.textContent = `${formatExecutor(task.worker_executor)}:${task.worker_model || 'deepseek-v4-flash'}`;
     }
     const reviewerEl = document.getElementById('detail-reviewer-info');
     if (reviewerEl) {
-      reviewerEl.textContent = `${task.reviewer_executor || 'workbuddy'}:${task.reviewer_model || 'deepseek-v4-flash'}`;
+      reviewerEl.textContent = `${formatExecutor(task.reviewer_executor)}:${task.reviewer_model || 'deepseek-v4-flash'}`;
     }
 
     const badge = document.getElementById('detail-status-badge');
@@ -277,7 +277,9 @@ export const TaskDetail = {
                 (r, idx) => {
                   const roundDomId = `round-${rn}-step-${idx}`;
                   const durationSec = r.duration_ms ? (r.duration_ms / 1000).toFixed(1) + 's' : (r.finished_at && r.started_at ? ((r.finished_at - r.started_at)/1000).toFixed(1)+'s' : '--');
-                  const adapterLabel = r.adapter_id ? `${r.adapter_id} (${r.model_name || 'default'})` : (r.worker_id || 'workbuddy');
+                  const rawAdapter = r.adapter_id || r.worker_id;
+                  const displayAdapter = formatExecutor(rawAdapter);
+                  const adapterLabel = r.adapter_id ? `${displayAdapter} (${r.model_name || 'default'})` : displayAdapter;
 
                   return `
               <div style="background: var(--surface-hover); padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border);">

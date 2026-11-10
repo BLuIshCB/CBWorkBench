@@ -158,6 +158,54 @@ try {
   assert.strictEqual(resetRes.workflow.id, 'default');
   console.log('  ✓ POST /api/workflows/reset-default restores default template after task deleted');
 
+  // 8. DELETE /api/workflows/:id
+  // 8.1 Default workflow cannot be deleted
+  const delDefaultRes = await fetch(`${baseUrl}/api/workflows/default`, {
+    method: 'DELETE',
+  });
+  assert.strictEqual(delDefaultRes.status, 400);
+  const delDefaultData = await delDefaultRes.json();
+  assert.strictEqual(delDefaultData.success, false);
+  assert.strictEqual(delDefaultData.code, 'FORBIDDEN_DELETE_DEFAULT');
+  console.log('  ✓ DELETE /api/workflows/default returns 400 FORBIDDEN_DELETE_DEFAULT');
+
+  // 8.2 Non-existent workflow returns 404
+  const delMissingRes = await fetch(`${baseUrl}/api/workflows/non-existent-wf`, {
+    method: 'DELETE',
+  });
+  assert.strictEqual(delMissingRes.status, 404);
+  console.log('  ✓ DELETE /api/workflows/non-existent-wf returns 404');
+
+  // 8.3 Workflow referenced by task cannot be deleted (returns 403)
+  const lockingTaskId = 'task-lock-del-' + randomUUID();
+  db.createTask({
+    id: lockingTaskId,
+    task_key: 'lock-del-key',
+    title: 'Locking Task',
+    target_cwd: process.cwd(),
+  });
+  db.initTaskWorkflow(lockingTaskId, { workflowId: 'good-wf' });
+
+  const delLockedRes = await fetch(`${baseUrl}/api/workflows/good-wf`, {
+    method: 'DELETE',
+  });
+  assert.strictEqual(delLockedRes.status, 403);
+  const delLockedData = await delLockedRes.json();
+  assert.strictEqual(delLockedData.code, 'WORKFLOW_IN_USE');
+  assert(delLockedData.referencingTasks.length > 0);
+  console.log('  ✓ DELETE /api/workflows/good-wf returns 403 WORKFLOW_IN_USE when referenced');
+
+  // 8.4 After deleting referencing task, deleting workflow succeeds
+  db.deleteTask(lockingTaskId);
+  const delSuccessRes = await fetch(`${baseUrl}/api/workflows/good-wf`, {
+    method: 'DELETE',
+  });
+  assert.strictEqual(delSuccessRes.status, 200);
+  const delSuccessData = await delSuccessRes.json();
+  assert.strictEqual(delSuccessData.success, true);
+  assert.strictEqual(db.getWorkflow('good-wf'), null);
+  console.log('  ✓ DELETE /api/workflows/good-wf succeeds once task is removed');
+
   console.log('✅ workflowHttp.test.ts passed successfully!');
 } finally {
   server.close();

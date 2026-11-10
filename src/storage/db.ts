@@ -18,7 +18,6 @@ import {
 
 export interface WorkflowDefinitionRecord {
   id: string;
-  version: number;
   name: string;
   description: string | null;
   nodes_json: string;
@@ -30,7 +29,6 @@ export interface WorkflowDefinitionRecord {
 export interface TaskWorkflowRecord {
   task_id: string;
   workflow_id: string;
-  workflow_version: number;
   nodes_json: string;
   current_node_id: string;
   current_run_id: string | null;
@@ -67,7 +65,6 @@ export interface TaskRecord {
   git_commit: string | null;
   git_status: string | null;
   budget_max_rounds: number;
-  budget_timeout_sec: number;
   execution_timeout_ms: number | null;
   current_round: number;
   active_worker_id: string | null;
@@ -259,7 +256,7 @@ export class WorkbenchDatabase {
         git_commit TEXT,
         git_status TEXT,
         budget_max_rounds INTEGER NOT NULL DEFAULT 10,
-        budget_timeout_sec INTEGER NOT NULL DEFAULT 1800,
+        execution_timeout_ms INTEGER,
         current_round INTEGER NOT NULL DEFAULT 0,
         active_worker_id TEXT,
         current_stage TEXT,
@@ -313,6 +310,9 @@ export class WorkbenchDatabase {
         issues_json TEXT,
         status TEXT NOT NULL,
         error_message TEXT,
+        run_id TEXT,
+        termination_reason TEXT,
+        cleanup_confirmed INTEGER,
         started_at INTEGER NOT NULL,
         finished_at INTEGER
       );
@@ -355,21 +355,18 @@ export class WorkbenchDatabase {
       );
 
       CREATE TABLE IF NOT EXISTS workflow_definitions (
-        id TEXT NOT NULL,
-        version INTEGER NOT NULL DEFAULT 1,
+        id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         description TEXT,
         nodes_json TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
-        is_default INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (id, version)
+        is_default INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS task_workflows (
         task_id TEXT PRIMARY KEY,
         workflow_id TEXT NOT NULL,
-        workflow_version INTEGER NOT NULL,
         nodes_json TEXT NOT NULL,
         current_node_id TEXT NOT NULL,
         current_run_id TEXT,
@@ -398,7 +395,6 @@ export class WorkbenchDatabase {
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
       CREATE INDEX IF NOT EXISTS idx_task_revisions_task_id ON task_revisions(task_id);
       CREATE INDEX IF NOT EXISTS idx_execution_rounds_task_id ON execution_rounds(task_id);
-      CREATE INDEX IF NOT EXISTS idx_workflow_defs_id ON workflow_definitions(id);
       CREATE INDEX IF NOT EXISTS idx_task_workflows_task ON task_workflows(task_id);
       CREATE INDEX IF NOT EXISTS idx_wf_node_runs_task ON workflow_node_runs(task_id);
       CREATE INDEX IF NOT EXISTS idx_wf_node_runs_token ON workflow_node_runs(completion_token);
@@ -411,11 +407,10 @@ export class WorkbenchDatabase {
       if (!defRow) {
         const now = Date.now();
         this.db.prepare(`
-          INSERT INTO workflow_definitions (id, version, name, description, nodes_json, created_at, updated_at, is_default)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+          INSERT INTO workflow_definitions (id, name, description, nodes_json, created_at, updated_at, is_default)
+          VALUES (?, ?, ?, ?, ?, ?, 1)
         `).run(
           DEFAULT_WORKFLOW_ID,
-          1,
           '默认开发交付流程',
           '经典流程：开始 -> 开发实现 -> 独立测试 -> 整体验收 -> 人工确认 -> 结束',
           JSON.stringify(DEFAULT_WORKFLOW_NODES),
@@ -425,33 +420,9 @@ export class WorkbenchDatabase {
       }
     } catch {}
 
-    this.db.exec(`CREATE TABLE IF NOT EXISTS execution_runs (run_id TEXT PRIMARY KEY, task_id TEXT, snapshot_json TEXT NOT NULL);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS execution_runs (run_id TEXT PRIMARY KEY, task_id TEXT, snapshot_json TEXT NOT NULL, output_bytes INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS execution_events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, at INTEGER NOT NULL, type TEXT NOT NULL, data_json TEXT NOT NULL, PRIMARY KEY(run_id,seq));
       CREATE INDEX IF NOT EXISTS idx_runs_task ON execution_runs(task_id);`);
-    // Gracefully apply schema migrations for existing databases
-    const migrations = [
-      "ALTER TABLE tasks ADD COLUMN execution_timeout_ms INTEGER",
-      "ALTER TABLE execution_runs ADD COLUMN output_bytes INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE tasks ADD COLUMN worker_executor TEXT NOT NULL DEFAULT 'workbuddy'",
-      "ALTER TABLE tasks ADD COLUMN worker_model TEXT NOT NULL DEFAULT 'deepseek-v4-flash'",
-      "ALTER TABLE tasks ADD COLUMN reviewer_executor TEXT NOT NULL DEFAULT 'workbuddy'",
-      "ALTER TABLE tasks ADD COLUMN reviewer_model TEXT NOT NULL DEFAULT 'deepseek-v4-flash'",
-      "ALTER TABLE execution_rounds ADD COLUMN run_id TEXT",
-      "ALTER TABLE execution_rounds ADD COLUMN termination_reason TEXT",
-      "ALTER TABLE execution_rounds ADD COLUMN cleanup_confirmed INTEGER",
-      "ALTER TABLE execution_rounds ADD COLUMN adapter_id TEXT",
-      "ALTER TABLE execution_rounds ADD COLUMN model_name TEXT",
-      "ALTER TABLE execution_rounds ADD COLUMN duration_ms INTEGER",
-    ];
-
-    for (const sql of migrations) {
-      try {
-        this.db.exec(sql);
-        if(sql.includes('execution_runs ADD COLUMN output_bytes')) this.db.exec("UPDATE execution_runs SET output_bytes=COALESCE((SELECT SUM(length(CAST(json_extract(data_json,'$.text') AS BLOB))) FROM execution_events WHERE execution_events.run_id=execution_runs.run_id AND type='output'),0)");
-      } catch (error:any) {
-        if(!String(error.message).includes('duplicate column name'))throw error;
-      }
-    }
   }
 
   taskOutputBytes(taskId:string):number {
@@ -512,7 +483,6 @@ export class WorkbenchDatabase {
     git_commit?: string | null;
     git_status?: string | null;
     budget_max_rounds?: number;
-    budget_timeout_sec?: number;
     execution_timeout_ms?: number;
     worker_executor?: string;
     worker_model?: string;
@@ -523,17 +493,17 @@ export class WorkbenchDatabase {
     const revision = data.revision ?? 1;
     const status = data.status ?? TaskStatus.PENDING_CONFIRM;
     const budgetRounds = data.budget_max_rounds ?? 10;
-    const budgetTimeout = data.budget_timeout_sec ?? 1800;
     const workerExecutor = data.worker_executor || 'codex';
     const workerModel = data.worker_model || (workerExecutor === 'codex' ? 'default' : 'deepseek-v4-flash');
     const reviewerExecutor = data.reviewer_executor || 'codex';
     const reviewerModel = data.reviewer_model || (reviewerExecutor === 'codex' ? 'default' : 'deepseek-v4-flash');
+    const executionTimeoutMs = resolveExecutionTimeout(data.execution_timeout_ms);
 
     const stmt = this.db.prepare(`
       INSERT INTO tasks (
         id, task_key, revision, title, status, target_cwd,
         git_root, git_commit, git_status,
-        budget_max_rounds, budget_timeout_sec, current_round,
+        budget_max_rounds, execution_timeout_ms, current_round,
         created_at, updated_at,
         worker_executor, worker_model, reviewer_executor, reviewer_model
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
@@ -550,7 +520,7 @@ export class WorkbenchDatabase {
       data.git_commit || null,
       data.git_status || null,
       budgetRounds,
-      budgetTimeout,
+      executionTimeoutMs,
       now,
       now,
       workerExecutor,
@@ -559,7 +529,6 @@ export class WorkbenchDatabase {
       reviewerModel
     );
 
-    this.db.prepare('UPDATE tasks SET execution_timeout_ms = ? WHERE id = ?').run(resolveExecutionTimeout(data.execution_timeout_ms), data.id);
     if (!this.getTaskWorkflow(data.id)) {
       this.initTaskWorkflow(data.id);
     }
@@ -936,31 +905,22 @@ export class WorkbenchDatabase {
     return stmt.all(workflowId) as { id: string; title: string; status: string }[];
   }
 
-  getWorkflow(id: string, version?: number): WorkflowDefinitionRecord | null {
-    if (version !== undefined) {
-      const stmt = this.db.prepare('SELECT * FROM workflow_definitions WHERE id = ? AND version = ?');
-      const row = stmt.get(id, version) as unknown as WorkflowDefinitionRecord | undefined;
-      if (row) return row;
-    }
-    const stmt = this.db.prepare('SELECT * FROM workflow_definitions WHERE id = ? ORDER BY updated_at DESC, version DESC LIMIT 1');
+  getWorkflow(id: string): WorkflowDefinitionRecord | null {
+    const stmt = this.db.prepare('SELECT * FROM workflow_definitions WHERE id = ?');
     const row = stmt.get(id) as unknown as WorkflowDefinitionRecord | undefined;
     return row ?? null;
   }
 
   listWorkflows(): WorkflowDefinitionRecord[] {
     const stmt = this.db.prepare(`
-      SELECT wd.* FROM workflow_definitions wd
-      INNER JOIN (
-        SELECT id, MAX(version) AS max_v FROM workflow_definitions GROUP BY id
-      ) latest ON wd.id = latest.id AND wd.version = latest.max_v
-      ORDER BY wd.is_default DESC, wd.id ASC
+      SELECT * FROM workflow_definitions
+      ORDER BY is_default DESC, id ASC
     `);
     return stmt.all() as unknown as WorkflowDefinitionRecord[];
   }
 
   saveWorkflowDefinition(data: {
     id: string;
-    version?: number;
     name: string;
     description?: string | null;
     nodes_json: string;
@@ -988,14 +948,12 @@ export class WorkbenchDatabase {
     }
 
     const now = Date.now();
-    const version = 1;
     this.db.prepare(`
       INSERT INTO workflow_definitions (
-        id, version, name, description, nodes_json, created_at, updated_at, is_default
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, name, description, nodes_json, created_at, updated_at, is_default
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
       data.id,
-      version,
       data.name,
       data.description || null,
       data.nodes_json,
@@ -1005,6 +963,24 @@ export class WorkbenchDatabase {
     );
 
     return this.getWorkflow(data.id)!;
+  }
+
+  deleteWorkflow(id: string): boolean {
+    const existing = this.getWorkflow(id);
+    if (!existing) return false;
+
+    if (existing.id === DEFAULT_WORKFLOW_ID || existing.is_default === 1) {
+      throw new Error('系统默认工作流禁止删除');
+    }
+
+    if (this.isWorkflowReferenced(id)) {
+      throw new Error(`工作流 [${id}] 当前正被任务引用，禁止删除！若需删除请先清理相关任务。`);
+    }
+
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM workflow_definitions WHERE id = ?').run(id);
+    });
+    return true;
   }
 
   // --- Task Workflows ---
@@ -1019,21 +995,18 @@ export class WorkbenchDatabase {
     taskId: string,
     options?: {
       workflowId?: string;
-      workflowVersion?: number;
       nodePrompts?: Record<string, string>;
       nodesOverride?: WorkflowNode[];
     }
   ): TaskWorkflowRecord {
     const wfId = options?.workflowId || DEFAULT_WORKFLOW_ID;
     let nodes: WorkflowNode[];
-    let wfVersion = options?.workflowVersion || 1;
 
     if (options?.nodesOverride) {
       nodes = JSON.parse(JSON.stringify(options.nodesOverride));
     } else {
-      const def = this.getWorkflow(wfId, options?.workflowVersion);
+      const def = this.getWorkflow(wfId);
       if (def) {
-        wfVersion = def.version;
         nodes = JSON.parse(def.nodes_json);
       } else {
         nodes = JSON.parse(JSON.stringify(DEFAULT_WORKFLOW_NODES));
@@ -1055,13 +1028,13 @@ export class WorkbenchDatabase {
 
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO task_workflows (
-        task_id, workflow_id, workflow_version, nodes_json,
+        task_id, workflow_id, nodes_json,
         current_node_id, current_run_id, code_generation,
         tests_passed_generation, acceptance_passed_generation, updated_at
-      ) VALUES (?, ?, ?, ?, ?, NULL, 0, 0, 0, ?)
+      ) VALUES (?, ?, ?, ?, NULL, 0, 0, 0, ?)
     `);
 
-    stmt.run(taskId, wfId, wfVersion, JSON.stringify(nodes), initialNodeId, now);
+    stmt.run(taskId, wfId, JSON.stringify(nodes), initialNodeId, now);
     return this.getTaskWorkflow(taskId)!;
   }
 

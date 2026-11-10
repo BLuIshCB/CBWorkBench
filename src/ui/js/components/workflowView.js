@@ -6,7 +6,7 @@
  */
 
 import { api } from '../api.js';
-import { escapeHtml } from '../utils.js';
+import { escapeHtml, formatExecutor } from '../utils.js';
 
 export class WorkflowView {
   constructor(app) {
@@ -102,6 +102,11 @@ export class WorkflowView {
             <button class="btn btn-secondary" onclick="app.workflowView.showNewWorkflowModal()">➕ 新建工作流</button>
             <button class="btn btn-secondary" ${wf.id === 'default' && isLocked ? 'disabled title="默认工作流正被任务引用，禁止重置"' : ''} onclick="app.workflowView.resetDefaultWorkflow()">🔄 恢复默认流程</button>
             <button class="btn btn-primary" ${isLocked ? 'disabled title="该工作流正被任务引用，禁止修改"' : ''} onclick="app.workflowView.saveWorkflow()">💾 保存工作流</button>
+            ${
+              wf.id !== 'default' && !wf.isDefault
+                ? `<button class="btn btn-danger" ${isLocked ? 'disabled title="该工作流正被任务引用，禁止删除"' : ''} onclick="app.workflowView.deleteCurrentWorkflow()">🗑️ 删除工作流</button>`
+                : ''
+            }
           </div>
         </div>
 
@@ -331,7 +336,7 @@ export class WorkflowView {
           <text x="${pos.x + 10}" y="${pos.y + 46}" font-size="13" font-weight="bold" fill="#1e293b">${escapeHtml(node.name || node.id)}</text>
           
           <!-- Detail subtext -->
-          <text x="${pos.x + 10}" y="${pos.y + 66}" font-size="11" fill="#64748b">${escapeHtml(node.execution_mode === 'agent' ? (node.executor || 'workbuddy') : node.execution_mode === 'command' ? (node.command || '独立测试') : '人工审核')}</text>
+          <text x="${pos.x + 10}" y="${pos.y + 66}" font-size="11" fill="#64748b">${escapeHtml(node.execution_mode === 'agent' ? formatExecutor(node.executor) : node.execution_mode === 'command' ? (node.command || '独立测试') : '人工审核')}</text>
         </g>
       `;
     });
@@ -410,7 +415,7 @@ export class WorkflowView {
             <div class="form-group">
               <label class="form-label">执行器 (Executor)</label>
               <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('executor', this.value)" ${isLocked ? 'disabled' : ''}>
-                <option value="workbuddy" ${node.executor === 'workbuddy' ? 'selected' : ''}>WorkBuddy</option>
+                <option value="workbuddy" ${node.executor === 'workbuddy' ? 'selected' : ''}>CodeBuddy CLI</option>
                 <option value="codex" ${node.executor === 'codex' ? 'selected' : ''}>Codex</option>
                 <option value="antigravity" ${node.executor === 'antigravity' ? 'selected' : ''}>Antigravity</option>
               </select>
@@ -731,6 +736,35 @@ export class WorkflowView {
       alert(`工作流 [${name}] 创建成功！`);
     } catch (e) {
       alert(`创建工作流失败: ${e.message}`);
+    }
+  }
+
+  async deleteCurrentWorkflow() {
+    if (!this.currentWorkflow) return;
+    const wf = this.currentWorkflow;
+    if (wf.id === 'default' || wf.isDefault) {
+      alert('系统默认工作流禁止删除！');
+      return;
+    }
+    if (wf.isReferenced) {
+      alert(`工作流 [${wf.name || wf.id}] 当前正被任务引用，禁止删除！请先清理相关任务。`);
+      return;
+    }
+    const displayName = wf.name || wf.id;
+    if (!confirm(`确定要彻底删除工作流「${displayName}」吗？此操作无法撤销。`)) {
+      return;
+    }
+    try {
+      const res = await api.deleteWorkflow(wf.id);
+      if (res && res.success) {
+        alert(`工作流「${displayName}」已成功删除`);
+        this.currentWorkflow = null;
+        await this.loadWorkflows();
+      } else {
+        alert(`删除失败: ${res?.message || '未知错误'}`);
+      }
+    } catch (e) {
+      alert(`删除失败: ${e.message}`);
     }
   }
 }

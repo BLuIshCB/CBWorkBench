@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { IAgentAdapter, AgentExecutionContext, AgentExecutionResult, AdapterExecutionPolicy } from './types.ts';
 import type { AgentCliConfig } from '../services/cliConfig.ts';
 import { CliRunner } from '../services/cliRunner.ts';
-import { ROOT_DIR, DEFAULT_WORKER_TIMEOUT_MS } from '../config/constants.ts';
+import { ROOT_DIR, DEFAULT_EXECUTION_TIMEOUT_MS } from '../config/constants.ts';
 
 /** 共用进程执行和失败处理；参数与协议解析留给厂商实现。 */
 export abstract class NativeCliAdapter implements IAgentAdapter {
@@ -72,7 +72,7 @@ export abstract class NativeCliAdapter implements IAgentAdapter {
           }
           if(Buffer.byteLength(pending)>1048576) throw Object.assign(new Error('协议行超过1MiB'),{errorCode:'OUTPUT_LIMIT'});
         },
-        timeoutMs: context.timeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS,
+        timeoutMs: context.timeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS,
       });
       if (!result.timedOut && !result.cancelled && result.errorCode!=='OUTPUT_LIMIT' && /^(?:Error:\s*)?(?:authentication required|authentication failed|not authenticated|please (?:use \/login|log\s?in|sign in)|未登录|请(?:先)?登录)/im.test(`${result.stdout}\n${result.stderr}`)) {
         await ExecutionService.finish(runId,'AUTH_REQUIRED',result.exitCode,true);

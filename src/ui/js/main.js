@@ -416,35 +416,6 @@ export class App {
         RuntimeView.renderClis(data.clis);
         RuntimeView.populateProbeForm(data.clis);
         this.handleProbeTargetChange();
-
-        const totalEl = document.getElementById('runtime-stat-total');
-        if (totalEl) totalEl.textContent = `${data.clis.length} 个`;
-
-        const countEl = document.getElementById('runtime-cli-count');
-        if (countEl) countEl.textContent = `共 ${data.clis.length} 个组件`;
-
-        const wb = data.clis.find((c) => c.id === 'workbuddy');
-        const wbEl = document.getElementById('runtime-stat-wb');
-        if (wbEl) {
-          if (wb && wb.available) {
-            wbEl.textContent = 'Direct CLI (无会话持久化)';
-            wbEl.className = 'stat-value text-blue';
-          } else {
-            wbEl.textContent = '待配置';
-            wbEl.className = 'stat-value text-muted';
-          }
-        }
-
-        const wbModelEl = document.getElementById('runtime-stat-wb-model');
-        if (wbModelEl && wb) {
-          wbModelEl.textContent = wb.defaultModel || 'deepseek-v4-flash';
-        }
-
-        const codexCli = data.clis.find((c) => c.id === 'codex');
-        const codexModelEl = document.getElementById('runtime-stat-codex-model');
-        if (codexModelEl && codexCli) {
-          codexModelEl.textContent = codexCli.defaultModel || 'gpt-5.6-sol';
-        }
       }
     } catch (e) {
       console.warn('Failed to fetch runtime clis:', e);
@@ -474,23 +445,7 @@ export class App {
   }
 
   setProbePreset(presetKey) {
-    const promptInput = document.getElementById('probe-prompt-input');
-    if (!promptInput) return;
-    promptInput.dataset.autoFilled = 'false';
-
-    switch (presetKey) {
-      case 'wb_echo':
-        promptInput.value = '只回复 WB_ADAPTER_OK。不要调用工具，不要读写文件。';
-        this.selectCliDropdown('workbuddy');
-        break;
-      case 'codex':
-        promptInput.value = '只回复 CODEX_OK，不要多余字符。';
-        this.selectCliDropdown('codex');
-        break;
-      case 'pong':
-        promptInput.value = '只回复 PONG';
-        break;
-    }
+    // Presets removed in streamlined UI
   }
 
   selectCliDropdown(cliId) {
@@ -603,7 +558,7 @@ export class App {
       }
 
       if (r.errorCode === 'AUTH_REQUIRED') {
-        displayOutput += `\n💡 [排查建议]\n- 若使用桌面桥接，请确保 WorkBuddy 桌面客户端已启动且已完成登录。\n- 若使用独立 CLI，请执行: node bin/workbuddy.js login\n`;
+        displayOutput += `\n💡 [排查建议]\n- 若使用独立 CLI，请执行: node bin/agent.js login workbuddy\n`;
       }
 
       outputBox.textContent = displayOutput;

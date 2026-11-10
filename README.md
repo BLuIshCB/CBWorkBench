@@ -186,7 +186,7 @@ CBWorkBench/
 │   │   └── constants.ts      # 常量、状态枚举与默认配置定义
 │   ├── server/
 │   │   ├── httpServer.ts     # 原生 Resident HTTP API 与静态 UI 服务器
-│   │   └── mcpServer.ts      # Stdio MCP 服务实现 (4 大安全 Tools)
+│   │   └── mcpServer.ts      # Stdio MCP 服务实现
 │   ├── services/
 │   │   ├── gitService.ts     # Git 工作区探测与全量 Diff 快照生成
 │   │   ├── testRunner.ts     # 独立自动化测试解析器与超时熔断执行器
@@ -200,8 +200,8 @@ CBWorkBench/
 │   │   └── fileStore.ts      # 任务包 Markdown 材料与 Artifacts 文件系统
 │   ├── ui/
 │   │   ├── index.html        # 现代 Web 控制台 HTML5 结构 (包含适配器中心)
-│   │   ├── styles.css        # 深色主题现代化 CSS
-│   │   └── app.js            # 响应式轮询与交互业务逻辑
+│   │   ├── styles.css        # 浅色主题现代化 CSS
+│   │   └── js/               # 模块化前端交互逻辑 (main.js / api.js / components/)
 │   └── utils/
 │       ├── logger.ts         # 控制台与 data/workbench.log 双输出日志器
 │       └── nodeResolver.js   # 跨环境 Node.js 运行时探测器

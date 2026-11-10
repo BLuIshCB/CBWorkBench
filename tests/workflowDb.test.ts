@@ -17,7 +17,7 @@ try {
   const defaultWf = testDb.getWorkflow(DEFAULT_WORKFLOW_ID);
   assert(defaultWf, 'Default workflow definition should exist');
   assert.strictEqual(defaultWf.id, 'default');
-  assert.strictEqual(defaultWf.version, 1);
+  assert.strictEqual('version' in defaultWf, false);
   const nodes = JSON.parse(defaultWf.nodes_json);
   assert(Array.isArray(nodes));
   assert.strictEqual(nodes.length, 6);
@@ -99,6 +99,7 @@ try {
   assert(taskWf, 'Task workflow should be initialized automatically');
   assert.strictEqual(taskWf.current_node_id, 'start');
   assert.strictEqual(taskWf.code_generation, 0);
+  assert.strictEqual('workflow_version' in taskWf, false);
   console.log('  ✓ Task workflow initialized on task creation');
 
   // 5. Updating task workflow state
@@ -197,6 +198,38 @@ try {
   assert.strictEqual(testDb.getTaskWorkflow('task-wf-1'), null);
   assert.strictEqual(testDb.getNodeRuns('task-wf-1').length, 0);
   console.log('  ✓ deleteTask cascades cleanly to workflow tables');
+
+  // 10. Deleting workflow definitions
+  // 10.1 Default workflow cannot be deleted
+  assert.throws(() => {
+    testDb.deleteWorkflow(DEFAULT_WORKFLOW_ID);
+  }, /默认工作流禁止删除/);
+  console.log('  ✓ Deleting default workflow is strictly prohibited');
+
+  // 10.2 Workflow referenced by a task cannot be deleted
+  testDb.createTask({
+    id: 'task-ref-del',
+    task_key: 'del-key',
+    title: '删除引用测试任务',
+    target_cwd: tmpDir,
+  });
+  testDb.initTaskWorkflow('task-ref-del', { workflowId: 'custom_wf' });
+  assert.throws(() => {
+    testDb.deleteWorkflow('custom_wf');
+  }, /正被任务引用/);
+  console.log('  ✓ Deleting workflow referenced by a task is strictly prohibited');
+
+  // 10.3 After deleting the referencing task, workflow deletion succeeds
+  testDb.deleteTask('task-ref-del');
+  const deleteResult = testDb.deleteWorkflow('custom_wf');
+  assert.strictEqual(deleteResult, true);
+  assert.strictEqual(testDb.getWorkflow('custom_wf'), null);
+  assert(!testDb.listWorkflows().some((w) => w.id === 'custom_wf'));
+  console.log('  ✓ Unreferenced workflow can be deleted cleanly');
+
+  // 10.4 Deleting non-existent workflow returns false
+  assert.strictEqual(testDb.deleteWorkflow('non_existent_wf'), false);
+  console.log('  ✓ Deleting non-existent workflow returns false');
 
   console.log('✅ workflowDb.test.ts passed successfully!');
 } finally {

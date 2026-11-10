@@ -35,11 +35,9 @@ export function createWorkbenchMcpServer(): McpServer {
         .record(z.string())
         .describe('各 Worker 提示词映射，键为 workerId（如 "worker-dev"），值为独立提示词正文'),
       workflow_id: z.string().optional().describe('工作流模板 ID（默认为 "default"）'),
-      workflow_version: z.number().optional().describe('工作流版本号（默认最新版）'),
       node_prompts: z.record(z.string()).optional().describe('工作流各 Agent 节点独立提示词映射（键为节点 ID，值为提示词）'),
       execution_timeout_ms: executionTimeoutSchema.optional(),
       budget_max_rounds: z.number().optional().describe('可选：最大执行轮次预算（默认 10）'),
-      budget_timeout_sec: z.number().optional().describe('可选：已废弃：仅兼容接收，不再限制执行时间'),
     },
     async (args) => {
       try {
@@ -67,9 +65,9 @@ export function createWorkbenchMcpServer(): McpServer {
 
         // Validate workflow
         const wfId = args.workflow_id || DEFAULT_WORKFLOW_ID;
-        const wfDef = db.getWorkflow(wfId, args.workflow_version);
+        const wfDef = db.getWorkflow(wfId);
         if (!wfDef) {
-          throw new Error(`未找到指定工作流模板: ${wfId}${args.workflow_version ? ` (v${args.workflow_version})` : ''}`);
+          throw new Error(`未找到指定工作流模板: ${wfId}`);
         }
         if (args.node_prompts) {
           const nodes = JSON.parse(wfDef.nodes_json) as WorkflowNode[];
@@ -96,13 +94,11 @@ export function createWorkbenchMcpServer(): McpServer {
             git_status: gitInfo.statusText,
             execution_timeout_ms: executionTimeoutMs,
             budget_max_rounds: args.budget_max_rounds,
-            budget_timeout_sec: args.budget_timeout_sec,
           });
 
           // Initialize task workflow
           db.initTaskWorkflow(taskId, {
             workflowId: wfDef.id,
-            workflowVersion: wfDef.version,
             nodePrompts: args.node_prompts,
           });
 
@@ -156,7 +152,6 @@ export function createWorkbenchMcpServer(): McpServer {
                   revision,
                   status: TaskStatus.PENDING_CONFIRM,
                   workflowId: wfDef.id,
-                  workflowVersion: wfDef.version,
                   execution_timeout_ms:executionTimeoutMs,
                   executionTimeoutSource,
                   statusDescription: '待启动确认',
@@ -165,7 +160,7 @@ export function createWorkbenchMcpServer(): McpServer {
                   gitCommit: gitInfo.headCommit,
                   webUrl,
                   message:
-                    '任务包已成功上传到工作台，处于【待启动确认】状态。请用户在工作台页面核对目录并点击【确认并开始】。' + (args.budget_timeout_sec!==undefined ? ' budget_timeout_sec 已废弃并忽略，不再限制任务总时长。' : '') + (['workerTimeoutMs','verifierTimeoutMs','testTimeoutMs'].some(key=>manifest.executionPolicy?.[key]!==undefined) ? ' workerTimeoutMs 等分阶段时限已停用。' : ''),
+                    '任务包已成功上传到工作台，处于【待启动确认】状态。请用户在工作台页面核对目录并点击【确认并开始】。',
                 },
                 null,
                 2
@@ -319,7 +314,6 @@ export function createWorkbenchMcpServer(): McpServer {
                 title: task.title,
                 status: task.status,
                 workflowId: taskWf?.workflow_id || 'default',
-                workflowVersion: taskWf?.workflow_version || 1,
                 currentNodeId: taskWf?.current_node_id || 'start',
                 currentNodeName,
                 currentNodeExecutionCount: currentExecCount,
@@ -428,7 +422,7 @@ export function createWorkbenchMcpServer(): McpServer {
   // 6. Tool: workbench_list_workflows
   server.tool(
     'workbench_list_workflows',
-    '获取工作台中所有可用的工作流模板列表及其版本信息与节点数量。',
+    '获取工作台中所有可用的工作流模板列表及节点数量。',
     {},
     async () => {
       const list = db.listWorkflows().map((wf) => {
@@ -439,7 +433,6 @@ export function createWorkbenchMcpServer(): McpServer {
         return {
           id: wf.id,
           name: wf.name,
-          version: wf.version,
           description: wf.description,
           isDefault: Boolean(wf.is_default),
           nodeCount,
@@ -464,10 +457,9 @@ export function createWorkbenchMcpServer(): McpServer {
     '获取指定工作流的完整节点图定义（包含稳定节点 ID、执行方式、提示词模板、成功/失败去向和最大执行次数）。',
     {
       workflow_id: z.string().describe('工作流唯一标识（如 "default"）'),
-      version: z.number().optional().describe('可选：指定版本号，不传则返回最新版本'),
     },
     async (args) => {
-      const wf = db.getWorkflow(args.workflow_id, args.version);
+      const wf = db.getWorkflow(args.workflow_id);
       if (!wf) {
         return {
           isError: true,
@@ -490,7 +482,6 @@ export function createWorkbenchMcpServer(): McpServer {
                 workflow: {
                   id: wf.id,
                   name: wf.name,
-                  version: wf.version,
                   description: wf.description,
                   isDefault: Boolean(wf.is_default),
                   nodes,
@@ -507,7 +498,67 @@ export function createWorkbenchMcpServer(): McpServer {
     }
   );
 
-  // 8. Tool: workbench_advance_workflow
+  // 8. Tool: workbench_delete_workflow
+  server.tool(
+    'workbench_delete_workflow',
+    '删除指定的工作流模板。注意：系统默认工作流（default）及正被任务引用的工作流禁止删除。',
+    {
+      workflow_id: z.string().describe('待删除的工作流唯一标识（ID）'),
+    },
+    async (args) => {
+      const wf = db.getWorkflow(args.workflow_id);
+      if (!wf) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `未找到工作流: ${args.workflow_id}` }],
+        };
+      }
+      if (wf.id === DEFAULT_WORKFLOW_ID || Boolean(wf.is_default)) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: '系统默认工作流禁止删除' }],
+        };
+      }
+      if (db.isWorkflowReferenced(wf.id)) {
+        const refTasks = db.getWorkflowReferencingTasks(wf.id);
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `工作流 [${wf.id}] 正被 ${refTasks.length} 个任务引用，禁止删除！请先清理相关任务。引用任务: ${refTasks.map((t) => `${t.title} (${t.id})`).join(', ')}`,
+            },
+          ],
+        };
+      }
+      try {
+        db.deleteWorkflow(wf.id);
+        logger.info(`[WorkbenchMCP] Workflow deleted: ${wf.id}`);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: true,
+                  message: `工作流 [${wf.name || wf.id}] 已成功删除`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (e: any) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `删除工作流失败: ${e.message}` }],
+        };
+      }
+    }
+  );
+
+  // 9. Tool: workbench_advance_workflow
   server.tool(
     'workbench_advance_workflow',
     '当前正在运行的 Agent 报告本节点执行完成或失败并请求推进。后台结合连线配置统一推进，调用方无需也不得指定下一节点。',

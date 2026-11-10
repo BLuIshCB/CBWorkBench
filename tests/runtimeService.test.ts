@@ -47,12 +47,12 @@ const adapter=adapterRegistry.getAdapter('codex');
 const original=adapter.execute;
 let extra='';
 adapter.execute=async context=>{
-  assert.equal(context.timeoutMs,180000,'Legacy probe timeout must not change the internal limit');
+  assert.equal(context.timeoutMs,180000,'Probe timeout must stay fixed at 180000ms');
   const marker=context.prompt.match(/CB_VERIFY_[0-9a-f-]+/)![0];
   return {ok:true,output:marker+extra,modelUsed:context.model || 'default',durationMs:0};
 };
 try {
-  const matched=await runtimeService.probeCli({cliId:'codex',verify:true,timeoutMs:1});
+  const matched=await runtimeService.probeCli({cliId:'codex',verify:true});
   assert.equal(matched.markerMatched,true);assert.equal(matched.verified,true);
   extra=' suffix';
   assert.equal((await runtimeService.probeCli({cliId:'codex',verify:true})).verified,false);

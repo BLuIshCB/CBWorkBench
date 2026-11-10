@@ -27,9 +27,6 @@ try {
   const cssRes = await fetch(`${baseUrl}/styles.css`);
   assert.strictEqual(cssRes.status, 200);
 
-  const jsRes = await fetch(`${baseUrl}/app.js`);
-  assert.strictEqual(jsRes.status, 200);
-
   const mainModuleRes = await fetch(`${baseUrl}/js/main.js`);
   assert.strictEqual(mainModuleRes.status, 200);
   assert.ok((await mainModuleRes.text()).includes('export class App'));

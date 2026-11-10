@@ -14,7 +14,6 @@ import { runtimeService } from '../services/runtimeService.ts';
 import {
   DEFAULT_PORT,
   DEFAULT_HOST,
-  WORKER_FIXED_MODEL,
   VERIFIER_DEFAULT_MODEL,
   TaskStatus,
 } from '../config/constants.ts';
@@ -352,7 +351,6 @@ export function createHttpServer(): http.Server {
             prompt: body.prompt,
             model: body.model,
             verify: body.verify,
-            timeoutMs: body.timeoutMs,
             cwd: body.cwd,
           });
           sendJson(res, 200, { success: true, result });
@@ -405,7 +403,6 @@ export function createHttpServer(): http.Server {
           const referencingTasks = db.getWorkflowReferencingTasks(wf.id);
           return {
             id: wf.id,
-            version: wf.version,
             name: wf.name,
             description: wf.description,
             nodeCount: nodes.length,
@@ -444,9 +441,7 @@ export function createHttpServer(): http.Server {
       const workflowDetailMatch = pathname.match(/^\/api\/workflows\/([^\/]+)$/);
       if (workflowDetailMatch && method === 'GET' && pathname !== '/api/workflows/reset-default') {
         const wfId = decodeURIComponent(workflowDetailMatch[1]);
-        const versionParam = url.searchParams.get('version');
-        const version = versionParam ? parseInt(versionParam, 10) : undefined;
-        const wf = db.getWorkflow(wfId, Number.isNaN(version) ? undefined : version);
+        const wf = db.getWorkflow(wfId);
         if (!wf) {
           sendJson(res, 404, { success: false, message: `Workflow not found: ${wfId}` });
           return;
@@ -460,7 +455,6 @@ export function createHttpServer(): http.Server {
           success: true,
           workflow: {
             id: wf.id,
-            version: wf.version,
             name: wf.name,
             description: wf.description,
             isDefault: Boolean(wf.is_default),
@@ -536,6 +530,54 @@ export function createHttpServer(): http.Server {
         return;
       }
 
+      const deleteWorkflowMatch = pathname.match(/^\/api\/workflows\/([^\/]+)(\/delete)?$/);
+      if (
+        deleteWorkflowMatch &&
+        pathname !== '/api/workflows/reset-default' &&
+        (method === 'DELETE' || (method === 'POST' && pathname.endsWith('/delete')))
+      ) {
+        const wfId = decodeURIComponent(deleteWorkflowMatch[1]);
+        const wf = db.getWorkflow(wfId);
+        if (!wf) {
+          sendJson(res, 404, { success: false, message: `工作流未找到: ${wfId}` });
+          return;
+        }
+
+        if (wf.id === DEFAULT_WORKFLOW_ID || Boolean(wf.is_default)) {
+          sendJson(res, 400, {
+            success: false,
+            code: 'FORBIDDEN_DELETE_DEFAULT',
+            message: '系统默认工作流禁止删除',
+          });
+          return;
+        }
+
+        if (db.isWorkflowReferenced(wf.id)) {
+          sendJson(res, 403, {
+            success: false,
+            code: 'WORKFLOW_IN_USE',
+            message: `工作流 [${wf.id}] 当前正被任务引用，禁止删除！若需删除，请先清理相关任务。`,
+            referencingTasks: db.getWorkflowReferencingTasks(wf.id),
+          });
+          return;
+        }
+
+        try {
+          db.deleteWorkflow(wf.id);
+          logger.info(`[HttpServer] Deleted workflow ${wf.id} (${wf.name})`);
+          sendJson(res, 200, {
+            success: true,
+            message: `工作流 [${wf.name || wf.id}] 已成功删除`,
+          });
+        } catch (e: any) {
+          sendJson(res, 400, {
+            success: false,
+            message: e.message || '删除工作流失败',
+          });
+        }
+        return;
+      }
+
       // Task Workflow Progress API
       const taskWfMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/workflow$/);
       if (taskWfMatch && method === 'GET') {
@@ -594,11 +636,6 @@ export function createHttpServer(): http.Server {
 
       if (pathname === '/styles.css') {
         sendFile(res, path.join(UI_DIR, 'styles.css'), 'text/css', '/styles.css');
-        return;
-      }
-
-      if (pathname === '/app.js') {
-        sendFile(res, path.join(UI_DIR, 'app.js'), 'application/javascript', '/app.js');
         return;
       }
 

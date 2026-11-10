@@ -14,10 +14,6 @@ export const VERIFIER_DEFAULT_MODEL = 'default';
 export const DEFAULT_EXECUTION_TIMEOUT_MS = 3600000;
 export const INTERNAL_SILENCE_WARNING_MS = 300000;
 export const DEFAULT_BUDGET_MAX_ROUNDS = 10;
-export const DEFAULT_BUDGET_TIMEOUT_SECONDS = 3600; // 60 minutes
-export const DEFAULT_WORKER_TIMEOUT_MS = DEFAULT_EXECUTION_TIMEOUT_MS;
-export const DEFAULT_VERIFIER_TIMEOUT_MS = DEFAULT_EXECUTION_TIMEOUT_MS;
-export const DEFAULT_TEST_TIMEOUT_MS = DEFAULT_EXECUTION_TIMEOUT_MS;
 
 function resolveRootDir(): string {
   if (process.env.CB_ROOT_DIR) return path.resolve(process.env.CB_ROOT_DIR);
@@ -60,7 +56,3 @@ export const RoundStage = {
   HUMAN_REVIEW: 'human_review',       // 人工审核门禁
 } as const;
 export type RoundStage = (typeof RoundStage)[keyof typeof RoundStage];
-
-for (const key of ['CB_WORKER_TIMEOUT_MS', 'CB_VERIFIER_TIMEOUT_MS', 'CB_TEST_TIMEOUT_MS', 'CB_BUDGET_TIMEOUT_SECONDS']) {
-  if (process.env[key]) console.warn(`[Deprecated] ${key} 已停用，请使用任务单次执行时限。`);
-}

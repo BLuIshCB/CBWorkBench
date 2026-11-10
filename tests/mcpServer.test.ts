@@ -19,7 +19,7 @@ try {
   const toolsResult = await client.listTools();
   const toolNames = toolsResult.tools.map((t) => t.name);
 
-  assert.strictEqual(toolNames.length, 8);
+  assert.strictEqual(toolNames.length, 9);
   assert.ok(toolNames.includes('workbench_submit_task'));
   assert.ok(toolNames.includes('workbench_revise_task'));
   assert.ok(toolNames.includes('workbench_get_task_status'));
@@ -27,6 +27,7 @@ try {
   assert.ok(toolNames.includes('workbench_delete_task'));
   assert.ok(toolNames.includes('workbench_list_workflows'));
   assert.ok(toolNames.includes('workbench_get_workflow'));
+  assert.ok(toolNames.includes('workbench_delete_workflow'));
   assert.ok(toolNames.includes('workbench_advance_workflow'));
 
   // Strict Gate check: MCP MUST NOT have start or approve tools
@@ -42,6 +43,7 @@ try {
   assert.strictEqual(listWfData.success, true);
   assert(listWfData.workflows.length >= 1);
   assert.strictEqual(listWfData.workflows[0].id, 'default');
+  assert.strictEqual('version' in listWfData.workflows[0], false);
 
   const getWfRes = await client.callTool({
     name: 'workbench_get_workflow',
@@ -50,6 +52,7 @@ try {
   const getWfData = JSON.parse((getWfRes.content as any)[0].text);
   assert.strictEqual(getWfData.success, true);
   assert.strictEqual(getWfData.workflow.id, 'default');
+  assert.strictEqual('version' in getWfData.workflow, false);
   assert(Array.isArray(getWfData.workflow.nodes));
   assert.strictEqual(getWfData.workflow.nodes.length, 6);
 
@@ -82,6 +85,7 @@ try {
   assert.strictEqual(submitData.success, true);
   assert.strictEqual(submitData.status, TaskStatus.PENDING_CONFIRM);
   assert.strictEqual(submitData.workflowId, 'default');
+  assert.strictEqual('workflowVersion' in submitData, false);
   assert.strictEqual(submitData.revision, 1);
   const taskId = submitData.taskId;
   assert.ok(taskId);
@@ -95,6 +99,7 @@ try {
   assert.strictEqual(statusData.taskId, taskId);
   assert.strictEqual(statusData.status, TaskStatus.PENDING_CONFIRM);
   assert.strictEqual(statusData.workflowId, 'default');
+  assert.strictEqual('workflowVersion' in statusData, false);
   assert.strictEqual(statusData.currentNodeId, 'start');
   assert.strictEqual(statusData.currentNodeExecutionCount, 0);
 
@@ -181,6 +186,35 @@ try {
   const deleteData = JSON.parse((deleteRes.content as any)[0].text);
   assert.strictEqual(deleteData.success, true);
   assert.strictEqual(deleteData.taskId, taskId);
+
+  // 9. Delete workflow via MCP
+  // 9.1 Deleting default workflow fails
+  const delDefRes = await client.callTool({
+    name: 'workbench_delete_workflow',
+    arguments: { workflow_id: 'default' },
+  });
+  assert.strictEqual(delDefRes.isError, true);
+  assert((delDefRes.content as any)[0].text.includes('系统默认工作流禁止删除'));
+
+  // 9.2 Deleting custom workflow succeeds
+  db.saveWorkflowDefinition({
+    id: 'mcp-test-wf',
+    name: 'MCP测试工作流',
+    nodes_json: JSON.stringify([
+      { id: 'start', name: '开始', type: 'start', on_success: 'end' },
+      { id: 'end', name: '结束', type: 'end' },
+    ]),
+  });
+  assert.ok(db.getWorkflow('mcp-test-wf'));
+
+  const delCustomRes = await client.callTool({
+    name: 'workbench_delete_workflow',
+    arguments: { workflow_id: 'mcp-test-wf' },
+  });
+  assert.strictEqual(delCustomRes.isError, undefined);
+  const delCustomData = JSON.parse((delCustomRes.content as any)[0].text);
+  assert.strictEqual(delCustomData.success, true);
+  assert.strictEqual(db.getWorkflow('mcp-test-wf'), null);
 
   console.log('✅ mcpServer.test.ts passed successfully!');
 } finally {

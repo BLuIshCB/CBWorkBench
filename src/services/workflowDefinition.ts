@@ -21,7 +21,6 @@ export interface WorkflowNode {
 
 export interface WorkflowDefinition {
   id: string;
-  version: number;
   name: string;
   description?: string | null;
   nodes: WorkflowNode[];

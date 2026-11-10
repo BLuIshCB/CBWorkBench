@@ -36,12 +36,6 @@ const workbenchCliConfigsSchema = z.object({
  * 解析 CB_AGENT_CLI_CONFIG 独立配置文件
  */
 export function resolveAgentCliConfigs(): WorkbenchCliConfigs {
-  if (process.env.CB_WORKBUDDY_MCP_CONFIG || process.env.CB_WORKBUDDY_BACKEND) {
-    throw new Error(
-      '检测到已废弃的配置项 CB_WORKBUDDY_MCP_CONFIG / CB_WORKBUDDY_BACKEND。当前工作台已全面采用 Direct CLI 任务分发，请迁移至 CB_AGENT_CLI_CONFIG 独立配置。'
-    );
-  }
-
   const localConfig = path.join(ROOT_DIR, 'data', 'agent-cli.json');
   const configFile = process.env.CB_AGENT_CLI_CONFIG || (fs.existsSync(localConfig) ? localConfig : undefined);
   if (configFile) {

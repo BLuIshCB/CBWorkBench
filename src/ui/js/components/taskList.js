@@ -2,7 +2,7 @@
  * CBWorkBench 任务列表视图组件
  */
 
-import { escapeHtml, formatStatus, formatTime } from '../utils.js';
+import { escapeHtml, formatStatus, formatTime, formatExecutor } from '../utils.js';
 import { api } from '../api.js';
 import { store } from '../store.js';
 
@@ -33,7 +33,8 @@ export const TaskList = {
         const cwdDisplay = t.confirmed_cwd || t.target_cwd;
         const commitText = t.git_commit ? `Git: ${t.git_commit}` : 'No Git';
         const roundText = t.current_round > 0 ? `第 ${t.current_round} 轮` : '尚未开始';
-        const workerText = `${t.worker_executor || 'workbuddy'}:${t.worker_model || 'deepseek-v4-flash'}`;
+        const workerExecutor = formatExecutor(t.worker_executor);
+        const workerText = `${workerExecutor}:${t.worker_model || 'deepseek-v4-flash'}`;
         const wfText = t.workflow_id ? `${t.workflow_id}` : 'default';
         const nodeText = t.current_node_id ? `节点: ${t.current_node_id}` : '就绪';
         const updatedTime = formatTime(t.updated_at);

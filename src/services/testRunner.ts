@@ -3,7 +3,7 @@ import { CliRunner } from './cliRunner.ts';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
-import { DEFAULT_TEST_TIMEOUT_MS } from '../config/constants.ts';
+import { DEFAULT_EXECUTION_TIMEOUT_MS } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
 
 export interface TestCaseItem {
@@ -120,7 +120,7 @@ export class TestRunner {
   static async runSingleTest(
     tc: TestCaseItem,
     workspaceDir: string,
-    timeoutMs: number = DEFAULT_TEST_TIMEOUT_MS,
+    timeoutMs: number = DEFAULT_EXECUTION_TIMEOUT_MS,
     options?: { taskId: string; roundId?: number; signal?: AbortSignal }
   ): Promise<SingleTestResult> {
     const runCwd = tc.cwd ? path.resolve(workspaceDir, tc.cwd) : workspaceDir;
@@ -146,7 +146,7 @@ export class TestRunner {
   static async runAllTests(
     testCases: TestCaseItem[],
     workspaceDir: string,
-    timeoutMs: number = DEFAULT_TEST_TIMEOUT_MS,
+    timeoutMs: number = DEFAULT_EXECUTION_TIMEOUT_MS,
     options?: { taskId: string; roundId?: number; signal?: AbortSignal }
   ): Promise<AggregateTestResult> {
     if (testCases.length === 0) {

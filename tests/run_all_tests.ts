@@ -19,7 +19,7 @@ const testSuites = [
   'codexModelsApi.test.ts',
   'codexDiscovery.test.ts',
   'workbuddyRegression.test.ts',
-  'workbuddyClient.test.ts',
+  'workbuddyAdapter.test.ts',
   'runtimeService.test.ts',
   'httpServer.test.ts',
   'mcpServer.test.ts',
