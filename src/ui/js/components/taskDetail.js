@@ -2,7 +2,7 @@
  * CBWorkBench 任务详情视图组件 (cb.task-package/2.0 统一节点材料视图)
  */
 
-import { escapeHtml, formatStatus, formatStage, renderMarkdown, formatExecutor } from '../utils.js';
+import { escapeHtml, formatStatus, renderMarkdown, formatExecutor } from '../utils.js';
 import { populateModelPicker, updateModelPicker, getModelValue } from './modelPicker.js';
 
 export const TaskDetail = {
@@ -136,10 +136,7 @@ export const TaskDetail = {
     const gitStatus = document.getElementById('git-status');
     if (gitStatus) gitStatus.textContent = task.git_status || 'Clean';
 
-    // 8. Rounds & Evidence Timeline
-    this.renderRoundsTimeline(rounds, testRuns, acceptanceRuns, data.workflowNodeRuns || []);
-
-    // 9. Uniform Node Materials Reader
+    // 8. Uniform Node Materials Reader (Default Main View)
     this.renderMaterialsTabs(
       { task, latestRevision, manifest, packageFiles: packageFiles || [] },
       currentMaterialSubtab || 'manifest',
@@ -516,16 +513,30 @@ export const TaskDetail = {
               ⏱️ 本节点执行记录 (${nodeRuns.length} 次)
             </label>
             ${nodeRuns.length > 0 ? `
-              <div style="display: flex; flex-direction: column; gap: 6px; max-height: 160px; overflow-y: auto;">
-                ${nodeRuns.slice().reverse().map((nr) => `
-                  <div style="padding: 6px 10px; border: 1px solid var(--surface-border); border-radius: 6px; background: #ffffff; font-size: 11px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                      <span><strong>#${nr.execution_index}</strong> (R${nr.round_number})</span>
+              <div style="display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto;">
+                ${nodeRuns.slice().reverse().map((nr) => {
+                  let durationStr = '--';
+                  if (nr.finished_at && nr.created_at) {
+                    const ms = Math.max(0, nr.finished_at - nr.created_at);
+                    durationStr = (ms / 1000).toFixed(1) + 's';
+                  }
+                  const finishTimeStr = nr.finished_at
+                    ? new Date(nr.finished_at).toLocaleTimeString()
+                    : (nr.created_at ? new Date(nr.created_at).toLocaleTimeString() + ' (推进中)' : '--');
+                  return `
+                  <div style="padding: 8px 10px; border: 1px solid var(--surface-border); border-radius: 6px; background: #ffffff; font-size: 11px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                      <span><strong>#${nr.execution_index}</strong> (第 ${nr.round_number} 轮)</span>
                       <span class="badge ${nr.status === 'passed' ? 'badge-completed' : nr.status === 'failed' ? 'badge-blocked' : 'badge-running'}">${nr.status}</span>
                     </div>
-                    ${nr.result_summary ? `<div style="color: var(--text-muted); margin-top: 2px;">${escapeHtml(nr.result_summary)}</div>` : ''}
+                    <div style="display: flex; gap: 12px; color: var(--text-muted); font-size: 11px; margin-bottom: 2px;">
+                      <span>⏱️ 耗时: <b style="color: #0f172a;">${durationStr}</b></span>
+                      <span>💬 完成时间: <b style="color: #0f172a;">${finishTimeStr}</b></span>
+                    </div>
+                    ${nr.result_summary ? `<div style="color: var(--text-main); font-size: 11px; line-height: 1.4; margin-top: 2px;">${escapeHtml(nr.result_summary)}</div>` : ''}
                   </div>
-                `).join('')}
+                `;
+                }).join('')}
               </div>
             ` : `
               <div style="font-size: 12px; color: var(--text-muted);">本节点尚未执行</div>
@@ -550,171 +561,6 @@ export const TaskDetail = {
     if (!node || node.execution_mode === 'manual' || node.type !== 'task') return;
     const adapter = (availableAdapters || []).find((a) => a.id === (node.executor || 'workbuddy')) || availableAdapters?.[0];
     populateModelPicker('task-node-model-select', adapter, node.model);
-  },
-
-  renderRoundsTimeline(rounds, testRuns, acceptanceRuns, nodeRuns) {
-    const container = document.getElementById('rounds-timeline');
-    if (!container) return;
-
-    if ((!rounds || rounds.length === 0) && (!nodeRuns || nodeRuns.length === 0)) {
-      container.innerHTML = '<div style="color: var(--text-muted); padding: 30px; text-align: center;">任务尚未产生执行轮次记录。</div>';
-      return;
-    }
-
-    const grouped = {};
-    for (const r of rounds || []) {
-      if (!grouped[r.round_number]) grouped[r.round_number] = [];
-      grouped[r.round_number].push(r);
-    }
-
-    const roundNumbers = Object.keys(grouped).sort((a, b) => Number(b) - Number(a));
-
-    const nodeRunsSummaryHtml = (nodeRuns && nodeRuns.length > 0) ? `
-      <div class="card" style="margin-bottom: 18px;">
-        <h4 style="font-size: 14px; margin-bottom: 10px; color: #0f172a;">节点执行尝试记录 (${nodeRuns.length} 次)</h4>
-        <div style="display: flex; flex-direction: column; gap: 8px;">
-          ${nodeRuns.slice().reverse().map((nr) => `
-            <div style="padding: 8px 12px; border: 1px solid var(--surface-border); border-radius: 6px; background: #f8fafc; font-size: 12px;">
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-                <div>
-                  <strong>${escapeHtml(nr.node_id)}</strong>
-                  <span style="color: var(--text-muted); margin-left: 6px;">#${nr.execution_index} (attempt: <code>${escapeHtml(nr.run_id.slice(0, 14))}</code>)</span>
-                </div>
-                <span class="badge ${nr.status === 'passed' ? 'badge-completed' : nr.status === 'failed' || nr.status === 'blocked' ? 'badge-blocked' : 'badge-running'}">${nr.status}</span>
-              </div>
-              ${nr.result_summary ? `<div style="color: var(--text-main);">${escapeHtml(nr.result_summary)}</div>` : ''}
-            </div>
-          `).join('')}
-        </div>
-      </div>
-    ` : '';
-
-    container.innerHTML = nodeRunsSummaryHtml + roundNumbers
-      .map((rn) => {
-        const roundRounds = grouped[rn];
-        const roundTests = (testRuns || []).filter((t) => t.round_number === Number(rn));
-        const roundAcceptance = (acceptanceRuns || []).find((a) => a.round_number === Number(rn));
-
-        return `
-        <div class="card round-card" style="margin-bottom: 20px;">
-          <div class="round-card-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--surface-border); padding-bottom: 10px; margin-bottom: 14px;">
-            <div style="display: flex; align-items: center; gap: 10px;">
-              <h4 style="font-size: 15px; color: #0f172a;">第 ${rn} 轮执行与模型调试</h4>
-              <span class="dbg-pill" style="color: #2563eb; border-color: #bfdbfe; background: #eff6ff;">
-                Stage: ${formatStage(roundRounds[roundRounds.length - 1]?.stage)}
-              </span>
-            </div>
-            <span style="font-size: 12px; color: var(--text-muted);">${new Date(roundRounds[0].started_at).toLocaleTimeString()}</span>
-          </div>
-
-          <div style="display: flex; flex-direction: column; gap: 12px;">
-            ${roundRounds
-              .map(
-                (r, idx) => {
-                  const roundDomId = `round-${rn}-step-${idx}`;
-                  const durationSec = r.duration_ms ? (r.duration_ms / 1000).toFixed(1) + 's' : (r.finished_at && r.started_at ? ((r.finished_at - r.started_at) / 1000).toFixed(1) + 's' : '--');
-                  const rawAdapter = r.adapter_id || r.worker_id;
-                  const displayAdapter = formatExecutor(rawAdapter);
-                  const adapterLabel = r.adapter_id ? `${displayAdapter} (${r.model_name || 'default'})` : displayAdapter;
-
-                  return `
-              <div style="background: var(--surface-hover); padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border);">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                  <div style="display: flex; align-items: center; gap: 8px;">
-                    <span style="font-weight: 600; color: var(--primary); font-size: 13px;">${formatStage(r.stage)}</span>
-                    <span class="dbg-pill" style="color: var(--purple); background: rgba(124, 58, 237, 0.1);">
-                      ${escapeHtml(adapterLabel)}
-                    </span>
-                    <span style="font-size: 11px; color: var(--text-muted);">耗时: ${durationSec}</span>
-                  </div>
-                  <div style="display: flex; gap: 6px; align-items: center;">
-                    <span class="badge ${r.status === 'passed' ? 'badge-completed' : r.status === 'failed' ? 'badge-blocked' : 'badge-running'}">${r.status}</span>
-                  </div>
-                </div>
-
-                <div style="display: flex; gap: 8px; margin-bottom: 8px;">
-                  ${r.input_prompt ? `
-                    <button class="dbg-btn" onclick="window.app.toggleDrawer('${roundDomId}-prompt')">🔍 查看 Prompt 输入</button>
-                    <button class="dbg-btn" onclick="window.app.copyToClipboard('${roundDomId}-prompt-content')">📋 复制 Prompt</button>
-                  ` : ''}
-                  ${r.output_text ? `
-                    <button class="dbg-btn" onclick="window.app.toggleDrawer('${roundDomId}-output')">📜 查看模型响应 Output</button>
-                    <button class="dbg-btn" onclick="window.app.copyToClipboard('${roundDomId}-output-content')">📋 复制 Response</button>
-                  ` : ''}
-                </div>
-
-                ${r.input_prompt ? `
-                  <div id="${roundDomId}-prompt" class="dbg-drawer" style="display: none;">
-                    <div style="font-size: 11px; color: #79c0ff; margin-bottom: 4px; font-weight: 600;">模型完整输入提示词 (Prompt)：</div>
-                    <pre id="${roundDomId}-prompt-content" class="code-block" style="font-size: 11px; max-height: 260px; overflow-y: auto; white-space: pre-wrap;">${escapeHtml(r.input_prompt)}</pre>
-                  </div>
-                ` : ''}
-
-                ${r.output_text ? `
-                  <div id="${roundDomId}-output" class="dbg-drawer" style="display: block;">
-                    <div style="font-size: 11px; color: #56d364; margin-bottom: 4px; font-weight: 600;">模型输出与执行日志：</div>
-                    <pre id="${roundDomId}-output-content" class="code-block" style="font-size: 11px; max-height: 220px; overflow-y: auto; white-space: pre-wrap;">${escapeHtml(r.output_text)}</pre>
-                  </div>
-                ` : ''}
-
-                ${r.error_message ? `<div style="color: #dc2626; font-size: 12px; margin-top: 6px; padding: 6px 10px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px;">❌ 错误信息：${escapeHtml(r.error_message)}</div>` : ''}
-              </div>
-            `;
-                }
-              )
-              .join('')}
-
-            ${
-              roundTests.length > 0
-                ? `
-              <div style="background: var(--surface-hover); padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border);">
-                <div style="font-weight: 600; color: var(--primary); margin-bottom: 8px; font-size: 13px;">独立命令执行结果：</div>
-                ${roundTests
-                  .map(
-                    (t) => `
-                  <div style="font-size: 12px; margin-bottom: 6px; padding: 6px 10px; background: #ffffff; border: 1px solid var(--surface-border); border-radius: 4px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                      <div>
-                        <span style="color: ${t.passed ? 'var(--success)' : 'var(--danger)'}; font-weight: bold;">[${t.passed ? 'PASS' : 'FAIL'}]</span>
-                        <code style="margin-left: 6px;">${escapeHtml(t.command)}</code>
-                      </div>
-                      <span style="color: var(--text-muted); font-size: 11px;">Exit: ${t.exit_code}</span>
-                    </div>
-                    ${t.stderr && !t.passed ? `<pre style="color: var(--danger); font-size: 11px; background: #fee2e2; padding: 6px; margin-top: 4px; border-radius: 4px; overflow-x: auto;">${escapeHtml(t.stderr)}</pre>` : ''}
-                    ${t.stdout && !t.passed ? `<pre style="color: var(--text-muted); font-size: 11px; padding: 4px; margin-top: 2px; overflow-x: auto;">${escapeHtml(t.stdout)}</pre>` : ''}
-                  </div>
-                `
-                  )
-                  .join('')}
-              </div>
-            `
-                : ''
-            }
-
-            ${
-              roundAcceptance
-                ? `
-              <div style="background: var(--surface-hover); padding: 12px 16px; border-radius: 6px; border: 1px solid var(--surface-border); border-left: 4px solid var(--primary);">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                  <span style="font-weight: 600; color: var(--primary); font-size: 13px;">Reviewer 自动验收评估报告：</span>
-                  <span class="badge ${roundAcceptance.decision === 'passed' ? 'badge-completed' : roundAcceptance.decision === 'needs_changes' ? 'badge-pending_confirm' : 'badge-blocked'}">${roundAcceptance.decision}</span>
-                </div>
-                <div style="font-size: 13px; color: var(--text-main); margin-bottom: 8px; line-height: 1.5;">${escapeHtml(roundAcceptance.summary)}</div>
-                ${roundAcceptance.issues_json && roundAcceptance.issues_json !== '[]' ? `
-                  <div style="margin-top: 8px; padding: 8px 10px; background: #fee2e2; border: 1px solid #fecaca; border-radius: 4px;">
-                    <div style="color: #991b1b; font-weight: 600; font-size: 12px; margin-bottom: 4px;">待修复 Issues 清单：</div>
-                    <pre style="color: #dc2626; font-size: 11px; white-space: pre-wrap;">${escapeHtml(roundAcceptance.issues_json)}</pre>
-                  </div>
-                ` : ''}
-              </div>
-            `
-                : ''
-            }
-          </div>
-        </div>
-      `;
-      })
-      .join('');
   },
 
   renderMaterialsTabs(materialsData, activeSubtab, activeResourcePath) {

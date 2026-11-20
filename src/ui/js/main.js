@@ -77,6 +77,9 @@ export class App {
     const viewDetail = document.getElementById('view-task-details');
     if (viewDetail) viewDetail.style.display = 'block';
 
+    const currentTab = store.getState().activeDetailTab;
+    this.setDetailTab(currentTab === 'rounds' ? 'materials' : (currentTab || 'materials'));
+
     await this.fetchTaskDetail(taskId, false);
   }
 
@@ -175,13 +178,14 @@ export class App {
   }
 
   setDetailTab(tabName) {
-    store.setState({ activeDetailTab: tabName });
+    const effectiveTab = (!tabName || tabName === 'rounds') ? 'materials' : tabName;
+    store.setState({ activeDetailTab: effectiveTab });
     document.querySelectorAll('.detail-tabs .dtab-btn').forEach((btn) => {
-      const match = btn.getAttribute('onclick')?.includes(tabName);
+      const match = btn.getAttribute('onclick')?.includes(`'${effectiveTab}'`);
       btn.classList.toggle('active', !!match);
     });
     document.querySelectorAll('.dtab-content').forEach((content) => {
-      content.classList.toggle('active', content.id === `dtab-${tabName}`);
+      content.classList.toggle('active', content.id === `dtab-${effectiveTab}`);
     });
   }
 

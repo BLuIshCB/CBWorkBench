@@ -1122,7 +1122,7 @@ body {
   margin: 20px 0;
 }
 
-/* Debugger Tooling Styles */
+/* Debugger Tooling Styles (Deprecated) */
 .dbg-pill {
   display: inline-flex;
   align-items: center;
@@ -1134,40 +1134,6 @@ body {
   border: 1px solid var(--surface-border);
   background: #f8fafc;
   color: #334155;
-}
-
-.dbg-btn {
-  background: #ffffff;
-  border: 1px solid #cbd5e1;
-  color: #334155;
-  border-radius: 4px;
-  padding: 4px 10px;
-  font-size: 11px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.dbg-btn:hover {
-  background: #f1f5f9;
-  border-color: #94a3b8;
-  color: #0f172a;
-}
-
-.dbg-drawer {
-  margin-top: 8px;
-  padding: 12px 14px;
-  background: #0f172a;
-  border: 1px solid #334155;
-  border-radius: 6px;
-}
-
-.dbg-drawer .code-block {
-  color: #e2e8f0;
-  font-family: var(--font-mono);
-  background: transparent;
-  padding: 0;
-  border: none;
 }
 
 /* Navbar Navigation Menu */
@@ -1778,31 +1744,64 @@ body {
   font-weight: bold;
 }
 
-/* Execution Live Panel */
-#execution-live-panel {
+/* Live Execution Progress Card (Streamlined, Non-CLI) */
+.live-progress-card {
   border-left: 4px solid var(--primary);
   background: #ffffff;
+  padding: 16px 20px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
 }
 
-#execution-live-status {
-  font-size: 13px;
-  color: #475569;
-  margin-bottom: 10px;
+.live-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.live-progress-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.live-executor-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.live-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.live-metric-item {
+  background: #f8fafc;
+  border: 1px solid var(--surface-border);
+  padding: 10px 14px;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.live-metric-label {
+  font-size: 11px;
+  color: var(--text-muted);
   font-weight: 500;
 }
 
-#execution-live-logs {
-  background: #0f172a;
-  color: #f1f5f9;
-  padding: 14px;
-  border-radius: 6px;
+.live-metric-val {
+  font-size: 14px;
+  font-weight: 600;
+  color: #0f172a;
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.5;
-  max-height: 400px;
-  overflow: auto;
-  white-space: pre-wrap;
-  border: 1px solid #1e293b;
 }
 
 /* Helper / Utility Classes */

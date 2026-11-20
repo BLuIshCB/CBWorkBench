@@ -169,22 +169,14 @@
         </div>
       </div>
 
-      <!-- Tab Navigation for Detail Content (Diff Tab removed for streamlined UI) -->
+      <!-- Tab Navigation for Detail Content -->
       <div class="detail-tabs">
-        <button class="dtab-btn active" onclick="app.setDetailTab('rounds')">轮次与模型调试 (Debugger)</button>
-        <button class="dtab-btn" onclick="app.setDetailTab('materials')">冻结任务材料阅读</button>
+        <button class="dtab-btn active" onclick="app.setDetailTab('materials')">冻结任务材料阅读</button>
         <button class="dtab-btn" onclick="app.setDetailTab('workspace')">工作区基准与代码状态</button>
       </div>
 
-      <!-- Tab Content 1: Rounds & Model Debugger -->
-      <div id="dtab-rounds" class="dtab-content active">
-        <div id="rounds-timeline" class="rounds-container">
-          <!-- Dynamically filled with debugger cards -->
-        </div>
-      </div>
-
-      <!-- Tab Content 2: Task Materials (Markdown Reading View) -->
-      <div id="dtab-materials" class="dtab-content">
+      <!-- Tab Content 1: Task Materials (Markdown Reading View) -->
+      <div id="dtab-materials" class="dtab-content active">
         <div class="card">
           <div class="material-subtabs" id="material-subtabs" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid var(--surface-border); padding-bottom: 10px;">
             <!-- Dynamic tabs injected by TaskDetail -->
