@@ -19,83 +19,57 @@ await server.connect(serverTransport);
 const client = new Client({ name: 'test-client', version: '1.0' }, { capabilities: {} });
 await client.connect(clientTransport);
 
-function sha256Buf(buf: Buffer): string {
-  return crypto.createHash('sha256').update(buf).digest('hex');
-}
-
 function buildLocalPackage(opts: {
   dir: string;
   taskKey: string;
   revision: number;
   title: string;
   workflowId: string;
-  workflowSha: string;
   nodes: any[];
   sharedText?: string;
 }) {
-  const files: any[] = [];
-  const manifestNodes: any[] = [];
-
-  const sharedPath = 'shared/resources/requirements.md';
-  fs.mkdirSync(path.join(opts.dir, 'shared', 'resources'), { recursive: true });
-  const sharedBuf = Buffer.from(opts.sharedText || '# Shared Requirements\nREQ-001\n', 'utf8');
-  fs.writeFileSync(path.join(opts.dir, sharedPath), sharedBuf);
-  files.push({
-    path: sharedPath,
-    owner: { scope: 'shared' },
-    media_type: 'text/markdown',
-    size_bytes: sharedBuf.length,
-    sha256: sha256Buf(sharedBuf),
-  });
+  fs.mkdirSync(opts.dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(opts.dir, 'requirements.md'),
+    opts.sharedText || '# Shared Requirements\nREQ-001\n',
+    'utf8'
+  );
+  fs.writeFileSync(
+    path.join(opts.dir, 'development.md'),
+    '# Development Guidelines\n',
+    'utf8'
+  );
 
   for (const n of opts.nodes) {
     if (n.type !== 'task') continue;
-    const nodeDir = n.dir_name || n.id;
-    const nodeRef = `nodes/${nodeDir}/node.md`;
-    const promptRef = `nodes/${nodeDir}/prompt.md`;
-    const resRef = `nodes/${nodeDir}/resources/notes.md`;
-    fs.mkdirSync(path.join(opts.dir, 'nodes', nodeDir, 'resources'), { recursive: true });
+    const nodeDir = path.join(opts.dir, 'nodes', n.id);
+    const nodeResDir = path.join(nodeDir, 'resources');
+    fs.mkdirSync(nodeResDir, { recursive: true });
 
-    const nodeBuf = Buffer.from(`# Node ${n.id} (rev ${opts.revision})\n`, 'utf8');
-    const promptBuf = Buffer.from(`Prompt for ${n.id} (rev ${opts.revision})\n`, 'utf8');
-    const resBuf = Buffer.from(`Private resource for ${n.id}\n`, 'utf8');
-
-    fs.writeFileSync(path.join(opts.dir, nodeRef), nodeBuf);
-    fs.writeFileSync(path.join(opts.dir, promptRef), promptBuf);
-    fs.writeFileSync(path.join(opts.dir, resRef), resBuf);
-
-    files.push(
-      { path: nodeRef, owner: { scope: 'node', node_id: n.id }, media_type: 'text/markdown', size_bytes: nodeBuf.length, sha256: sha256Buf(nodeBuf) },
-      { path: promptRef, owner: { scope: 'node', node_id: n.id }, media_type: 'text/markdown', size_bytes: promptBuf.length, sha256: sha256Buf(promptBuf) },
-      { path: resRef, owner: { scope: 'node', node_id: n.id }, media_type: 'text/markdown', size_bytes: resBuf.length, sha256: sha256Buf(resBuf) }
+    fs.writeFileSync(
+      path.join(nodeDir, 'work.md'),
+      `# Work for ${n.id} (rev ${opts.revision})\n`,
+      'utf8'
     );
-
-    manifestNodes.push({
-      node_id: n.id,
-      node_ref: nodeRef,
-      prompt_ref: promptRef,
-      resources: [{ id: 'notes', path: resRef, description: '节点附属说明' }],
-      shared_refs: [sharedPath],
-      input_bindings: [],
-      output_contract: { required_outputs: ['result'], optional_outputs: [] },
-    });
+    fs.writeFileSync(
+      path.join(nodeDir, 'prompt.md'),
+      `Prompt for ${n.id} (rev ${opts.revision})\n`,
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(nodeResDir, 'notes.md'),
+      `Private resource for ${n.id}\n`,
+      'utf8'
+    );
   }
 
   const manifest = {
-    protocol_version: 'cb.task-package/2.0',
-    task_key: opts.taskKey,
-    revision: opts.revision,
     title: opts.title,
+    workflow_id: opts.workflowId,
     target_cwd: process.cwd(),
-    workflow: { id: opts.workflowId, definition_sha256: opts.workflowSha },
-    readiness: 'ready',
-    blockers: [],
-    nodes: manifestNodes,
-    files,
+    task_key: opts.taskKey,
   };
-  const mBuf = Buffer.from(JSON.stringify(manifest, null, 2), 'utf8');
-  fs.writeFileSync(path.join(opts.dir, 'manifest.json'), mBuf);
-  return { manifest, manifestSha: sha256Buf(mBuf) };
+  fs.writeFileSync(path.join(opts.dir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
 }
 
 const tmpPkgRoot1 = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-mcp-pkg1-'));
@@ -106,13 +80,12 @@ try {
   const toolsResult = await client.listTools();
   const toolNames = toolsResult.tools.map((t) => t.name);
 
-  assert.strictEqual(toolNames.length, 12);
+  assert.strictEqual(toolNames.length, 11);
   assert.ok(toolNames.includes('workbench_get_package_protocol'));
   assert.ok(toolNames.includes('workbench_list_workflows'));
   assert.ok(toolNames.includes('workbench_get_workflow'));
   assert.ok(toolNames.includes('workbench_delete_workflow'));
-  assert.ok(toolNames.includes('workbench_stage_package'));
-  assert.ok(toolNames.includes('workbench_finalize_package'));
+  assert.ok(toolNames.includes('workbench_submit_task'));
   assert.ok(toolNames.includes('workbench_get_package'));
   assert.ok(toolNames.includes('workbench_get_node_context'));
   assert.ok(toolNames.includes('workbench_get_task_status'));
@@ -121,7 +94,8 @@ try {
   assert.ok(toolNames.includes('workbench_advance_workflow'));
 
   // Deprecated tools MUST be gone
-  assert.strictEqual(toolNames.includes('workbench_submit_task'), false);
+  assert.strictEqual(toolNames.includes('workbench_stage_package'), false);
+  assert.strictEqual(toolNames.includes('workbench_finalize_package'), false);
   assert.strictEqual(toolNames.includes('workbench_revise_task'), false);
   assert.strictEqual(toolNames.includes('workbench_upload_package_resource'), false);
 
@@ -138,7 +112,7 @@ try {
   assert.ok(protoData.instance.instance_id);
   assert.ok(path.isAbsolute(protoData.instance.data_dir));
 
-  // 3. Query workflows via MCP (no version field, has definition_sha256 & material_contract)
+  // 3. Query workflows via MCP
   const listWfRes = await client.callTool({ name: 'workbench_list_workflows', arguments: {} });
   const listWfData = JSON.parse((listWfRes.content as any)[0].text);
   assert.strictEqual(listWfData.success, true);
@@ -159,70 +133,34 @@ try {
   assert.ok(devNode.material_contract);
   assert.strictEqual(devNode.material_contract.node_dir, 'nodes/development');
 
-  // 4. Stage + Validate + Finalize local_path package
-  const built1 = buildLocalPackage({
+  // 4. Submit minimal package via workbench_submit_task
+  buildLocalPackage({
     dir: tmpPkgRoot1,
     taskKey: 'mcp-test-task',
     revision: 1,
-    title: 'MCP Unit Test Task v2',
+    title: 'MCP Unit Test Task MVP',
     workflowId: 'default',
-    workflowSha: getWfData.workflow.definition_sha256,
     nodes: getWfData.workflow.nodes,
   });
 
-  const stageRes = await client.callTool({
-    name: 'workbench_stage_package',
+  const submitRes = await client.callTool({
+    name: 'workbench_submit_task',
     arguments: {
-      protocol_version: 'cb.task-package/2.0',
-      operation: 'create',
-      idempotency_key: `mcp-stage-1:${built1.manifestSha}`,
-      source: {
-        mode: 'local_path',
-        package_root: tmpPkgRoot1,
-        manifest_path: 'manifest.json',
-        manifest_sha256: built1.manifestSha,
-      },
+      package_root: tmpPkgRoot1,
     },
   });
-  assert.strictEqual(Boolean(stageRes.isError), false);
-  const stageData = JSON.parse((stageRes.content as any)[0].text);
-  assert.strictEqual(stageData.ok, true);
-  assert.strictEqual(stageData.status, 'staging');
-  const draftId1 = stageData.draft_id;
-  const taskId = stageData.task_id;
-  assert.strictEqual(db.getTask(taskId), null, 'Staging must not create a startable task row');
+  assert.strictEqual(Boolean(submitRes.isError), false);
+  const submitData = JSON.parse((submitRes.content as any)[0].text);
+  assert.strictEqual(submitData.ok, true);
+  assert.strictEqual(submitData.revision, 1);
+  assert.strictEqual(submitData.status, TaskStatus.PENDING_CONFIRM);
+  const taskId = submitData.task_id;
+  assert.ok(taskId);
+  assert.ok(submitData.web_url);
 
-  // Validate only
-  const valOnlyRes = await client.callTool({
-    name: 'workbench_finalize_package',
-    arguments: {
-      draft_id: draftId1,
-      manifest_sha256: built1.manifestSha,
-      idempotency_key: `mcp-fin-1:${built1.manifestSha}`,
-      validate_only: true,
-    },
-  });
-  const valOnlyData = JSON.parse((valOnlyRes.content as any)[0].text);
-  assert.strictEqual(valOnlyData.ok, true);
-  assert.strictEqual(valOnlyData.validate_only, true);
-  assert.strictEqual(db.getTask(taskId), null, 'validate_only must have no side effects');
-
-  // Finalize
-  const finRes = await client.callTool({
-    name: 'workbench_finalize_package',
-    arguments: {
-      draft_id: draftId1,
-      manifest_sha256: built1.manifestSha,
-      idempotency_key: `mcp-fin-1:${built1.manifestSha}`,
-    },
-  });
-  assert.strictEqual(Boolean(finRes.isError), false);
-  const finData = JSON.parse((finRes.content as any)[0].text);
-  assert.strictEqual(finData.ok, true);
-  assert.strictEqual(finData.task_id, taskId);
-  assert.strictEqual(finData.revision, 1);
-  assert.strictEqual(finData.status, TaskStatus.PENDING_CONFIRM);
-  assert.strictEqual(finData.package_digest, built1.manifestSha);
+  const storedTask = db.getTask(taskId);
+  assert.ok(storedTask);
+  assert.strictEqual(storedTask.status, TaskStatus.PENDING_CONFIRM);
 
   // Delete original source dir -> package in workbench remains readable!
   fs.rmSync(tmpPkgRoot1, { recursive: true, force: true });
@@ -231,14 +169,14 @@ try {
     name: 'workbench_get_package',
     arguments: {
       task_id: taskId,
-      resource_path: 'nodes/development/resources/notes.md',
+      resource_path: 'nodes/development/work.md',
     },
   });
   const getPkgData = JSON.parse((getPkgRes.content as any)[0].text);
   assert.strictEqual(getPkgData.ok, true);
-  assert.ok(getPkgData.resource.content.includes('Private resource for development'));
+  assert.ok(getPkgData.resource.content.includes('Work for development'));
 
-  // 5. Query status via MCP
+  // 5. Query task status via MCP
   const statusRes = await client.callTool({
     name: 'workbench_get_task_status',
     arguments: { task_id: taskId },
@@ -246,76 +184,68 @@ try {
   const statusData = JSON.parse((statusRes.content as any)[0].text);
   assert.strictEqual(statusData.taskId, taskId);
   assert.strictEqual(statusData.status, TaskStatus.PENDING_CONFIRM);
-  assert.strictEqual(statusData.packageDigest, built1.manifestSha);
 
-  // 6. Test node context isolation & advance_workflow
-  const mat = taskFileStore.materializeNodeRunDirectory({
+  // 6. Test isolated attempt view + workflow advancement
+  db.updateTaskStatus(taskId, TaskStatus.RUNNING);
+  const mockToken = crypto.randomBytes(16).toString('hex');
+  const mockAttempt = 'attempt-mcp-1';
+  taskFileStore.materializeNodeRunDirectory({
     taskId,
     revision: 1,
-    packageDigest: built1.manifestSha,
+    packageDigest: 'digest-fixture',
     workflowId: 'default',
     workflowSha256: getWfData.workflow.definition_sha256,
     nodeId: 'development',
     nodeName: '开发实现',
     executionMode: 'agent',
-    attemptId: 'run-mcp-adv-1',
+    attemptId: mockAttempt,
     executionIndex: 1,
     codeGeneration: 1,
     targetCwd: process.cwd(),
-    manifestNode: built1.manifest.nodes.find((n: any) => n.node_id === 'development'),
-    boundInputs: [],
-    completionToken: 'tok-mcp-999',
+    completionToken: mockToken,
   });
 
-  db.updateTaskStatus(taskId, TaskStatus.RUNNING);
+  const runDir = taskFileStore.getNodeRunDir(taskId, 1, 'development', mockAttempt);
   db.createNodeRun({
-    run_id: 'run-mcp-adv-1',
+    run_id: mockAttempt,
     task_id: taskId,
     revision: 1,
     node_id: 'development',
     execution_index: 1,
+    round_number: 1,
+    code_generation: 1,
     status: 'running',
-    completion_token: 'tok-mcp-999',
-    attempt_dir: mat.paths.attemptDir,
+    completion_token: mockToken,
+    attempt_dir: runDir,
   });
 
-  // Cross-node access MUST be rejected
-  const deniedCtx = await client.callTool({
+  // Query node context via MCP
+  const ctxRes = await client.callTool({
     name: 'workbench_get_node_context',
     arguments: {
       task_id: taskId,
       node_id: 'development',
-      attempt_id: 'run-mcp-adv-1',
-      completion_token: 'tok-mcp-999',
-      resource_path: 'nodes/acceptance/resources/notes.md',
+      attempt_id: mockAttempt,
+      completion_token: mockToken,
+      resource_path: 'material/work.md',
     },
   });
-  assert.strictEqual(deniedCtx.isError, true);
-  assert.strictEqual(JSON.parse((deniedCtx.content as any)[0].text).error.code, 'ACCESS_DENIED');
+  const ctxData = JSON.parse((ctxRes.content as any)[0].text);
+  assert.strictEqual(ctxData.ok, true);
+  assert.ok(ctxData.resource.content.includes('Work for development'));
 
-  // Own material access succeeds
-  const allowedCtx = await client.callTool({
-    name: 'workbench_get_node_context',
-    arguments: {
-      task_id: taskId,
-      node_id: 'development',
-      attempt_id: 'run-mcp-adv-1',
-      completion_token: 'tok-mcp-999',
-      resource_path: 'nodes/development/resources/notes.md',
-    },
-  });
-  assert.strictEqual(Boolean(allowedCtx.isError), false);
-  assert.ok(JSON.parse((allowedCtx.content as any)[0].text).resource.content.includes('Private resource for development'));
+  // Simulate worker creating outputs and calling advance
+  const outPath = path.join(runDir, 'outputs');
+  fs.writeFileSync(path.join(outPath, 'dev_notes.md'), 'Dev done', 'utf8');
 
-  // Advance workflow report
   const advanceRes = await client.callTool({
     name: 'workbench_advance_workflow',
     arguments: {
       task_id: taskId,
       node_id: 'development',
-      attempt_id: 'run-mcp-adv-1',
-      completion_token: 'tok-mcp-999',
-      request_id: 'req-adv-101',
+      attempt_id: mockAttempt,
+      completion_token: mockToken,
+      request_id: 'req-mcp-1',
       outcome: 'passed',
       summary: 'MCP Agent 开发完成并通过',
     },
@@ -326,44 +256,26 @@ try {
   // Stop task before revising (running task cannot be revised)
   db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
 
-  const built2 = buildLocalPackage({
+  buildLocalPackage({
     dir: tmpPkgRoot2,
     taskKey: 'mcp-test-task',
     revision: 2,
-    title: 'MCP Unit Test Task v2 Revised',
+    title: 'MCP Unit Test Task MVP Revised',
     workflowId: 'default',
-    workflowSha: getWfData.workflow.definition_sha256,
     nodes: getWfData.workflow.nodes,
   });
-  const stageRev2 = await client.callTool({
-    name: 'workbench_stage_package',
+
+  const submitRev2 = await client.callTool({
+    name: 'workbench_submit_task',
     arguments: {
-      protocol_version: 'cb.task-package/2.0',
-      operation: 'revise',
+      package_root: tmpPkgRoot2,
       task_id: taskId,
-      expected_revision: 1,
-      idempotency_key: `mcp-stage-2:${built2.manifestSha}`,
-      source: {
-        mode: 'local_path',
-        package_root: tmpPkgRoot2,
-        manifest_path: 'manifest.json',
-        manifest_sha256: built2.manifestSha,
-      },
     },
   });
-  const draftId2 = JSON.parse((stageRev2.content as any)[0].text).draft_id;
-  const finRev2 = await client.callTool({
-    name: 'workbench_finalize_package',
-    arguments: {
-      draft_id: draftId2,
-      manifest_sha256: built2.manifestSha,
-      idempotency_key: `mcp-fin-2:${built2.manifestSha}`,
-    },
-  });
-  const finRev2Data = JSON.parse((finRev2.content as any)[0].text);
-  assert.strictEqual(finRev2Data.ok, true);
-  assert.strictEqual(finRev2Data.revision, 2);
-  assert.strictEqual(finRev2Data.status, TaskStatus.PENDING_CONFIRM);
+  const submitRev2Data = JSON.parse((submitRev2.content as any)[0].text);
+  assert.strictEqual(submitRev2Data.ok, true);
+  assert.strictEqual(submitRev2Data.revision, 2);
+  assert.strictEqual(submitRev2Data.status, TaskStatus.PENDING_CONFIRM);
 
   // 7. Query artifacts via MCP
   const artifactsRes = await client.callTool({
@@ -388,27 +300,20 @@ try {
     name: 'workbench_delete_workflow',
     arguments: { workflow_id: 'default' },
   });
-  assert.strictEqual(delDefRes.isError, true);
+  const delDefParsed = JSON.parse((delDefRes.content as any)[0].text);
+  assert.strictEqual(delDefParsed.error?.code || delDefParsed.code, 'FORBIDDEN_DELETE_DEFAULT');
 
-  db.saveWorkflowDefinition({
-    id: 'mcp-test-wf',
-    name: 'MCP测试工作流',
-    nodes_json: JSON.stringify([
-      { id: 'start', name: '开始', type: 'start', on_success: 'end' },
-      { id: 'end', name: '结束', type: 'end' },
-    ]),
-  });
-  const delCustomRes = await client.callTool({
+  const customWfId = 'mcp-test-wf';
+  db.saveWorkflowDefinition({ id: customWfId, name: 'Custom MCP WF', nodes_json: JSON.stringify(getWfData.workflow.nodes) });
+  const delCustRes = await client.callTool({
     name: 'workbench_delete_workflow',
-    arguments: { workflow_id: 'mcp-test-wf' },
+    arguments: { workflow_id: customWfId },
   });
-  assert.strictEqual(delCustomRes.isError, undefined);
-  assert.strictEqual(db.getWorkflow('mcp-test-wf'), null);
-
-  console.log('✅ mcpServer.test.ts passed successfully!');
+  assert.strictEqual(JSON.parse((delCustRes.content as any)[0].text).success, true);
+  assert.strictEqual(db.getWorkflow(customWfId), null);
 } finally {
-  try { fs.rmSync(tmpPkgRoot1, { recursive: true, force: true }); } catch {}
-  try { fs.rmSync(tmpPkgRoot2, { recursive: true, force: true }); } catch {}
   await client.close();
   await server.close();
+  fs.rmSync(tmpPkgRoot1, { recursive: true, force: true });
+  fs.rmSync(tmpPkgRoot2, { recursive: true, force: true });
 }

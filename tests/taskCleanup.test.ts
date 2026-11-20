@@ -32,58 +32,25 @@ const wfSha = computeWorkflowDefinitionSha256({ id: wfRec.id, name: wfRec.name, 
 
 function createTestTask(label: string) {
   const pkgRoot = path.join(tmpBase, label);
-  fs.mkdirSync(path.join(pkgRoot, 'nodes', 'work', 'resources'), { recursive: true });
-  fs.mkdirSync(path.join(pkgRoot, 'shared', 'resources'), { recursive: true });
+  fs.mkdirSync(path.join(pkgRoot, 'nodes', 'work'), { recursive: true });
 
-  const nodeBuf = Buffer.from('# Work Node\n', 'utf8');
-  const promptBuf = Buffer.from('Run work\n', 'utf8');
-  const sharedBuf = Buffer.from('# Shared\n', 'utf8');
-  fs.writeFileSync(path.join(pkgRoot, 'nodes', 'work', 'node.md'), nodeBuf);
-  fs.writeFileSync(path.join(pkgRoot, 'nodes', 'work', 'prompt.md'), promptBuf);
-  fs.writeFileSync(path.join(pkgRoot, 'shared', 'resources', 'common.md'), sharedBuf);
+  fs.writeFileSync(path.join(pkgRoot, 'requirements.md'), '# Requirements\n', 'utf8');
+  fs.writeFileSync(path.join(pkgRoot, 'development.md'), '# Development\n', 'utf8');
+  fs.writeFileSync(path.join(pkgRoot, 'nodes', 'work', 'work.md'), '# Work Node\n', 'utf8');
+  fs.writeFileSync(path.join(pkgRoot, 'nodes', 'work', 'prompt.md'), 'Run work\n', 'utf8');
 
   const manifest = {
-    protocol_version: 'cb.task-package/2.0',
-    task_key: label,
-    revision: 1,
     title: `Cleanup Test ${label}`,
+    workflow_id: wfId,
     target_cwd: tmpBase,
-    workflow: { id: wfId, definition_sha256: wfSha },
-    readiness: 'ready',
-    blockers: [],
-    nodes: [
-      {
-        node_id: 'work',
-        node_ref: 'nodes/work/node.md',
-        prompt_ref: 'nodes/work/prompt.md',
-        resources: [],
-        shared_refs: ['shared/resources/common.md'],
-        input_bindings: [],
-        output_contract: { required_outputs: ['result'], optional_outputs: [] },
-      },
-    ],
-    files: [
-      { path: 'nodes/work/node.md', owner: { scope: 'node', node_id: 'work' }, media_type: 'text/markdown', size_bytes: nodeBuf.length, sha256: sha256(nodeBuf) },
-      { path: 'nodes/work/prompt.md', owner: { scope: 'node', node_id: 'work' }, media_type: 'text/markdown', size_bytes: promptBuf.length, sha256: sha256(promptBuf) },
-      { path: 'shared/resources/common.md', owner: { scope: 'shared' }, media_type: 'text/markdown', size_bytes: sharedBuf.length, sha256: sha256(sharedBuf) },
-    ],
+    task_key: label,
   };
-  const mBuf = Buffer.from(JSON.stringify(manifest, null, 2), 'utf8');
-  fs.writeFileSync(path.join(pkgRoot, 'manifest.json'), mBuf);
-  const mSha = sha256(mBuf);
+  fs.writeFileSync(path.join(pkgRoot, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
 
-  const staged = packageService.stagePackage({
-    protocol_version: 'cb.task-package/2.0',
-    operation: 'create',
-    idempotency_key: `clean:${label}:${mSha}`,
-    source: { mode: 'local_path', package_root: pkgRoot, manifest_path: 'manifest.json', manifest_sha256: mSha },
+  const res = packageService.submitTask({
+    package_root: pkgRoot,
   });
-  const finalized = packageService.finalizePackage({
-    draft_id: staged.draft_id,
-    manifest_sha256: mSha,
-    idempotency_key: `fin-clean:${label}:${mSha}`,
-  });
-  return { taskId: finalized.task_id as string, pkgRoot };
+  return { taskId: res.task_id as string, pkgRoot };
 }
 
 try {

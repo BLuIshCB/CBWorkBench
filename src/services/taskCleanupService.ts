@@ -106,9 +106,8 @@ export class TaskCleanupService {
 
     const existingTask = db.getTask(taskId);
     const existingRecovery = this.readRecoveryRecord(taskId);
-    const hasDrafts = db.hasActiveDraftForTask(taskId);
 
-    if (!existingTask && !taskDirExists && !existingRecovery && !hasDrafts) {
+    if (!existingTask && !taskDirExists && !existingRecovery) {
       return {
         ok: true,
         task_id: taskId,

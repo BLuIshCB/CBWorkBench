@@ -285,31 +285,20 @@ export function createWorkbenchMcpServer(): McpServer {
     }
   );
 
-  // 5. workbench_stage_package
+  // 5. workbench_submit_task
   server.tool(
-    'workbench_stage_package',
-    '通过本机路径 (local_path) 导入并校验 cb.task-package/2.0 任务包或修订包至任务暂存区 (.staging)。注意：暂存不会创建可启动任务，须调用 workbench_finalize_package 完成冻结。',
+    'workbench_submit_task',
+    '提交极简任务包到开发工作台。服务端直接校验 package_root 目录完整性与各节点材料，落盘归档并将任务置为待人工确认启动状态 (pending_confirm)。',
     {
-      protocol_version: z.string().describe('协议版本，固定为 "cb.task-package/2.0"'),
-      operation: z.enum(['create', 'revise']).describe('操作类型：create (新建任务) 或 revise (提交修订)'),
-      task_id: z.string().optional().describe('revise 时必填：原任务 ID；create 时可选预指定 ID'),
-      expected_revision: z.number().int().positive().optional().describe('revise 时必填：期望的当前修订号，防止并发覆盖'),
-      idempotency_key: z.string().describe('请求幂等键（建议 <task_key>:r<rev>:<manifest_sha256>）'),
-      execution_timeout_ms: executionTimeoutSchema.optional().describe('可选：单次执行超时（毫秒，1–1440 分钟整数倍）'),
-      budget_max_rounds: z.number().int().positive().max(100).optional().describe('可选：最大执行轮次预算（默认 10）'),
-      source: z
-        .object({
-          mode: z.string().describe('传输模式，当前仅支持 "local_path"'),
-          package_root: z.string().describe('本地任务包根目录绝对路径'),
-          manifest_path: z.string().optional().describe('包内 Manifest 相对路径（默认 "manifest.json"）'),
-          manifest_sha256: z.string().describe('manifest.json 原始字节的 64 位小写 SHA-256'),
-        })
-        .strict(),
+      package_root: z.string().describe('任务包本地绝对路径（必须包含 manifest.json、requirements.md、development.md 以及 nodes/<node_id>/work.md）'),
+      task_id: z.string().optional().describe('可选。若传入则作为现有任务的新修订版本提交；若省略则自动创建新任务'),
+      budget_max_rounds: z.number().int().positive().max(100).optional().describe('可选。最大执行轮次上限'),
+      execution_timeout_ms: executionTimeoutSchema.optional().describe('可选。单节点执行超时毫秒数'),
     },
     async (args) => {
       try {
         await verifyInstanceBindingIfConfigured();
-        const res = packageService.stagePackage(args);
+        const res = packageService.submitTask(args);
         return okJson(res);
       } catch (err) {
         return errJson(err);
@@ -317,36 +306,13 @@ export function createWorkbenchMcpServer(): McpServer {
     }
   );
 
-  // 6. workbench_finalize_package
-  server.tool(
-    'workbench_finalize_package',
-    '对已暂存草稿执行完整校验并原子冻结为正式不可变修订 (revisions/rNNNN)。支持 validate_only=true 预检。正式提交后任务进入【待启动确认】状态，等待用户在 Web 端手动点击启动。',
-    {
-      draft_id: z.string().describe('暂存草稿 ID'),
-      manifest_sha256: z.string().describe('与暂存一致的 Manifest SHA-256 摘要'),
-      idempotency_key: z.string().describe('幂等键'),
-      validate_only: z.boolean().optional().describe('为 true 时仅执行完整性校验，不创建正式修订'),
-    },
-    async (args) => {
-      try {
-        await verifyInstanceBindingIfConfigured();
-        const res = packageService.finalizePackage(args);
-        return okJson(res);
-      } catch (err) {
-        return errJson(err);
-      }
-    }
-  );
-
-  // 7. workbench_get_package
+  // 6. workbench_get_package
   server.tool(
     'workbench_get_package',
-    '查询暂存草稿或正式任务包的 Manifest、文件索引、提交回执，并支持按 resource_path + offset_bytes + max_bytes 分页读取包内文件。',
+    '查询正式任务包的 Manifest、文件索引、提交回执，并支持按 resource_path + offset_bytes + max_bytes 分页读取包内文件。',
     {
-      idempotency_key: z.string().optional().describe('按幂等键查询提交或草稿结果'),
-      task_id: z.string().optional().describe('按任务 ID 查询'),
+      task_id: z.string().describe('按任务 ID 查询'),
       revision: z.number().int().positive().optional().describe('可选修订号（不传则返回任务当前修订）'),
-      draft_id: z.string().optional().describe('按暂存草稿 ID 查询'),
       resource_path: z.string().optional().describe('可选：读取指定包内相对路径的文件内容（支持分页）'),
       offset_bytes: z.number().int().nonnegative().optional().describe('读取起始字节偏移（默认 0）'),
       max_bytes: z.number().int().positive().optional().describe('单次读取最大字节数（上限 262144）'),
@@ -362,7 +328,7 @@ export function createWorkbenchMcpServer(): McpServer {
     }
   );
 
-  // 8. workbench_get_node_context
+  // 7. workbench_get_node_context
   server.tool(
     'workbench_get_node_context',
     '按任务、节点、执行 attempt_id 与 completion_token 获取当前节点运行视图与允许访问的资源（严格节点隔离，禁止读取他节点私有资源）。',
@@ -515,8 +481,7 @@ export function createWorkbenchMcpServer(): McpServer {
         }
 
         const existingTask = db.getTask(args.task_id);
-        const hasDraft = db.hasActiveDraftForTask(args.task_id);
-        if (!existingTask && !hasDraft) {
+        if (!existingTask) {
           throw new PackageProtocolError('TASK_NOT_FOUND', `未找到任务: ${args.task_id}`);
         }
 

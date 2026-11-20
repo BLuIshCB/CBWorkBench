@@ -117,28 +117,6 @@ export interface TaskPackageFileRecord {
   sha256: string;
 }
 
-export interface PackageDraftRecord {
-  draft_id: string;
-  task_id: string;
-  operation: 'create' | 'revise';
-  target_revision: number;
-  expected_revision: number | null;
-  idempotency_key: string;
-  manifest_json: string;
-  manifest_sha256: string;
-  workflow_id: string;
-  workflow_sha256: string;
-  readiness: 'ready' | 'blocked';
-  blockers_json: string;
-  validation_errors_json: string;
-  execution_timeout_ms: number | null;
-  budget_max_rounds: number | null;
-  status: 'staging' | 'invalid' | 'finalized' | 'cancelled';
-  receipt_json: string | null;
-  created_at: number;
-  updated_at: number;
-  expires_at: number;
-}
 
 export interface ExecutionRoundRecord {
   run_id?: string | null;
@@ -335,28 +313,6 @@ export class WorkbenchDatabase {
         UNIQUE(task_id, revision, path)
       );
 
-      CREATE TABLE IF NOT EXISTS package_drafts (
-        draft_id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        target_revision INTEGER NOT NULL,
-        expected_revision INTEGER,
-        idempotency_key TEXT NOT NULL UNIQUE,
-        manifest_json TEXT NOT NULL,
-        manifest_sha256 TEXT NOT NULL,
-        workflow_id TEXT NOT NULL,
-        workflow_sha256 TEXT NOT NULL,
-        readiness TEXT NOT NULL,
-        blockers_json TEXT NOT NULL,
-        validation_errors_json TEXT NOT NULL,
-        execution_timeout_ms INTEGER,
-        budget_max_rounds INTEGER,
-        status TEXT NOT NULL,
-        receipt_json TEXT,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
-      );
 
       CREATE TABLE IF NOT EXISTS execution_rounds (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -469,7 +425,6 @@ export class WorkbenchDatabase {
       CREATE INDEX IF NOT EXISTS idx_task_revisions_task_id ON task_revisions(task_id);
       CREATE INDEX IF NOT EXISTS idx_task_revisions_idem ON task_revisions(idempotency_key);
       CREATE INDEX IF NOT EXISTS idx_task_package_files_rev ON task_package_files(task_id, revision);
-      CREATE INDEX IF NOT EXISTS idx_package_drafts_task ON package_drafts(task_id);
       CREATE INDEX IF NOT EXISTS idx_execution_rounds_task_id ON execution_rounds(task_id);
       CREATE INDEX IF NOT EXISTS idx_task_workflows_task ON task_workflows(task_id);
       CREATE INDEX IF NOT EXISTS idx_wf_node_runs_task ON workflow_node_runs(task_id);
@@ -802,89 +757,6 @@ export class WorkbenchDatabase {
       .all(taskId, revision) as unknown as TaskPackageFileRecord[];
   }
 
-  // --- Package Drafts ---
-
-  saveDraft(draft: Omit<PackageDraftRecord, 'created_at' | 'updated_at'>): PackageDraftRecord {
-    const now = Date.now();
-    this.db.prepare(`
-      INSERT INTO package_drafts (
-        draft_id, task_id, operation, target_revision, expected_revision,
-        idempotency_key, manifest_json, manifest_sha256, workflow_id, workflow_sha256,
-        readiness, blockers_json, validation_errors_json, execution_timeout_ms, budget_max_rounds,
-        status, receipt_json, created_at, updated_at, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      draft.draft_id,
-      draft.task_id,
-      draft.operation,
-      draft.target_revision,
-      draft.expected_revision ?? null,
-      draft.idempotency_key,
-      draft.manifest_json,
-      draft.manifest_sha256,
-      draft.workflow_id,
-      draft.workflow_sha256,
-      draft.readiness,
-      draft.blockers_json,
-      draft.validation_errors_json,
-      draft.execution_timeout_ms ?? null,
-      draft.budget_max_rounds ?? null,
-      draft.status,
-      draft.receipt_json ?? null,
-      now,
-      now,
-      draft.expires_at
-    );
-    return this.getDraft(draft.draft_id)!;
-  }
-
-  getDraft(draftId: string): PackageDraftRecord | null {
-    const row = this.db
-      .prepare('SELECT * FROM package_drafts WHERE draft_id = ?')
-      .get(draftId) as unknown as PackageDraftRecord | undefined;
-    return row ?? null;
-  }
-
-  getDraftByIdempotencyKey(key: string): PackageDraftRecord | null {
-    const row = this.db
-      .prepare('SELECT * FROM package_drafts WHERE idempotency_key = ?')
-      .get(key) as unknown as PackageDraftRecord | undefined;
-    return row ?? null;
-  }
-
-  updateDraft(
-    draftId: string,
-    updates: Partial<{
-      status: PackageDraftRecord['status'];
-      receipt_json: string | null;
-      validation_errors_json: string;
-    }>
-  ): void {
-    const sets: string[] = ['updated_at = ?'];
-    const params: unknown[] = [Date.now()];
-    if (updates.status !== undefined) { sets.push('status = ?'); params.push(updates.status); }
-    if (updates.receipt_json !== undefined) { sets.push('receipt_json = ?'); params.push(updates.receipt_json); }
-    if (updates.validation_errors_json !== undefined) { sets.push('validation_errors_json = ?'); params.push(updates.validation_errors_json); }
-    params.push(draftId);
-    this.db.prepare(`UPDATE package_drafts SET ${sets.join(', ')} WHERE draft_id = ?`).run(...params);
-  }
-
-  listExpiredDrafts(now: number = Date.now()): PackageDraftRecord[] {
-    return this.db
-      .prepare(`SELECT * FROM package_drafts WHERE status IN ('staging', 'invalid') AND expires_at < ?`)
-      .all(now) as unknown as PackageDraftRecord[];
-  }
-
-  deleteDraft(draftId: string): void {
-    this.db.prepare('DELETE FROM package_drafts WHERE draft_id = ?').run(draftId);
-  }
-
-  hasActiveDraftForTask(taskId: string): boolean {
-    const row = this.db
-      .prepare(`SELECT 1 FROM package_drafts WHERE task_id = ? AND status = 'staging' LIMIT 1`)
-      .get(taskId);
-    return Boolean(row);
-  }
 
   // --- Execution Rounds & History ---
 
@@ -1446,8 +1318,7 @@ export class WorkbenchDatabase {
 
   deleteTask(taskId: string): boolean {
     const task = this.getTask(taskId);
-    const hasDraft = Boolean(this.db.prepare('SELECT 1 FROM package_drafts WHERE task_id = ? LIMIT 1').get(taskId));
-    if (!task && !hasDraft) return false;
+    if (!task) return false;
 
     return this.transaction(() => {
       this.db.prepare('DELETE FROM execution_events WHERE run_id IN (SELECT run_id FROM execution_runs WHERE task_id=?)').run(taskId);
@@ -1457,7 +1328,6 @@ export class WorkbenchDatabase {
       this.db.prepare('DELETE FROM workflow_node_runs WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM task_revisions WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM task_package_files WHERE task_id = ?').run(taskId);
-      this.db.prepare('DELETE FROM package_drafts WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM execution_rounds WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM test_runs WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM acceptance_runs WHERE task_id = ?').run(taskId);
@@ -1475,7 +1345,6 @@ export class WorkbenchDatabase {
       this.db.exec('DELETE FROM workflow_node_runs;');
       this.db.exec('DELETE FROM task_revisions;');
       this.db.exec('DELETE FROM task_package_files;');
-      this.db.exec('DELETE FROM package_drafts;');
       this.db.exec('DELETE FROM execution_rounds;');
       this.db.exec('DELETE FROM test_runs;');
       this.db.exec('DELETE FROM acceptance_runs;');

@@ -40,59 +40,30 @@ function createCustomWorkflow(wfId: string) {
 function submitV2Package(opts: { taskKey: string; wfId: string; wfSha: string; nodes: WorkflowNode[]; budgetMaxRounds?: number }) {
   const pkgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-wfe-pkg-'));
   try {
-    const files: any[] = [];
-    const manifestNodes: any[] = [];
+    fs.writeFileSync(path.join(pkgRoot, 'requirements.md'), '# Requirements\n', 'utf8');
+    fs.writeFileSync(path.join(pkgRoot, 'development.md'), '# Development\n', 'utf8');
     for (const n of opts.nodes) {
       if (n.type !== 'task') continue;
-      const nodePath = `nodes/${n.id}/node.md`;
-      const promptPath = `nodes/${n.id}/prompt.md`;
-      fs.mkdirSync(path.join(pkgRoot, 'nodes', n.id, 'resources'), { recursive: true });
-      const nodeBuf = Buffer.from(`# ${n.name}\n`, 'utf8');
-      const promptBuf = Buffer.from(`Execute ${n.id}\n`, 'utf8');
-      fs.writeFileSync(path.join(pkgRoot, nodePath), nodeBuf);
-      fs.writeFileSync(path.join(pkgRoot, promptPath), promptBuf);
-      files.push(
-        { path: nodePath, owner: { scope: 'node', node_id: n.id }, media_type: 'text/markdown', size_bytes: nodeBuf.length, sha256: crypto.createHash('sha256').update(nodeBuf).digest('hex') },
-        { path: promptPath, owner: { scope: 'node', node_id: n.id }, media_type: 'text/markdown', size_bytes: promptBuf.length, sha256: crypto.createHash('sha256').update(promptBuf).digest('hex') }
-      );
-      manifestNodes.push({
-        node_id: n.id,
-        node_ref: nodePath,
-        prompt_ref: promptPath,
-        resources: [],
-        shared_refs: [],
-        input_bindings: [],
-        output_contract: { required_outputs: ['result'], optional_outputs: [] },
-      });
+      const nodeDir = path.join(pkgRoot, 'nodes', n.id);
+      fs.mkdirSync(nodeDir, { recursive: true });
+      fs.writeFileSync(path.join(nodeDir, 'work.md'), `# ${n.name}\n`, 'utf8');
+      if (n.id !== 'development') {
+        fs.writeFileSync(path.join(nodeDir, 'prompt.md'), `Execute ${n.id}\n`, 'utf8');
+      }
     }
     const manifest = {
-      protocol_version: 'cb.task-package/2.0',
-      task_key: opts.taskKey,
-      revision: 1,
       title: opts.taskKey,
+      workflow_id: opts.wfId,
       target_cwd: process.cwd(),
-      workflow: { id: opts.wfId, definition_sha256: opts.wfSha },
-      readiness: 'ready',
-      blockers: [],
-      nodes: manifestNodes,
-      files,
-    };
-    const mBuf = Buffer.from(JSON.stringify(manifest, null, 2), 'utf8');
-    fs.writeFileSync(path.join(pkgRoot, 'manifest.json'), mBuf);
-    const mSha = crypto.createHash('sha256').update(mBuf).digest('hex');
-    const staged = packageService.stagePackage({
-      protocol_version: 'cb.task-package/2.0',
-      operation: 'create',
-      idempotency_key: `${opts.taskKey}:${mSha}`,
+      task_key: opts.taskKey,
       budget_max_rounds: opts.budgetMaxRounds,
-      source: { mode: 'local_path', package_root: pkgRoot, manifest_path: 'manifest.json', manifest_sha256: mSha },
+    };
+    fs.writeFileSync(path.join(pkgRoot, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+    const res = packageService.submitTask({
+      package_root: pkgRoot,
+      budget_max_rounds: opts.budgetMaxRounds,
     });
-    const finalized = packageService.finalizePackage({
-      draft_id: staged.draft_id,
-      manifest_sha256: mSha,
-      idempotency_key: `fin:${opts.taskKey}:${mSha}`,
-    });
-    return finalized.task_id as string;
+    return res.task_id as string;
   } finally {
     fs.rmSync(pkgRoot, { recursive: true, force: true });
   }
@@ -184,8 +155,8 @@ assert.strictEqual(humanReviewTask?.status, TaskStatus.HUMAN_REVIEW);
 assert.strictEqual(humanReviewTask?.current_round, 1);
 
 const devRound = db.getRounds(loopTaskId).find((r) => r.worker_id === 'development');
-assert.ok(devRound?.input_prompt?.includes('保留编排时的开发约束。'), '编排提示词必须传入执行器');
-assert.ok(devRound?.input_prompt?.includes('Execute development'), '任务包提示词也必须传入执行器');
+assert.ok(devRound?.input_prompt?.includes('保留编排时的开发约束。'), '无 prompt.md 时回退使用工作流编排提示词');
+assert.ok(devRound?.input_prompt?.includes('# 开发实现'), 'work.md 必须传入执行器');
 
 const reworkRes = await workflowEngine.submitHumanDecision(loopTaskId, 'reject', 'Need more polish');
 assert.strictEqual(reworkRes.success, true);

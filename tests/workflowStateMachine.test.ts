@@ -103,63 +103,28 @@ function createFixtureTask(options?: { budget_max_rounds?: number }) {
   const pkgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-sm-pkg-'));
   try {
     const taskKey = 'sm-' + randomUUID().slice(0, 8);
-    const files: any[] = [];
-    const manifestNodes: any[] = [];
+    fs.writeFileSync(path.join(pkgRoot, 'requirements.md'), '# Requirements\n', 'utf8');
+    fs.writeFileSync(path.join(pkgRoot, 'development.md'), '# Development\n', 'utf8');
     for (const n of smNodes) {
       if (n.type !== 'task') continue;
-      const nodePath = `nodes/${n.id}/node.md`;
-      const promptPath = `nodes/${n.id}/prompt.md`;
-      fs.mkdirSync(path.join(pkgRoot, 'nodes', n.id, 'resources'), { recursive: true });
-      const nodeBuf = Buffer.from(`# ${n.name}\n`, 'utf8');
-      const promptBuf = Buffer.from(`Do ${n.id}\n`, 'utf8');
-      fs.writeFileSync(path.join(pkgRoot, nodePath), nodeBuf);
-      fs.writeFileSync(path.join(pkgRoot, promptPath), promptBuf);
-      files.push(
-        { path: nodePath, owner: { scope: 'node', node_id: n.id }, media_type: 'text/markdown', size_bytes: nodeBuf.length, sha256: crypto.createHash('sha256').update(nodeBuf).digest('hex') },
-        { path: promptPath, owner: { scope: 'node', node_id: n.id }, media_type: 'text/markdown', size_bytes: promptBuf.length, sha256: crypto.createHash('sha256').update(promptBuf).digest('hex') }
-      );
-      const inputBindings =
-        n.id === 'acceptance'
-          ? [{ slot: 'cmd_out', from_node_id: 'test', output: 'result', required: true, constraint: 'current_code_snapshot' }]
-          : [];
-      manifestNodes.push({
-        node_id: n.id,
-        node_ref: nodePath,
-        prompt_ref: promptPath,
-        resources: [],
-        shared_refs: [],
-        input_bindings: inputBindings,
-        output_contract: { required_outputs: ['result'], optional_outputs: [] },
-      });
+      const nodeDir = path.join(pkgRoot, 'nodes', n.id);
+      fs.mkdirSync(nodeDir, { recursive: true });
+      fs.writeFileSync(path.join(nodeDir, 'work.md'), `# ${n.name}\n`, 'utf8');
+      fs.writeFileSync(path.join(nodeDir, 'prompt.md'), `Do ${n.id}\n`, 'utf8');
     }
     const manifest = {
-      protocol_version: 'cb.task-package/2.0',
-      task_key: taskKey,
-      revision: 1,
       title: 'State Machine Test Task',
+      workflow_id: smWfId,
       target_cwd: process.cwd(),
-      workflow: { id: smWfId, definition_sha256: smWfSha },
-      readiness: 'ready',
-      blockers: [],
-      nodes: manifestNodes,
-      files,
-    };
-    const mBuf = Buffer.from(JSON.stringify(manifest, null, 2), 'utf8');
-    fs.writeFileSync(path.join(pkgRoot, 'manifest.json'), mBuf);
-    const mSha = crypto.createHash('sha256').update(mBuf).digest('hex');
-    const staged = packageService.stagePackage({
-      protocol_version: 'cb.task-package/2.0',
-      operation: 'create',
-      idempotency_key: `stage:${taskKey}`,
+      task_key: taskKey,
       budget_max_rounds: options?.budget_max_rounds ?? 10,
-      source: { mode: 'local_path', package_root: pkgRoot, manifest_path: 'manifest.json', manifest_sha256: mSha },
+    };
+    fs.writeFileSync(path.join(pkgRoot, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+    const res = packageService.submitTask({
+      package_root: pkgRoot,
+      budget_max_rounds: options?.budget_max_rounds ?? 10,
     });
-    const finalized = packageService.finalizePackage({
-      draft_id: staged.draft_id,
-      manifest_sha256: mSha,
-      idempotency_key: `fin:${taskKey}`,
-    });
-    return finalized.task_id as string;
+    return res.task_id as string;
   } finally {
     fs.rmSync(pkgRoot, { recursive: true, force: true });
   }

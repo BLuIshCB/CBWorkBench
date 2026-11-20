@@ -15,7 +15,6 @@ import { type WorkflowNode, DEFAULT_MAX_EXECUTIONS, validateWorkflowNodes } from
 import {
   NODE_RESULT_SCHEMA_VERSION,
   PackageProtocolError,
-  type ManifestNodeEntry,
   type TaskPackageManifest,
   type UnifiedNodeResult,
 } from './packageProtocol.ts';
@@ -368,104 +367,19 @@ export class WorkflowEngine {
   }
 
   private resolveInputBindings(
-    taskId: string,
-    revision: number,
-    codeGeneration: number,
-    manifestNode: ManifestNodeEntry
+    _taskId: string,
+    _revision: number,
+    _codeGeneration: number
   ): {
     ok: boolean;
     errorMessage?: string;
     bindings: Array<BoundInputEntry & { sourceAbsPath: string }>;
     inputsSummaryText: string;
   } {
-    const resolved: Array<BoundInputEntry & { sourceAbsPath: string }> = [];
-    const summaryLines: string[] = [];
-
-    for (const binding of manifestNode.input_bindings) {
-      const upstreamRun = db.getLatestCompletedNodeRunForRevision(taskId, revision, binding.from_node_id);
-      if (!upstreamRun) {
-        if (binding.required !== false) {
-          return {
-            ok: false,
-            errorMessage: `必需输入 [${binding.slot}] 缺失：来源节点 [${binding.from_node_id}] 在修订 r${revision} 尚未产生有效输出`,
-            bindings: [],
-            inputsSummaryText: '',
-          };
-        }
-        continue;
-      }
-
-      if (
-        binding.constraint === 'current_code_snapshot' &&
-        codeGeneration > 0 &&
-        upstreamRun.code_generation !== codeGeneration
-      ) {
-        if (binding.required !== false) {
-          return {
-            ok: false,
-            errorMessage: `必需输入 [${binding.slot}] 已过期：来源节点 [${binding.from_node_id}] 输出于代码代次 G${upstreamRun.code_generation}，当前为 G${codeGeneration}`,
-            bindings: [],
-            inputsSummaryText: '',
-          };
-        }
-        continue;
-      }
-
-      const outputsMap = readNodeOutputMap(upstreamRun);
-      const outputEntry = outputsMap[binding.output];
-      if (!outputEntry || !upstreamRun.attempt_dir) {
-        if (binding.required !== false) {
-          return {
-            ok: false,
-            errorMessage: `必需输入 [${binding.slot}] 缺失：来源节点 [${binding.from_node_id}] 的执行记录 [${upstreamRun.run_id}] 未产出 [${binding.output}]`,
-            bindings: [],
-            inputsSummaryText: '',
-          };
-        }
-        continue;
-      }
-
-      try {
-        const buf = readRegularFileSafely(upstreamRun.attempt_dir, outputEntry.path);
-        const sha256 = computeBufferSha256(buf);
-        if (outputEntry.sha256 && sha256 !== outputEntry.sha256) {
-          throw new Error(`产物哈希不匹配 (${outputEntry.path})`);
-        }
-        const sourceAbsPath = path.join(upstreamRun.attempt_dir, ...outputEntry.path.split('/'));
-        const fileName = path.posix.basename(outputEntry.path);
-        const mountedPath = `inputs/${binding.slot}/${fileName}`;
-        resolved.push({
-          slot: binding.slot,
-          from_node_id: binding.from_node_id,
-          output: binding.output,
-          source_attempt_id: upstreamRun.run_id,
-          source_execution_index: upstreamRun.execution_index,
-          source_code_generation: upstreamRun.code_generation,
-          source_path: outputEntry.path,
-          mounted_path: mountedPath,
-          sourceAbsPath,
-          sha256,
-          size_bytes: buf.length,
-        });
-        summaryLines.push(
-          `- slot=${binding.slot} (from ${binding.from_node_id}#${upstreamRun.execution_index}, attempt=${upstreamRun.run_id}, file=${mountedPath})`
-        );
-      } catch (err: any) {
-        if (binding.required !== false) {
-          return {
-            ok: false,
-            errorMessage: `必需输入 [${binding.slot}] 读取失败: ${err?.message || err}`,
-            bindings: [],
-            inputsSummaryText: '',
-          };
-        }
-      }
-    }
-
     return {
       ok: true,
-      bindings: resolved,
-      inputsSummaryText: summaryLines.join('\n'),
+      bindings: [],
+      inputsSummaryText: '',
     };
   }
 
@@ -507,7 +421,6 @@ export class WorkflowEngine {
     outcome: 'passed' | 'failed' | 'blocked';
     summary: string;
     issues: Array<{ id: string; description: string; evidence?: string }>;
-    manifestNode: ManifestNodeEntry;
     attemptDir: string;
     outputsDir: string;
     extraOutputs?: Record<string, { path: string; sha256: string; size_bytes: number }>;
@@ -522,24 +435,26 @@ export class WorkflowEngine {
       ...(params.extraOutputs || {}),
     };
 
-    // Check if any declared outputs besides 'result' already exist in outputsDir
-    for (const outName of [
-      ...params.manifestNode.output_contract.required_outputs,
-      ...params.manifestNode.output_contract.optional_outputs,
-    ]) {
-      if (outName === 'result' || outputsMap[outName]) continue;
-      for (const candidate of [`${outName}.json`, `${outName}.md`, `${outName}.txt`, outName]) {
-        const candidatePath = path.join(params.outputsDir, candidate);
-        if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).isFile()) {
-          const buf = fs.readFileSync(candidatePath);
-          outputsMap[outName] = {
-            path: `outputs/${candidate}`,
-            sha256: computeBufferSha256(buf),
-            size_bytes: buf.length,
-          };
-          break;
+    // Scan outputsDir for output files if any
+    if (fs.existsSync(params.outputsDir)) {
+      try {
+        const files = fs.readdirSync(params.outputsDir);
+        for (const file of files) {
+          if (file === 'result.json') continue;
+          const nameWithoutExt = file.replace(/\.[^.]+$/, '');
+          if (!outputsMap[nameWithoutExt] && !outputsMap[file]) {
+            const filePath = path.join(params.outputsDir, file);
+            if (fs.statSync(filePath).isFile()) {
+              const buf = fs.readFileSync(filePath);
+              outputsMap[nameWithoutExt] = {
+                path: `outputs/${file}`,
+                sha256: computeBufferSha256(buf),
+                size_bytes: buf.length,
+              };
+            }
+          }
         }
-      }
+      } catch {}
     }
 
     const resultPath = path.join(params.outputsDir, 'result.json');
@@ -581,49 +496,6 @@ export class WorkflowEngine {
       sha256: finalResultSha,
       size_bytes: finalBuf.length,
     };
-
-    // Enforce output_contract only when outcome is passed
-    if (params.outcome === 'passed') {
-      for (const reqOut of params.manifestNode.output_contract.required_outputs) {
-        if (!outputsMap[reqOut]) {
-          return {
-            valid: false,
-            errorMessage: `节点 [${params.nodeId}] 缺少契约声明的必需输出 [${reqOut}]`,
-            resultJson: finalResultJson,
-            resultSha256: finalResultSha,
-            outputsMap,
-          };
-        }
-      }
-
-      if (params.manifestNode.output_contract.schema_ref) {
-        try {
-          const revDir = taskFileStore.getRevisionDir(params.taskId, params.revision);
-          const schemaBuf = readRegularFileSafely(revDir, params.manifestNode.output_contract.schema_ref);
-          const schemaObj = JSON.parse(schemaBuf.toString('utf8'));
-          const schemaCheck = validateJsonAgainstSchema(resultObj, schemaObj);
-          if (!schemaCheck.valid) {
-            return {
-              valid: false,
-              errorMessage: `节点 [${params.nodeId}] 输出不满足声明 Schema (${params.manifestNode.output_contract.schema_ref}): ${schemaCheck.errors
-                .map((e) => `${e.path}: ${e.message}`)
-                .join('; ')}`,
-              resultJson: finalResultJson,
-              resultSha256: finalResultSha,
-              outputsMap,
-            };
-          }
-        } catch (err: any) {
-          return {
-            valid: false,
-            errorMessage: `输出 Schema 校验失败: ${err?.message || err}`,
-            resultJson: finalResultJson,
-            resultSha256: finalResultSha,
-            outputsMap,
-          };
-        }
-      }
-    }
 
     return {
       valid: true,
@@ -683,7 +555,6 @@ export class WorkflowEngine {
         });
         return;
       }
-      const manifestNodeMap = new Map(manifest.nodes.map((n) => [n.node_id, n]));
       const definedTaskNodeIds = nodes.filter((n) => n.type === 'task').map((n) => n.id);
       const hasVerificationNode = nodes.some((n) => n.type === 'task' && n.result_rule === 'verification');
       const hasAcceptanceNode = nodes.some((n) => n.type === 'task' && n.result_rule === 'acceptance');
@@ -755,10 +626,11 @@ export class WorkflowEngine {
         }
 
         if (currentNode.type === 'task') {
-          const manifestNode = manifestNodeMap.get(currentNode.id);
-          if (!manifestNode) {
+          const revDir = taskFileStore.getRevisionDir(taskId, revisionRecord.revision);
+          const workFilePath = path.join(revDir, 'nodes', currentNode.id, 'work.md');
+          if (!fs.existsSync(workFilePath)) {
             db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
-              blocked_reason: `任务包缺失节点 [${currentNode.id}] 的材料声明`,
+              blocked_reason: `任务包修订材料中缺少节点 [${currentNode.id}] 的 work.md`,
             });
             return;
           }
@@ -817,8 +689,7 @@ export class WorkflowEngine {
           const inputResolution = this.resolveInputBindings(
             taskId,
             revisionRecord.revision,
-            taskWorkflow.code_generation,
-            manifestNode
+            taskWorkflow.code_generation
           );
           if (!inputResolution.ok) {
             db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
@@ -851,8 +722,6 @@ export class WorkflowEngine {
             executionIndex: currentExecIndex,
             codeGeneration: taskWorkflow.code_generation,
             targetCwd: confirmedCwd,
-            manifestNode,
-            boundInputs: inputResolution.bindings,
             reworkFeedback: reworkFeedback || undefined,
             completionToken,
           });
@@ -923,19 +792,43 @@ export class WorkflowEngine {
 
             let nodePromptContent = '';
             try {
-              nodePromptContent = fs
-                .readFileSync(path.join(materialized.paths.materialDir, 'prompt.md'), 'utf8')
-                .trim();
+              const pPath = path.join(materialized.paths.materialDir, 'prompt.md');
+              if (fs.existsSync(pPath)) {
+                nodePromptContent = fs.readFileSync(pPath, 'utf8').trim();
+              }
             } catch {}
-            // 编排要求与本次任务材料共同生效，任务包不能覆盖节点的固定职责。
-            const basePrompt = [
-              currentNode.prompt?.trim() ? `## 工作流节点提示词\n${currentNode.prompt.trim()}` : '',
-              nodePromptContent ? `## 本次任务提示词\n${nodePromptContent}` : '',
-            ].filter(Boolean).join('\n\n');
+            // 提示词优先级：优先使用任务包中的 prompt.md；若无或为空，则自动回退至平台工作流模板中该节点的默认提示词
+            const effectivePrompt = nodePromptContent || currentNode.prompt?.trim() || '';
+
+            let workMdContent = '';
+            try {
+              const wPath = path.join(materialized.paths.materialDir, 'work.md');
+              if (fs.existsSync(wPath)) {
+                workMdContent = fs.readFileSync(wPath, 'utf8').trim();
+              }
+            } catch {}
+
+            let reqMdContent = '';
+            try {
+              const rPath = path.join(materialized.paths.sharedDir, 'requirements.md');
+              if (fs.existsSync(rPath)) {
+                reqMdContent = fs.readFileSync(rPath, 'utf8').trim();
+              }
+            } catch {}
+
+            let devMdContent = '';
+            try {
+              const dPath = path.join(materialized.paths.sharedDir, 'development.md');
+              if (fs.existsSync(dPath)) {
+                devMdContent = fs.readFileSync(dPath, 'utf8').trim();
+              }
+            } catch {}
 
             const promptLines = [
-              basePrompt,
-              '',
+              effectivePrompt ? `## 节点执行指令\n${effectivePrompt}` : '',
+              workMdContent ? `## 本节点具体工作 (work.md)\n${workMdContent}` : '',
+              reqMdContent ? `## 需求文档 (requirements.md)\n${reqMdContent}` : '',
+              devMdContent ? `## 开发文档 (development.md)\n${devMdContent}` : '',
               '---',
               '## Isolated Node Attempt Runtime Context',
               `Task ID: ${taskId} (Revision: r${revisionRecord.revision}, Digest: ${revisionRecord.package_digest})`,
@@ -943,25 +836,22 @@ export class WorkflowEngine {
               `Attempt ID: ${runId} (Execution #${currentExecIndex}, Round ${currentRound})`,
               `Working Directory: ${confirmedCwd}`,
               `Isolated Attempt Directory: ${materialized.paths.attemptDir}`,
+              `Material Directory: ${materialized.paths.materialDir}`,
+              `Shared Directory: ${materialized.paths.sharedDir}`,
               `Context Manifest: ${materialized.paths.contextPath}`,
-              `Node Spec: ${path.join(materialized.paths.materialDir, 'node.md')}`,
-              `Node Resources Dir: ${path.join(materialized.paths.materialDir, 'resources')}`,
-              `Shared Resources Dir: ${path.join(materialized.paths.sharedDir, 'resources')}`,
-              `Bound Inputs Dir: ${materialized.paths.inputsDir}`,
               `Outputs Dir: ${materialized.paths.outputsDir}`,
-            ];
+            ].filter(Boolean);
             if (isVerification) {
-              promptLines.push('', '自行检查项目和任务材料，选择并真实运行测试命令；不修改业务代码。',
+              promptLines.push(
+                '自行检查项目和任务材料，选择并真实运行测试命令；不修改业务代码。',
                 '将证据保存为 Outputs Dir 下的 test_report.json，格式为 {"tests":[{"command":"实际运行的命令","cwd":"实际工作目录","exit_code":0,"stdout":"实际标准输出","stderr":"实际错误输出"}]}。',
-                'tests 至少包含一条实际执行记录；无法运行或缺失证据时如实报告阻塞。工作台根据退出码判定测试结果，不要求用户配置命令。');
-            }
-            if (inputResolution.inputsSummaryText) {
-              promptLines.push('', '### Bound Upstream Inputs', inputResolution.inputsSummaryText);
+                'tests 至少包含一条实际执行记录；无法运行或缺失证据时如实报告阻塞。工作台根据退出码判定测试结果，不要求用户配置命令。'
+              );
             }
             if (reworkFeedback) {
-              promptLines.push('', reworkFeedback);
+              promptLines.push(reworkFeedback);
             }
-            const fullPrompt = promptLines.join('\n');
+            const fullPrompt = promptLines.join('\n\n');
 
             const roundDbId = db.createExecutionRound({
               task_id: taskId,
@@ -998,10 +888,10 @@ export class WorkflowEngine {
                 revision: revisionRecord.revision,
                 confirmedCwd,
                 attemptDir: materialized.paths.attemptDir,
-                nodePrompt: basePrompt,
-                materialFiles: manifestNode.resources.map((r) => r.path),
-                sharedFiles: manifestNode.shared_refs,
-                boundInputsSummary: inputResolution.inputsSummaryText,
+                nodePrompt: effectivePrompt,
+                materialFiles: ['work.md'],
+                sharedFiles: ['requirements.md', 'development.md'],
+                boundInputsSummary: '',
                 testRunsSummary: testSummaryText,
                 gitDiff: diffSnapshot.diff,
                 definedNodeIds: definedTaskNodeIds,
@@ -1159,7 +1049,7 @@ export class WorkflowEngine {
             }
           }
 
-          // Validate output_contract and persist canonical result.json
+          // Record outputs and persist canonical result.json
           const outputCheck = this.validateAndRecordNodeOutputs({
             taskId,
             revision: revisionRecord.revision,
@@ -1171,7 +1061,6 @@ export class WorkflowEngine {
             outcome,
             summary,
             issues: issuesForResult,
-            manifestNode,
             attemptDir: materialized.paths.attemptDir,
             outputsDir: materialized.paths.outputsDir,
             extraOutputs,
