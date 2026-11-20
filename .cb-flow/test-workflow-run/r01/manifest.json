@@ -1,0 +1,245 @@
+{
+  "protocol_version": "cb.task-package/2.0",
+  "task_key": "test-workflow-run",
+  "revision": 1,
+  "title": "工作流链路连通性自测 (test)",
+  "target_cwd": "D:/CODE/AI/CBWorkBench",
+  "workflow": {
+    "id": "default",
+    "definition_sha256": "23d94b79cf5b110f0f453ff16aa95bf0404fdf43310f97db672cc4def4639989"
+  },
+  "readiness": "ready",
+  "blockers": [],
+  "nodes": [
+    {
+      "node_id": "development",
+      "node_ref": "nodes/development/node.md",
+      "prompt_ref": "nodes/development/prompt.md",
+      "resources": [
+        {
+          "id": "dev-items",
+          "path": "nodes/development/resources/development-items.md",
+          "description": "工单清单"
+        }
+      ],
+      "shared_refs": [
+        "shared/resources/requirements.md",
+        "shared/resources/acceptance-baseline.md"
+      ],
+      "input_bindings": [],
+      "output_contract": {
+        "required_outputs": [
+          "result"
+        ],
+        "optional_outputs": []
+      }
+    },
+    {
+      "node_id": "test",
+      "node_ref": "nodes/test/node.md",
+      "prompt_ref": "nodes/test/prompt.md",
+      "resources": [
+        {
+          "id": "test-cases",
+          "path": "nodes/test/resources/test-cases.md",
+          "description": "测试用例"
+        }
+      ],
+      "shared_refs": [
+        "shared/resources/requirements.md"
+      ],
+      "input_bindings": [
+        {
+          "slot": "dev_output",
+          "from_node_id": "development",
+          "output": "result",
+          "required": true,
+          "constraint": "current_revision"
+        }
+      ],
+      "output_contract": {
+        "required_outputs": [
+          "result"
+        ],
+        "optional_outputs": []
+      }
+    },
+    {
+      "node_id": "acceptance",
+      "node_ref": "nodes/acceptance/node.md",
+      "prompt_ref": "nodes/acceptance/prompt.md",
+      "resources": [
+        {
+          "id": "criteria",
+          "path": "nodes/acceptance/resources/acceptance-criteria.md",
+          "description": "验收标准"
+        }
+      ],
+      "shared_refs": [
+        "shared/resources/requirements.md",
+        "shared/resources/acceptance-baseline.md"
+      ],
+      "input_bindings": [
+        {
+          "slot": "test_output",
+          "from_node_id": "test",
+          "output": "result",
+          "required": true,
+          "constraint": "current_revision"
+        }
+      ],
+      "output_contract": {
+        "required_outputs": [
+          "result"
+        ],
+        "optional_outputs": []
+      }
+    },
+    {
+      "node_id": "human_review",
+      "node_ref": "nodes/human_review/node.md",
+      "prompt_ref": "nodes/human_review/prompt.md",
+      "resources": [],
+      "shared_refs": [
+        "shared/resources/requirements.md"
+      ],
+      "input_bindings": [],
+      "output_contract": {
+        "required_outputs": [
+          "result"
+        ],
+        "optional_outputs": []
+      }
+    }
+  ],
+  "files": [
+    {
+      "path": "shared/resources/requirements.md",
+      "owner": {
+        "scope": "shared"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 759,
+      "sha256": "d312fa1c56e0299222c16b4c8bb1f8244abb39e48f60bdacabde4f6880aabffd"
+    },
+    {
+      "path": "shared/resources/acceptance-baseline.md",
+      "owner": {
+        "scope": "shared"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 358,
+      "sha256": "f6a31c541b8aa0e85a8b16a386bd1e9fc607c3747602c8a706e6ed8893fc2532"
+    },
+    {
+      "path": "nodes/development/node.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "development"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 432,
+      "sha256": "5a97ea9a02919c38f4339e4bdf509a92eb2f52675feabea595b644d147700e8e"
+    },
+    {
+      "path": "nodes/development/prompt.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "development"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 842,
+      "sha256": "c9f305a16dbf50428dae8c9f82e09329d0ff499b8fe8c4673d165883a8fc9a13"
+    },
+    {
+      "path": "nodes/development/resources/development-items.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "development"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 444,
+      "sha256": "c5161c509829d7c2285f3904cd1893adc3674999f81acce0abd23ddeb1eba96c"
+    },
+    {
+      "path": "nodes/test/node.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "test"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 242,
+      "sha256": "7a5b306ae8b5be3344851633b6ee59f0010820f50d465ea8bb2fda8deb453692"
+    },
+    {
+      "path": "nodes/test/prompt.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "test"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 448,
+      "sha256": "aa987941eff29ab3b6ab759312d4fd42a7fee09b6fd1e8453c209bae8611b241"
+    },
+    {
+      "path": "nodes/test/resources/test-cases.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "test"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 386,
+      "sha256": "8b64c7cdf2d157b98783dfd3cec6f4b2e6fa99ea2b5de5149d1bb4a1efb377d8"
+    },
+    {
+      "path": "nodes/acceptance/node.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "acceptance"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 184,
+      "sha256": "6ab0ead8711a0f2d8ce59392464442247748943bfeb892dcf38d4e97998ae594"
+    },
+    {
+      "path": "nodes/acceptance/prompt.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "acceptance"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 599,
+      "sha256": "eb7ebd94497fa3adeaf0249736bcc74d850c85cb343b9f6265db66b65043c9be"
+    },
+    {
+      "path": "nodes/acceptance/resources/acceptance-criteria.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "acceptance"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 193,
+      "sha256": "5dfe6243690e483b3bd8c4c623e51ca24df1ef51fd25b0d4a9e8b07c570b7870"
+    },
+    {
+      "path": "nodes/human_review/node.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "human_review"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 158,
+      "sha256": "57660a2dc8b6233a1454ffa0cab9c680e646f2714015b9d0b644a68293b86da0"
+    },
+    {
+      "path": "nodes/human_review/prompt.md",
+      "owner": {
+        "scope": "node",
+        "node_id": "human_review"
+      },
+      "media_type": "text/markdown",
+      "size_bytes": 274,
+      "sha256": "4735109b121185fc30884565869726992b4ecd05c2917e693f0b80f86c67560f"
+    }
+  ]
+}

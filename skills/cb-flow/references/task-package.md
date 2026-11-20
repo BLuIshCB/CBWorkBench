@@ -1,100 +1,124 @@
-# 任务包与无上下文提示词规范
+# 任务包与无上下文提示词规范（`cb.task-package/2.0`）
 
-生成任务包时读取本文件。这是 cb-flow 的本地材料约定，不是已实现的服务端 API；以实际发现的 MCP Schema 为准进行无损映射，不能因此删减用户已确认的标准或提示词。
+用户明确选择工作流后，生成任务包时读取本文件。先列出工作流并询问用户采用哪个，取得选择后读取完整定义与提示词，再按节点设计方案和 Markdown；不得直接套用默认模板。所有字段与目录布局对应工作台 MCP 服务端契约（通过 `workbench_get_package_protocol` 与 `workbench_get_workflow` 实时查询）。
 
-## 文件组织
+## 1. 标准目录组织
+
+主 Agent 在业务工作区临时冻结目录 `.cb-flow/<task-key>/rNN/` 下按以下统一结构生成任务包（所有任务节点使用相同目录形态，不按节点名称特殊分化）：
 
 ```text
-rNN/
+r01/
   manifest.json
-  task.md
-  development.md
-  tests.md
-  acceptance.md
-  prompts/
-    worker-<id>.md
-    verifier.md
+  shared/
+    resources/
+      requirements.md            # 可选：共同需求与边界基线
+      acceptance-baseline.md     # 可选：冻结的共同判定标准
+  nodes/
+    <safe_node_dir>/             # 来自 workbench_get_workflow 返回的 dir_name
+      node.md                    # 节点职责、输入、工作步骤、完成条件、输出与阻塞处理
+      prompt.md                  # 节点独立提示词或人工核验指引
+      resources/                 # 可选：本节点专属清单、用例、JSON Schema 等普通资源
+        <resource_files>
 ```
 
-只生成任务实际需要的 Worker。通常包含开发、审查、测试与修复职责；开发和修复可由同一 Worker 承担，但职责和输入必须明确。所有提示词均作为任务包文件上传。
+约束：
+- **禁止旧全局正文文件**：不再使用根目录 `task.md`、`development.md`、`tests.md`、`acceptance.md` 或 `prompts/verifier.md` / `prompts/worker-*.md`。
+- **文本编码**：所有文本（Markdown / JSON）必须为 UTF-8 无 BOM；`size_bytes` 和 `sha256` 必须严格按原始字节计算。
+- **路径安全**：统一使用 `/`，禁止绝对路径、盘符、`..`、UNC、符号链接或大小写重名。
+- **所有权隔离**：`shared/resources/*` 归属 `{"scope": "shared"}`，各 `nodes/<dir>/*` 归属 `{"scope": "node", "node_id": "<id>"}`；任何节点不得引用他节点私有文件。
 
-## manifest.json
+## 2. `manifest.json` 规范
 
-使用有效 JSON，包含以下本地字段。它用于关联材料与版本，字段名不代表远端工具支持同名参数。
+先调用 `workbench_get_workflow` 获取 `definition_sha256`、任务节点 ID、安全目录名 `dir_name` 及 `material_contract`：
 
-| 字段 | 内容 |
-|---|---|
-| `packageVersion` | 本地格式版本 `1` |
-| `taskKey`、`revision`、`title` | 唯一任务标识、递增修订号、可读标题 |
-| `readiness`、`blockers` | `ready` 或 `blocked`，以及具体未决条件；不表示获准执行 |
-| `workspace` | 实际 cwd、Git 根目录、HEAD、现有改动摘要；未知值明确标明 |
-| `requirements` | 需求 ID 与摘要 |
-| `developmentItems` | 开发项 ID、对应需求 ID、执行顺序、负责 Worker ID、完成条件 |
-| `testCases` | 用例 ID、需求 ID、负责 Worker ID、自动或人工、是否必需 |
-| `criteria` | 标准 ID、需求 ID、测试或自动验收或人工审核类别、所需证据 |
-| `workers` | Worker ID、职责、`workbuddy-mcp`、固定模型 `deepseek-v4-flash`、提示词文件 |
-| `verifier` | `codex-cli`、验收提示词文件；不随意替用户更换 Codex 模型 |
-| `executionPolicy` | 单次超时及预算等已决定的约束；未定项标明，不编造服务默认值 |
-| `files` | 包内相对路径、文件用途、SHA-256 |
+```json
+{
+  "protocol_version": "cb.task-package/2.0",
+  "task_key": "example-task",
+  "revision": 1,
+  "title": "示例任务",
+  "target_cwd": "D:/CODE/PROJECT",
+  "workflow": {
+    "id": "default",
+    "definition_sha256": "<from workbench_get_workflow>"
+  },
+  "readiness": "ready",
+  "blockers": [],
+  "nodes": [
+    {
+      "node_id": "development",
+      "node_ref": "nodes/development/node.md",
+      "prompt_ref": "nodes/development/prompt.md",
+      "resources": [
+        {
+          "id": "dev-items",
+          "path": "nodes/development/resources/development-items.md",
+          "description": "按 Tracer-bullet 拆解的独立工单清单"
+        }
+      ],
+      "shared_refs": ["shared/resources/requirements.md"],
+      "input_bindings": [],
+      "output_contract": {
+        "required_outputs": ["result"],
+        "optional_outputs": []
+      }
+    }
+  ],
+  "files": [
+    {
+      "path": "shared/resources/requirements.md",
+      "owner": { "scope": "shared" },
+      "media_type": "text/markdown",
+      "size_bytes": 123,
+      "sha256": "<64-hex>"
+    }
+  ]
+}
+```
 
-`files` 列出任务材料与全部提示词，不包含 manifest 本身、后续上传回执或运行报告。写完 manifest 后另算其文件 SHA-256，作为用户审阅版本的标识；不要把该值写回 manifest 形成自引用。
+关键规则：
+- `nodes` 必须 1:1 覆盖工作流的所有 `task` 节点（不含 `start` 与 `end`）。
+- `files` 必须完整登记 `nodes` 引用的全部文件，**不得登记 `manifest.json` 本身**。
+- `manifest.json` 写完后另行计算其原始字节 SHA-256（`manifest_sha256`），用于 `workbench_stage_package` 与 `workbench_finalize_package`。
+- `readiness` 仅为 `"ready"` 或 `"blocked"`；`"ready"` 仅代表材料完整，工作台手动启动与人工审核始终由人类用户操作决定。
 
-`ready` 仅表示材料完整；上传同意、工作台手动启动和最终人工审核由实际用户动作决定，不允许模型在 manifest 中填入虚假的同意或通过记录。
+## 3. 节点内容规范
 
-## 正文要求
+### `nodes/<dir>/node.md`
+以所选工作流中该节点的提示词、职责与实际流转为基础编写，不按节点名称猜测职责。所有任务节点包含：
 
-### task.md
+1. 节点目标与负责需求 ID
+2. 输入材料及用途
+3. 工作范围与必须保持的行为
+4. 具体工作项与执行步骤
+5. 完成条件与证据要求
+6. 交付物与输出格式
+7. 阻塞条件及处理方式
 
-根据 `to-spec` 规格规范收敛生成。包含经过清洗提炼的需求背景、目标、需求 ID、明确包含 (In Scope) 和明确排除 (Out of Scope)、已验证的代码入口及调用关系、核心契约与数据模型、工作目录及基准、已知风险和未决事项。严禁把整个聊天记录直接当作项目背景，丢弃所有中间推导噪音。
+### `nodes/<dir>/prompt.md`
+保留编排提示词的要求，补充本次节点的输入、步骤、完成条件与输出。执行器会同时接收编排提示词和任务包提示词，任务包不能降低或覆盖编排要求；出现冲突先澄清。
 
-### development.md
+- **Agent 节点**：开发节点注入 `implement`（全新窗口隔离 + TDD 红绿重构）与 `/code-review` 自审要求；只读验收节点使用只读审查约束，其他节点按职责设计。使用运行视图相对路径（`context.json`、`material/node.md`、`material/resources/*`、`shared/resources/*`、`inputs/*`、`outputs/`），严禁依赖主 Agent 聊天上下文。
+- **测试验证 Agent 节点**（`result_rule = "verification"`）：根据项目的真实测试入口和任务验收要求自行选择、执行命令，不修改业务代码。命令可以作为任务材料中的建议，不是用户必须填写的工作流配置。声明 `test_report` 输出，并为下游验收绑定当前代码代次的测试证据。
+- **Manual 节点**：写明人应查看什么、通过/退回条件与退回原因指引。
 
-根据 `to-tickets` 规范拆解生成。按 Tracer-bullet（端到端贯穿调用链）拆解工单，每项包含工单 ID、需求 ID、显式声明的阻塞边（`blocked_by` / `blocks`）、负责 Worker、相关真实路径、具体自包含任务及可检查的完成条件。每张票形成独立闭环，不依赖跨票隐式上下文。
+测试节点将实际执行证据写入 `outputs/test_report.json`，`tests` 至少一项：
 
-### tests.md
+```json
+{
+  "tests": [
+    { "command": "实际运行的命令", "cwd": "实际工作目录", "exit_code": 0, "stdout": "实际标准输出", "stderr": "实际错误输出" }
+  ]
+}
+```
 
-每个用例包含 ID、关联需求、前置环境和数据、输入、操作步骤、预期结果、执行方式、负责 Worker、证据要求。按任务实际风险覆盖正常流程、边界、异常及受影响的回归路径，不为无关范围增加测试。
+工作台根据节点提交的退出码判定测试结果并保存证据；非零退出码走失败路径，缺失或格式无效的证据阻塞任务。不得把 Agent 正常退出等同于测试通过。
 
-区分：已有可运行测试、需要 Worker 实现的自动化测试、人工检查。自动测试写明真实命令、工作目录、必需环境、通过条件和报告路径；尚不存在的测试入口标为待实现，不伪装成已验证命令。
+## 4. MCP 上传与修订流程（仅 `local_path`）
 
-缺少测试环境不等于测试通过，未发现预期测试、跳过、执行失败或报告不完整均须可识别。用例预期和必需标准不能由 Worker 为了通过而降低。
-
-### acceptance.md
-
-自动验收与最终人工审核分开。每条标准具有 ID、关联需求、判定条件、所需证据、阻断性和检查责任方。明确哪些内容允许留给人工检查；必需自动检查不能临时转成人工检查。
-
-通过条件需要对应实际代码状态，而不仅是 Git HEAD。要求提供材料版本、差异及参与验收文件的内容摘要，包含新文件；代码变化后旧结论不能直接复用。
-
-## 每个 Worker 提示词必须独立包含的内容
-
-编写实际完成的提示词，遵循 `implement`（全新窗口 + TDD 驱动）与 `/code-review`（审查门禁收尾）规范，不把以下说明原样作为空模板交付：
-
-1. **身份与目标：** Worker ID、职责、本次需求背景、它负责的自包含 Tracer-bullet 工单项。
-2. **会话隔离与执行模式：** 明确 Worker 在全新独立窗口中执行，不预设上一张票的会话记忆；以 TDD（测试先行：红灯编写失败测试 -> 绿灯编写最小实现 -> 绿灯保护下重构）推进代码。
-3. **项目上下文：** 已确认的工作目录、技术和业务背景、相关代码入口及调用关系、必须保持的行为。只写有证据的事实。
-4. **材料入口：** 明确要读取哪些任务包文件和项目文件，使用包内或工作区相对路径；说明工作台会在派发时提供任务包根目录和当前执行目录，不能依赖原主 Agent 的聊天或仅在主 Agent 本机存在的附件路径。
-5. **修改边界与 /code-review 收尾门禁：** 可以改什么、不能改什么、如何保护已有改动；完工前必须对照 `/code-review` 准则逐行检查 `git diff`，确保未修改工单范围外文件、覆盖边界异常、清理调试日志，并执行完整回归测试。不得自行提交、推送、合并、删除无关数据或修改验收基线。
-6. **本次输入：** 工作台派发时应附带任务与材料版本、执行轮次、当前代码状态、相关报告和上轮问题。第一轮没有问题清单应明确为空；必需输入缺失时返回受阻，不自行臆测。
-7. **执行要求：** 按已确认清单执行、验证实际结果，缺少能力或环境时说明。不得调用工作台启动、人工审核或其他不属于本 Worker 职责的动作。
-8. **完成与交接：** 完成条件、所需证据（真实执行测试的 stdout/stderr 与退出码 0）、输出格式；修复时逐项回应问题 ID，并报告对现有测试的影响。完成本票后会话上下文即可安全抛弃。
-
-输出建议为结构化结果：`workerId`、`revision`、`status`、`completedItemIds`、`changedFiles`、`checks`、`issues`、`artifacts`。`status` 为 `completed`、`needs_changes` 或 `blocked`。每项检查标明实际命令、结果及证据位置；未执行不能填写通过。工作台依真实契约校验此结果，不能只凭 completed 跳过测试或验收。
-
-## Codex 验收者提示词必须独立包含的内容
-
-- 说明它是独立 Codex CLI 验收会话，没有原始聊天记忆；目标是按冻结的标准验收，不重新定义任务。
-- 内嵌简要业务背景、目标、排除项和关键约束；给出明确的材料读取清单以及派发时提供的根目录、版本和快照字段。
-- 输入包括任务包、全部相关 Worker 结果、真实测试报告、代码差异、新文件摘要、历史未关闭问题及修复说明。输入不完整不能给出通过结论。
-- 逐个检查需求和验收标准，核对真实代码、测试证据和当前版本，不把 Worker 自述当作证据；必要检查缺失时交回测试职责补充。
-- 只承担验收，不修改业务代码、不降低标准、不自动启动任务、不代表用户完成人工审核。工作台负责实际进程和外部工具权限限制，提示词不是安全沙箱。
-- 不通过时标明问题 ID、关联标准、证据、建议处理的已定义 Worker ID 和修复要求；不得自行调用其他 Worker。无法判断时说明缺少什么。
-
-建议结果字段：`decision`、`revision`、`codeSnapshot`、`criteriaResults`、`issues`、`manualChecksPending`。`decision` 仅为 `passed`、`needs_changes` 或 `blocked`。只有必需自动标准全部有当前版本证据且通过、没有未解决阻断问题，才允许 `passed`；预先约定的人工检查列入待办，由用户最终决定，不伪造其结果。
-
-## 上传与修订
-
-材料生成后计算文件哈希并自检，提供可查看的实际内容。用户同意的是具体版本和目标工作台；内容或目录变化需新版本确认。
-
-工作台若使用不同字段名或附件形式，在不改变语义和材料内容的前提下映射。无法承载独立提示词、测试或验收标准时报告契约缺口，不静默删减。
-
-本地路径不能代替上传材料。除非实际接口明确支持并验证服务器可以读取，否则上传正文或附件内容。上传失败只影响提交状态，不删除已完成的本地包。
+1. **选择工作流与查询契约**：调用 `workbench_list_workflows` 展示候选并询问用户，等待选择后调用 `workbench_get_workflow` 与 `workbench_get_package_protocol`；本次已明确选择则直接核对。
+2. **本地冻结与自检**：写入 `.cb-flow/<task-key>/rNN/` 并计算所有文件与 Manifest 的真实字节大小及 SHA-256。
+3. **门禁 1（对话授权）**：向用户展示路径、摘要、节点分工与阻塞项，获得明确同意后再上传。
+4. **暂存与校验**：调用 `workbench_stage_package`（`source.mode: "local_path"`），再按需用 `workbench_finalize_package(validate_only=true)` 校验。
+5. **正式提交**：调用 `workbench_finalize_package(validate_only=false)` 冻结至工作台 `revisions/rNNNN/`，进入 `pending_confirm` 状态并给出 Web 详情链接，等待用户在 Web 端手动点击启动。
+6. **修订提交**：如任务运行中须先停止并确认进程退出；修订时 `operation: "revise"`，传入 `task_id`、`expected_revision` 与新 `revision = expected_revision + 1`。
