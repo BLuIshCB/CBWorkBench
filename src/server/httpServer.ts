@@ -11,20 +11,36 @@ import { GitService } from '../services/gitService.ts';
 import { workflowEngine } from '../services/workflowEngine.ts';
 import { adapterRegistry } from '../adapters/registry.ts';
 import { runtimeService } from '../services/runtimeService.ts';
+import { packageService } from '../services/packageService.ts';
+import { taskCleanupService } from '../services/taskCleanupService.ts';
+import { PackageProtocolError } from '../services/packageProtocol.ts';
 import {
+  DATA_DIR,
+  DATA_DIR_SOURCE,
   DEFAULT_PORT,
   DEFAULT_HOST,
+  INSTANCE_ID,
+  LEGACY_DATA_PATH,
   VERIFIER_DEFAULT_MODEL,
   TaskStatus,
 } from '../config/constants.ts';
+import {
+  isStandaloneExe,
+  removeServerInfoFile,
+  resolveResidentServerForDataDir,
+  writeServerInfoFile,
+} from '../config/dataDir.ts';
 import { logger } from '../utils/logger.ts';
 import { resolveSupportedNode } from '../utils/nodeResolver.js';
 import {
   validateWorkflowNodes,
   DEFAULT_WORKFLOW_ID,
   DEFAULT_WORKFLOW_NODES,
+  buildUniformNodeMaterialContract,
+  computeWorkflowDefinitionSha256,
   type WorkflowNode,
 } from '../services/workflowDefinition.ts';
+import { encodeNodeDirName } from '../utils/pathSecurity.ts';
 import { EMBEDDED_ASSETS } from '../ui/embeddedAssets.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -48,13 +64,20 @@ function resolveUiDir(): string {
 }
 const UI_DIR = resolveUiDir();
 
+function decodeRouteParam(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
 export async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
     let body = '';
     req.on('data', (chunk) => {
       body += chunk.toString();
       if (body.length > 5 * 1024 * 1024) {
-        // 5MB limit
         reject(new Error('Payload too large'));
       }
     });
@@ -91,7 +114,8 @@ export function sendFile(
   contentType: string,
   virtualKey?: string
 ): void {
-  if (fs.existsSync(filePath)) {
+  // EXE 只使用随包资源，避免旧后端加载工作区里的新版页面与接口客户端。
+  if (!isStandaloneExe() && fs.existsSync(filePath)) {
     const content = fs.readFileSync(filePath);
     res.writeHead(200, {
       'Content-Type': `${contentType}; charset=utf-8`,
@@ -102,7 +126,6 @@ export function sendFile(
     return;
   }
 
-  // Fallback to embedded asset if available (e.g. inside standalone SEA binary)
   if (virtualKey && EMBEDDED_ASSETS[virtualKey]) {
     const asset = EMBEDDED_ASSETS[virtualKey];
     const buffer = Buffer.from(asset.content, 'utf-8');
@@ -125,7 +148,6 @@ export function createHttpServer(): http.Server {
     const pathname = url.pathname;
     const method = req.method?.toUpperCase() || 'GET';
 
-    // CORS preflight
     if (method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
@@ -137,55 +159,129 @@ export function createHttpServer(): http.Server {
     }
 
     try {
-      const executionMatch=pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_-]+)\/execution$/);
-      if(executionMatch && method==='GET') {
-        if(!db.getTask(executionMatch[1])) {sendJson(res,404,{success:false,code:'NOT_FOUND',message:'Task not found'});return;}
-        const latest=db.latestRun(executionMatch[1]);
-        sendJson(res,200,{success:true,run:latest ? ExecutionService.snapshot(latest.runId) : null});return;
-      }
-      const cleanupMatch=pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/cleanup$/);
-      if(cleanupMatch && method==='POST') {
-        if(!db.getRun(cleanupMatch[1])){sendJson(res,404,{success:false,code:'NOT_FOUND',message:'Run not found'});return;}
-        const confirmed=await CliRunner.retryCleanup(cleanupMatch[1]);
-        sendJson(res,confirmed?200:409,{success:confirmed,...(confirmed?{}:{code:'CONFLICT'}),message:confirmed?'已确认回收':'无法安全确认回收，保留占用与现场；请检查原生进程。'});return;
-      }
-      const eventsMatch=pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/(events|stream)$/);
-      if(eventsMatch && method==='GET') {
-        const runId=eventsMatch[1];
-        const rawAfter=eventsMatch[2]==='stream' ? (req.headers['last-event-id'] ?? url.searchParams.get('after') ?? '0') : (url.searchParams.get('after') ?? '0');
-        const rawLimit=url.searchParams.get('limit') ?? '200';
-        const after=Number(rawAfter),limit=Number(rawLimit);
-        if(!/^\d+$/.test(String(rawAfter)) || !Number.isSafeInteger(after) || !/^\d+$/.test(rawLimit) || !Number.isSafeInteger(limit) || limit<1 || limit>500) {
-          sendJson(res,400,{success:false,code:'INVALID_INPUT',message:'Invalid event cursor or limit'});return;
+      const executionMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_-]+)\/execution$/);
+      if (executionMatch && method === 'GET') {
+        if (!db.getTask(executionMatch[1])) {
+          sendJson(res, 404, { success: false, code: 'NOT_FOUND', message: 'Task not found' });
+          return;
         }
-        if(!db.getRun(runId)) {sendJson(res,404,{success:false,code:'NOT_FOUND',message:'Run not found'});return;}
-        if(eventsMatch[2]==='events') {
-          const rows=db.runEvents(runId,after,limit+1);const events=rows.slice(0,limit);
-          sendJson(res,200,{success:true,events,nextAfter:events.at(-1)?.seq ?? after,hasMore:rows.length>limit});return;
+        const latest = db.latestRun(executionMatch[1]);
+        sendJson(res, 200, { success: true, run: latest ? ExecutionService.snapshot(latest.runId) : null });
+        return;
+      }
+
+      const cleanupMatch = pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/cleanup$/);
+      if (cleanupMatch && method === 'POST') {
+        if (!db.getRun(cleanupMatch[1])) {
+          sendJson(res, 404, { success: false, code: 'NOT_FOUND', message: 'Run not found' });
+          return;
         }
-        res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache','Connection':'keep-alive'});
-        let cursor=after;let closed=false;let backpressured=false;
-        const pump=()=>{
-          if(closed || backpressured)return;
+        const confirmed = await CliRunner.retryCleanup(cleanupMatch[1]);
+        sendJson(res, confirmed ? 200 : 409, {
+          success: confirmed,
+          ...(confirmed ? {} : { code: 'CONFLICT' }),
+          message: confirmed ? '已确认回收' : '无法安全确认回收，保留占用与现场；请检查原生进程。',
+        });
+        return;
+      }
+
+      const eventsMatch = pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/(events|stream)$/);
+      if (eventsMatch && method === 'GET') {
+        const runId = eventsMatch[1];
+        const rawAfter =
+          eventsMatch[2] === 'stream'
+            ? (req.headers['last-event-id'] ?? url.searchParams.get('after') ?? '0')
+            : (url.searchParams.get('after') ?? '0');
+        const rawLimit = url.searchParams.get('limit') ?? '200';
+        const after = Number(rawAfter);
+        const limit = Number(rawLimit);
+        if (
+          !/^\d+$/.test(String(rawAfter)) ||
+          !Number.isSafeInteger(after) ||
+          !/^\d+$/.test(rawLimit) ||
+          !Number.isSafeInteger(limit) ||
+          limit < 1 ||
+          limit > 500
+        ) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: 'Invalid event cursor or limit' });
+          return;
+        }
+        if (!db.getRun(runId)) {
+          sendJson(res, 404, { success: false, code: 'NOT_FOUND', message: 'Run not found' });
+          return;
+        }
+        if (eventsMatch[2] === 'events') {
+          const rows = db.runEvents(runId, after, limit + 1);
+          const events = rows.slice(0, limit);
+          sendJson(res, 200, { success: true, events, nextAfter: events.at(-1)?.seq ?? after, hasMore: rows.length > limit });
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+        let cursor = after;
+        let closed = false;
+        let backpressured = false;
+        const pump = () => {
+          if (closed || backpressured) return;
           try {
-            const events=db.runEvents(runId,cursor,100);
-            if(!events.length && (!db.getRun(runId) || db.getRun(runId)?.finishedAt!==null)){res.end();return;}
-            for(const event of events) {
-              const frame='id: '+event.seq+'\nevent: execution\ndata: '+JSON.stringify(event)+'\n\n';
-              cursor=event.seq;
-              if(Buffer.byteLength(frame)>1048576 || res.writableLength>1048576) {res.end();return;}
-              if(!res.write(frame)) {backpressured=true;return;}
-              if(event.type==='finished') {res.end();return;}
+            const events = db.runEvents(runId, cursor, 100);
+            if (!events.length && (!db.getRun(runId) || db.getRun(runId)?.finishedAt !== null)) {
+              res.end();
+              return;
             }
-          } catch {res.destroy();}
+            for (const event of events) {
+              const frame = 'id: ' + event.seq + '\nevent: execution\ndata: ' + JSON.stringify(event) + '\n\n';
+              cursor = event.seq;
+              if (Buffer.byteLength(frame) > 1048576 || res.writableLength > 1048576) {
+                res.end();
+                return;
+              }
+              if (!res.write(frame)) {
+                backpressured = true;
+                return;
+              }
+              if (event.type === 'finished') {
+                res.end();
+                return;
+              }
+            }
+          } catch {
+            res.destroy();
+          }
         };
-        const poll=setInterval(pump,100);
-        res.on('drain',()=>{backpressured=false;pump();});
-        const heartbeat=setInterval(()=>{if(!backpressured && !res.write(': heartbeat\n\n'))backpressured=true;},15000);
-        res.on('close',()=>{closed=true;clearInterval(poll);clearInterval(heartbeat);});
-        pump();return;
+        const poll = setInterval(pump, 100);
+        res.on('drain', () => {
+          backpressured = false;
+          pump();
+        });
+        const heartbeat = setInterval(() => {
+          if (!backpressured && !res.write(': heartbeat\n\n')) backpressured = true;
+        }, 15000);
+        res.on('close', () => {
+          closed = true;
+          clearInterval(poll);
+          clearInterval(heartbeat);
+        });
+        pump();
+        return;
       }
-      // API Routes
+
+      // Instance discovery endpoint
+      if (pathname === '/api/system/instance' && method === 'GET') {
+        const addr = (req.socket?.server as any)?.address?.();
+        sendJson(res, 200, {
+          success: true,
+          instance_id: INSTANCE_ID,
+          data_dir: DATA_DIR,
+          source: DATA_DIR_SOURCE,
+          legacy_data_path: LEGACY_DATA_PATH,
+          pid: process.pid,
+          host: addr?.address || DEFAULT_HOST,
+          port: addr?.port || DEFAULT_PORT,
+        });
+        return;
+      }
+
+      // Task List
       if (pathname === '/api/tasks' && method === 'GET') {
         const statusFilter = url.searchParams.get('status') as TaskStatus | undefined;
         const tasks = db.listTasks(statusFilter);
@@ -193,24 +289,32 @@ export function createHttpServer(): http.Server {
         return;
       }
 
-      // Clear all tasks and associated files
+      // Clear all tasks via unified recoverable cleanup
       if (
         (pathname === '/api/tasks/clear-all' && method === 'POST') ||
         (pathname === '/api/tasks' && method === 'DELETE')
       ) {
-        await workflowEngine.handleAllTasksDeleted();
-        const { deletedCount } = db.deleteAllTasks();
-        taskFileStore.deleteAllTaskFiles();
-        logger.info(`[HttpServer] Cleared all tasks (${deletedCount} tasks) and deleted associated files`);
+        const result = await taskCleanupService.deleteAllTasks();
+        if (!result.ok) {
+          sendJson(res, 409, {
+            success: false,
+            code: 'CLEANUP_FAILED',
+            message: `部分任务清理失败 (${result.failedCount})：${result.failures.map((f) => `${f.task_id}: ${f.message}`).join('；')}`,
+            deletedCount: result.deletedCount,
+            failures: result.failures,
+          });
+          return;
+        }
+        logger.info(`[HttpServer] Cleared all tasks (${result.deletedCount} tasks) and all owned resources`);
         sendJson(res, 200, {
           success: true,
-          message: `已成功清空所有任务（共 ${deletedCount} 个）及其相关方案和文件`,
-          deletedCount,
+          message: `已成功清空所有任务（共 ${result.deletedCount} 个）及其全部关联材料和文件`,
+          deletedCount: result.deletedCount,
         });
         return;
       }
 
-      // Delete single task and associated files
+      // Delete single task via unified recoverable cleanup
       const deleteTaskMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)(\/delete)?$/);
       if (
         deleteTaskMatch &&
@@ -218,22 +322,63 @@ export function createHttpServer(): http.Server {
       ) {
         const taskId = deleteTaskMatch[1];
         const task = db.getTask(taskId);
-        if (!task) {
+        const dirExists = fs.existsSync(taskFileStore.getTaskRootDir(taskId));
+        if (!task && !dirExists && !taskCleanupService.isTaskDeleting(taskId)) {
           sendJson(res, 404, { success: false, message: `Task not found: ${taskId}` });
           return;
         }
 
-        await workflowEngine.handleTaskDeleted(taskId);
-        db.deleteTask(taskId);
-        taskFileStore.deleteTaskFiles(taskId);
-        logger.info(`[HttpServer] Deleted task ${taskId} and its files`);
+        const result = await taskCleanupService.deleteTask(taskId);
+        if (!result.ok) {
+          sendJson(res, 409, {
+            success: false,
+            code: result.code || 'CLEANUP_FAILED',
+            message: result.message,
+          });
+          return;
+        }
+
+        logger.info(`[HttpServer] Deleted task ${taskId} and all owned files`);
         sendJson(res, 200, {
           success: true,
-          message: `任务 ${taskId} 及其相关方案和文件已成功删除`,
+          message: result.message,
         });
         return;
       }
 
+      // Task revision resource slice viewer
+      const resourceMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/revisions\/(\d+)\/resource$/);
+      if (resourceMatch && method === 'GET') {
+        const taskId = resourceMatch[1];
+        const rev = Number(resourceMatch[2]);
+        const relPath = url.searchParams.get('path') || '';
+        const offset = Number(url.searchParams.get('offset') || '0');
+        const limit = Number(url.searchParams.get('limit') || '262144');
+        if (!relPath) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: 'path query parameter is required' });
+          return;
+        }
+        try {
+          const pkgRes = packageService.getPackage({
+            task_id: taskId,
+            revision: rev,
+            resource_path: relPath,
+            offset_bytes: Number.isFinite(offset) ? offset : 0,
+            max_bytes: Number.isFinite(limit) ? limit : 262144,
+          });
+          sendJson(res, 200, { success: true, ...pkgRes });
+        } catch (err: any) {
+          const status = err instanceof PackageProtocolError && err.code === 'TASK_NOT_FOUND' ? 404 : 400;
+          sendJson(res, status, {
+            success: false,
+            code: err?.code || 'INVALID_INPUT',
+            message: err?.message || 'Failed to read resource',
+          });
+        }
+        return;
+      }
+
+      // Task detail
       const taskDetailMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)$/);
       if (taskDetailMatch && method === 'GET') {
         const taskId = taskDetailMatch[1];
@@ -244,13 +389,20 @@ export function createHttpServer(): http.Server {
         }
 
         const latestRevision = db.getLatestRevision(taskId);
-        const workerPrompts = latestRevision ? db.getWorkerPrompts(taskId, latestRevision.revision) : [];
+        const revisions = db.listRevisions(taskId);
+        const packageFiles = latestRevision ? db.getPackageFiles(taskId, latestRevision.revision) : [];
+        let parsedManifest: any = null;
+        if (latestRevision?.manifest_json) {
+          try {
+            parsedManifest = JSON.parse(latestRevision.manifest_json);
+          } catch {}
+        }
+
         const rounds = db.getRounds(taskId);
         const testRuns = db.getTestRuns(taskId);
         const acceptanceRuns = db.getAcceptanceRuns(taskId);
         const humanDecisions = db.getHumanDecisions(taskId);
 
-        // Fetch diff snapshot if confirmed_cwd exists
         let diffSnapshot = null;
         try {
           const cwd = task.confirmed_cwd || task.target_cwd;
@@ -261,7 +413,7 @@ export function createHttpServer(): http.Server {
 
         let taskWorkflow = db.getTaskWorkflow(taskId);
         if (!taskWorkflow) {
-          taskWorkflow = db.initTaskWorkflow(taskId);
+          taskWorkflow = db.initTaskWorkflow(taskId, { revision: task.revision });
         }
         const workflowNodeRuns = db.getNodeRuns(taskId);
         const nodeExecutionCounts: Record<string, number> = {};
@@ -278,7 +430,9 @@ export function createHttpServer(): http.Server {
           success: true,
           task,
           latestRevision,
-          workerPrompts,
+          revisions,
+          manifest: parsedManifest,
+          packageFiles,
           rounds,
           testRuns,
           acceptanceRuns,
@@ -294,9 +448,16 @@ export function createHttpServer(): http.Server {
       const confirmStartMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/confirm-start$/);
       if (confirmStartMatch && method === 'POST') {
         const taskId = confirmStartMatch[1];
-        const parsed=confirmStartSchema.safeParse(await parseJsonBody(req));
-        if(!parsed.success) {sendJson(res,400,{success:false,code:'INVALID_INPUT',message:'启动参数不合法，单次执行时限须为1–1440整数分钟（毫秒值）'});return;}
-        const body=parsed.data;
+        const parsed = confirmStartSchema.safeParse(await parseJsonBody(req));
+        if (!parsed.success) {
+          sendJson(res, 400, {
+            success: false,
+            code: 'INVALID_INPUT',
+            message: '启动参数不合法，单次执行时限须为1–1440整数分钟（毫秒值）',
+          });
+          return;
+        }
+        const body = parsed.data;
         const result = await workflowEngine.confirmAndStartTask(taskId, body.confirmed_cwd, {
           executionTimeoutMs: body.execution_timeout_ms,
           workerExecutor: body.worker_executor,
@@ -337,8 +498,15 @@ export function createHttpServer(): http.Server {
 
       if (pathname === '/api/runtime/probe' && method === 'POST') {
         const body = await parseJsonBody(req);
-        if ((body.verify !== undefined && typeof body.verify !== 'boolean') || (body.verify === true && body.prompt !== undefined)) {
-          sendJson(res, 400, {success:false,code:'INVALID_INPUT',message:'verify 必须是布尔值；标准验证不允许提供 prompt'});
+        if (
+          (body.verify !== undefined && typeof body.verify !== 'boolean') ||
+          (body.verify === true && body.prompt !== undefined)
+        ) {
+          sendJson(res, 400, {
+            success: false,
+            code: 'INVALID_INPUT',
+            message: 'verify 必须是布尔值；标准验证不允许提供 prompt',
+          });
           return;
         }
         if (!body.cliId) {
@@ -387,6 +555,9 @@ export function createHttpServer(): http.Server {
             verifierModel: VERIFIER_DEFAULT_MODEL,
             activeTaskId: workflowEngine.getActiveTaskId(),
             isBusy: workflowEngine.isBusy(),
+            instanceId: INSTANCE_ID,
+            dataDir: DATA_DIR,
+            legacyDataPath: LEGACY_DATA_PATH,
           },
         });
         return;
@@ -401,6 +572,12 @@ export function createHttpServer(): http.Server {
             nodes = JSON.parse(wf.nodes_json);
           } catch {}
           const referencingTasks = db.getWorkflowReferencingTasks(wf.id);
+          const definitionSha = computeWorkflowDefinitionSha256({
+            id: wf.id,
+            name: wf.name,
+            description: wf.description,
+            nodes,
+          });
           return {
             id: wf.id,
             name: wf.name,
@@ -409,6 +586,7 @@ export function createHttpServer(): http.Server {
             isDefault: Boolean(wf.is_default),
             isReferenced: referencingTasks.length > 0,
             referencingCount: referencingTasks.length,
+            definition_sha256: definitionSha,
             nodes,
             createdAt: wf.created_at,
             updatedAt: wf.updated_at,
@@ -440,17 +618,36 @@ export function createHttpServer(): http.Server {
 
       const workflowDetailMatch = pathname.match(/^\/api\/workflows\/([^\/]+)$/);
       if (workflowDetailMatch && method === 'GET' && pathname !== '/api/workflows/reset-default') {
-        const wfId = decodeURIComponent(workflowDetailMatch[1]);
+        const wfId = decodeRouteParam(workflowDetailMatch[1]);
+        if (wfId === null) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: '无效的工作流 ID 编码' });
+          return;
+        }
         const wf = db.getWorkflow(wfId);
         if (!wf) {
           sendJson(res, 404, { success: false, message: `Workflow not found: ${wfId}` });
           return;
         }
-        let nodes = [];
+        let nodes: WorkflowNode[] = [];
         try {
           nodes = JSON.parse(wf.nodes_json);
         } catch {}
         const referencingTasks = db.getWorkflowReferencingTasks(wf.id);
+        const definitionSha = computeWorkflowDefinitionSha256({
+          id: wf.id,
+          name: wf.name,
+          description: wf.description,
+          nodes,
+        });
+        const enrichedNodes = nodes.map((n) => ({
+          ...n,
+          ...(n.type === 'task'
+            ? {
+                dir_name: encodeNodeDirName(n.id),
+                material_contract: buildUniformNodeMaterialContract(n),
+              }
+            : {}),
+        }));
         sendJson(res, 200, {
           success: true,
           workflow: {
@@ -460,7 +657,8 @@ export function createHttpServer(): http.Server {
             isDefault: Boolean(wf.is_default),
             isReferenced: referencingTasks.length > 0,
             referencingTasks,
-            nodes,
+            definition_sha256: definitionSha,
+            nodes: enrichedNodes,
             createdAt: wf.created_at,
             updatedAt: wf.updated_at,
           },
@@ -485,7 +683,6 @@ export function createHttpServer(): http.Server {
 
         const trimmedId = body.id.trim();
 
-        // 检查是否已被任务引用，被引用的工作流禁止修改
         if (db.isWorkflowReferenced(trimmedId)) {
           sendJson(res, 403, {
             success: false,
@@ -536,7 +733,11 @@ export function createHttpServer(): http.Server {
         pathname !== '/api/workflows/reset-default' &&
         (method === 'DELETE' || (method === 'POST' && pathname.endsWith('/delete')))
       ) {
-        const wfId = decodeURIComponent(deleteWorkflowMatch[1]);
+        const wfId = decodeRouteParam(deleteWorkflowMatch[1]);
+        if (wfId === null) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: '无效的工作流 ID 编码' });
+          return;
+        }
         const wf = db.getWorkflow(wfId);
         if (!wf) {
           sendJson(res, 404, { success: false, message: `工作流未找到: ${wfId}` });
@@ -589,7 +790,7 @@ export function createHttpServer(): http.Server {
         }
         let taskWorkflow = db.getTaskWorkflow(taskId);
         if (!taskWorkflow) {
-          taskWorkflow = db.initTaskWorkflow(taskId);
+          taskWorkflow = db.initTaskWorkflow(taskId, { revision: task.revision });
         }
         let nodes: WorkflowNode[] = [];
         try {
@@ -628,6 +829,60 @@ export function createHttpServer(): http.Server {
         return;
       }
 
+      // Task Workflow Node Update API (Update model / executor before execution starts)
+      const taskNodeUpdateMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/workflow\/nodes\/([a-zA-Z0-9_\-]+)$/);
+      if (taskNodeUpdateMatch && (method === 'PUT' || method === 'PATCH')) {
+        const taskId = taskNodeUpdateMatch[1];
+        const nodeId = taskNodeUpdateMatch[2];
+        const task = db.getTask(taskId);
+        if (!task) {
+          sendJson(res, 404, { success: false, message: 'Task not found' });
+          return;
+        }
+        if (task.status !== TaskStatus.PENDING_CONFIRM) {
+          sendJson(res, 409, {
+            success: false,
+            code: 'TASK_ALREADY_STARTED',
+            message: '任务已开始执行，节点模型与配置已冻结，无法修改。',
+          });
+          return;
+        }
+        let taskWorkflow = db.getTaskWorkflow(taskId);
+        if (!taskWorkflow) {
+          taskWorkflow = db.initTaskWorkflow(taskId, { revision: task.revision });
+        }
+        let nodes: WorkflowNode[] = [];
+        try {
+          nodes = JSON.parse(taskWorkflow.nodes_json);
+        } catch {
+          nodes = [];
+        }
+        const targetNode = nodes.find((n) => n.id === nodeId);
+        if (!targetNode) {
+          sendJson(res, 404, { success: false, message: `未找到节点: ${nodeId}` });
+          return;
+        }
+        const body = await parseJsonBody(req);
+        if (body.executor !== undefined) {
+          try {
+            adapterRegistry.getAdapter(body.executor);
+            targetNode.executor = body.executor;
+          } catch (e: any) {
+            sendJson(res, 400, { success: false, message: `不支持的执行器: ${body.executor}` });
+            return;
+          }
+        }
+        if (body.model !== undefined) {
+          targetNode.model = String(body.model).trim();
+        }
+        if (body.prompt !== undefined) {
+          targetNode.prompt = String(body.prompt);
+        }
+        db.updateTaskWorkflow(taskId, { nodes_json: JSON.stringify(nodes) });
+        sendJson(res, 200, { success: true, node: targetNode, nodes });
+        return;
+      }
+
       // Static UI Files
       if (pathname === '/' || pathname === '/runtime' || pathname === '/workflows' || pathname.startsWith('/tasks/')) {
         sendFile(res, path.join(UI_DIR, 'index.html'), 'text/html', '/index.html');
@@ -639,7 +894,6 @@ export function createHttpServer(): http.Server {
         return;
       }
 
-      // Modular JS Files under /js/
       if (pathname.startsWith('/js/') && pathname.endsWith('.js')) {
         const safePath = path.normalize(pathname).replace(/^(\.\.[\/\\])+/, '');
         const fullPath = path.join(UI_DIR, safePath);
@@ -648,12 +902,16 @@ export function createHttpServer(): http.Server {
         return;
       }
 
-      // 404
+      if (pathname.startsWith('/api/')) {
+        sendJson(res, 404, { success: false, code: 'NOT_FOUND', message: `Not Found: ${method} ${pathname}` });
+        return;
+      }
+
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('Not Found');
     } catch (err: any) {
       logger.error(`[HttpServer] Error processing ${method} ${pathname}:`, err);
-      sendJson(res, 500, { success: false, code:'INTERNAL', message: err?.message || 'Internal Server Error' });
+      sendJson(res, 500, { success: false, code: 'INTERNAL', message: err?.message || 'Internal Server Error' });
     }
   });
 }
@@ -669,14 +927,28 @@ export async function startServer(
     logger.error('[App] Unhandled promise rejection:', reason);
   });
 
-  // Crash recovery check for unfinalized tasks from previous process
+  // Enforce single resident daemon per DATA_DIR
+  const existingServer = await resolveResidentServerForDataDir(DATA_DIR, INSTANCE_ID);
+  if (existingServer && existingServer.pid !== process.pid) {
+    throw new Error(
+      `当前数据目录 (${DATA_DIR}) 已有常驻后台正在运行 (PID=${existingServer.pid}, URL=${existingServer.url})，禁止同一数据目录启动多个调度后台`
+    );
+  }
+
+  // Recover pending deletions before task loop recovery
+  try {
+    await taskCleanupService.recoverPendingDeletions();
+  } catch (e: any) {
+    logger.error('[HttpServer] Error during pending deletion recovery:', e);
+  }
+
   try {
     const recovery = db.recoverPendingTasks();
     if (recovery.recoveredCount > 0) {
       logger.info(`[HttpServer] Startup crash recovery: recovered ${recovery.recoveredCount} tasks stuck in running/queued state.`);
     }
   } catch (e: any) {
-    logger.error(`[HttpServer] Error during recovery check:`, e);
+    logger.error('[HttpServer] Error during recovery check:', e);
   }
 
   const server = createHttpServer();
@@ -688,11 +960,33 @@ export async function startServer(
     });
 
     server.listen(port, host, () => {
-      logger.info(`[HttpServer] CBWorkBench resident server listening at http://${host}:${port}`);
+      const boundAddr = server.address() as any;
+      const actualPort = boundAddr?.port || port;
+      const serverUrl = `http://${host}:${actualPort}`;
+      writeServerInfoFile(DATA_DIR, {
+        instance_id: INSTANCE_ID,
+        data_dir: DATA_DIR,
+        pid: process.pid,
+        host,
+        port: actualPort,
+        url: serverUrl,
+        started_at: Date.now(),
+      });
+
+      const cleanupLock = () => removeServerInfoFile(DATA_DIR, process.pid);
+      server.on('close', cleanupLock);
+      process.once('exit', cleanupLock);
+
+      logger.info(`[HttpServer] CBWorkBench resident server listening at ${serverUrl} (instance=${INSTANCE_ID}, dataDir=${DATA_DIR})`);
       console.log(`\n============================================================`);
       console.log(`🚀 CBWorkBench 多 Agent 开发工作台后台服务已启动！`);
-      console.log(`🌐 访问地址: http://${host}:${port}`);
-      console.log(`🛠️ 接入模式: ${adapterRegistry.listAdapters().map(adapter => adapter.name).join(' / ')}，统一 CLI 对话`);
+      console.log(`🌐 访问地址: ${serverUrl}`);
+      console.log(`📁 数据目录: ${DATA_DIR} (${DATA_DIR_SOURCE})`);
+      console.log(`🆔 实例标识: ${INSTANCE_ID}`);
+      if (LEGACY_DATA_PATH) {
+        console.log(`📦 检测到旧目录: ${LEGACY_DATA_PATH} (已保留未覆盖/未删除)`);
+      }
+      console.log(`🛠️ 接入模式: ${adapterRegistry.listAdapters().map((adapter) => adapter.name).join(' / ')}，统一 CLI 对话`);
       console.log(`============================================================\n`);
       resolve(server);
     });

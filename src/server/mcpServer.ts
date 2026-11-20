@@ -1,504 +1,256 @@
-import { executionTimeoutSchema, resolveExecutionTimeout } from '../services/executionPolicy.ts';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import crypto from 'node:crypto';
 import { db } from '../storage/db.ts';
-import { taskFileStore } from '../storage/fileStore.ts';
 import { GitService } from '../services/gitService.ts';
-import { workflowEngine } from '../services/workflowEngine.ts';
-import { DEFAULT_PORT, DEFAULT_HOST, TaskStatus } from '../config/constants.ts';
+import {
+  DATA_DIR,
+  DEFAULT_HOST,
+  DEFAULT_PORT,
+  INSTANCE_ID,
+} from '../config/constants.ts';
+import {
+  assertServerMatchesLocalInstance,
+  resolveResidentServerForDataDir,
+  DataDirConfigError,
+} from '../config/dataDir.ts';
 import { logger } from '../utils/logger.ts';
-import { DEFAULT_WORKFLOW_ID, type WorkflowNode } from '../services/workflowDefinition.ts';
+import {
+  DEFAULT_WORKFLOW_ID,
+  buildUniformNodeMaterialContract,
+  computeWorkflowDefinitionSha256,
+  type WorkflowNode,
+} from '../services/workflowDefinition.ts';
+import { PackageProtocolError } from '../services/packageProtocol.ts';
+import { packageService } from '../services/packageService.ts';
+import { taskCleanupService } from '../services/taskCleanupService.ts';
+import { executionTimeoutSchema } from '../services/executionPolicy.ts';
+import { encodeNodeDirName, PathSecurityError } from '../utils/pathSecurity.ts';
+
+function okJson(payload: Record<string, unknown>) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(
+          {
+            ok: true,
+            request_id: crypto.randomUUID(),
+            ...payload,
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+function errJson(err: unknown) {
+  const requestId = crypto.randomUUID();
+  if (err instanceof PackageProtocolError) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              ok: false,
+              request_id: requestId,
+              error: {
+                code: err.code,
+                message: err.message,
+                retryable: err.retryable,
+                details: err.details,
+              },
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+  if (err instanceof PathSecurityError || err instanceof DataDirConfigError) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              ok: false,
+              request_id: requestId,
+              error: {
+                code: err.code,
+                message: err.message,
+                retryable: false,
+                details: [],
+              },
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return {
+    isError: true,
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(
+          {
+            ok: false,
+            request_id: requestId,
+            error: {
+              code: 'INTERNAL_ERROR',
+              message,
+              retryable: false,
+              details: [],
+            },
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+async function verifyInstanceBindingIfConfigured(): Promise<string | null> {
+  const configuredUrl = process.env.CB_SERVER_URL?.trim();
+  if (configuredUrl) {
+    const verified = await assertServerMatchesLocalInstance(configuredUrl, DATA_DIR, INSTANCE_ID);
+    return verified.url;
+  }
+  const active = await resolveResidentServerForDataDir(DATA_DIR, INSTANCE_ID);
+  return active ? active.url : null;
+}
 
 export function createWorkbenchMcpServer(): McpServer {
   const server = new McpServer({
     name: 'cb-workbench-mcp',
-    version: '0.1.0',
+    version: '0.2.0',
   });
 
-  // 1. Tool: workbench_submit_task
+  // 1. workbench_get_package_protocol
   server.tool(
-    'workbench_submit_task',
-    '将主 Agent 与 cb-flow 制作的完整任务包上传至开发工作台。任务将处于【待启动确认】状态，返回任务编号与详情页面链接。注意：MCP 提交不会自动开始执行，用户须在工作台页面手动核对并点击【确认并开始】。',
-    {
-      task_key: z.string().describe('任务唯一英文标识（如 add-supplier-filter）'),
-      title: z.string().describe('任务的简明中文标题'),
-      target_cwd: z.string().describe('当前对话实际工作目录的绝对路径'),
-      manifest_json: z.string().describe('完整的 manifest.json 内容'),
-      task_md: z.string().describe('完整的 task.md 内容'),
-      development_md: z.string().describe('完整的 development.md 内容'),
-      tests_md: z.string().describe('完整的 tests.md 内容'),
-      acceptance_md: z.string().describe('完整的 acceptance.md 内容'),
-      verifier_prompt_md: z.string().describe('完整的 prompts/verifier.md 内容'),
-      worker_prompts: z
-        .record(z.string())
-        .describe('各 Worker 提示词映射，键为 workerId（如 "worker-dev"），值为独立提示词正文'),
-      workflow_id: z.string().optional().describe('工作流模板 ID（默认为 "default"）'),
-      node_prompts: z.record(z.string()).optional().describe('工作流各 Agent 节点独立提示词映射（键为节点 ID，值为提示词）'),
-      execution_timeout_ms: executionTimeoutSchema.optional(),
-      budget_max_rounds: z.number().optional().describe('可选：最大执行轮次预算（默认 10）'),
-    },
-    async (args) => {
-      try {
-        const taskId = `task-${crypto.randomBytes(6).toString('hex')}`;
-        const revision = 1;
-        const manifest=JSON.parse(args.manifest_json);
-        const executionTimeoutMs=resolveExecutionTimeout(args.execution_timeout_ms,null,manifest);
-        const executionTimeoutSource=args.execution_timeout_ms!==undefined?'request':manifest.executionPolicy?.executionTimeoutMs!==undefined?'manifest.executionTimeoutMs':executionTimeoutSchema.safeParse(manifest.executionPolicy?.timeoutMs).success?'manifest.timeoutMs':executionTimeoutSchema.safeParse(Number(process.env.CB_EXECUTION_TIMEOUT_MS)).success?'environment':'default';
-
-        // Inspect workspace Git
-        let gitInfo;
-        try {
-          gitInfo = GitService.inspectWorkspace(args.target_cwd);
-        } catch (e: any) {
-          gitInfo = {
-            targetCwd: args.target_cwd,
-            isGitRepo: false,
-            gitRoot: null,
-            branch: null,
-            headCommit: null,
-            isDirty: false,
-            statusText: `Git inspection error: ${e.message}`,
-          };
-        }
-
-        // Validate workflow
-        const wfId = args.workflow_id || DEFAULT_WORKFLOW_ID;
-        const wfDef = db.getWorkflow(wfId);
-        if (!wfDef) {
-          throw new Error(`未找到指定工作流模板: ${wfId}`);
-        }
-        if (args.node_prompts) {
-          const nodes = JSON.parse(wfDef.nodes_json) as WorkflowNode[];
-          for (const [nodeId] of Object.entries(args.node_prompts)) {
-            const node = nodes.find((n) => n.id === nodeId);
-            if (!node) throw new Error(`node_prompts 中的节点 ID 不存在: ${nodeId}`);
-            if (node.type !== 'task' || node.execution_mode !== 'agent') {
-              throw new Error(`节点 ${nodeId} 执行方式不是 Agent，不可配置 node_prompts`);
-            }
-          }
-        }
-
-        // Save into DB atomically via transaction
-        db.transaction(() => {
-          db.createTask({
-            id: taskId,
-            task_key: args.task_key,
-            revision,
-            title: args.title,
-            status: TaskStatus.PENDING_CONFIRM,
-            target_cwd: args.target_cwd,
-            git_root: gitInfo.gitRoot,
-            git_commit: gitInfo.headCommit,
-            git_status: gitInfo.statusText,
-            execution_timeout_ms: executionTimeoutMs,
-            budget_max_rounds: args.budget_max_rounds,
-          });
-
-          // Initialize task workflow
-          db.initTaskWorkflow(taskId, {
-            workflowId: wfDef.id,
-            nodePrompts: args.node_prompts,
-          });
-
-          // Save Revision
-          db.saveRevision({
-            task_id: taskId,
-            revision,
-            manifest_json: args.manifest_json,
-            task_md: args.task_md,
-            development_md: args.development_md,
-            tests_md: args.tests_md,
-            acceptance_md: args.acceptance_md,
-            verifier_prompt_md: args.verifier_prompt_md,
-          });
-
-          // Save Worker Prompts
-          for (const [workerId, promptText] of Object.entries(args.worker_prompts)) {
-            db.saveWorkerPrompt({
-              task_id: taskId,
-              revision,
-              worker_id: workerId,
-              role: workerId.includes('review') ? 'reviewer' : 'developer',
-              prompt_text: promptText,
-            });
-          }
-        });
-
-        // Save to File Store (projection)
-        taskFileStore.saveTaskPackage(taskId, revision, {
-          manifest_json: args.manifest_json,
-          task_md: args.task_md,
-          development_md: args.development_md,
-          tests_md: args.tests_md,
-          acceptance_md: args.acceptance_md,
-          verifier_prompt_md: args.verifier_prompt_md,
-          worker_prompts: args.worker_prompts,
-        });
-
-        const webUrl = `http://${DEFAULT_HOST}:${DEFAULT_PORT}/tasks/${taskId}`;
-        logger.info(`[WorkbenchMCP] Task submitted: ${taskId} (${args.title})`);
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: true,
-                  taskId,
-                  taskKey: args.task_key,
-                  revision,
-                  status: TaskStatus.PENDING_CONFIRM,
-                  workflowId: wfDef.id,
-                  execution_timeout_ms:executionTimeoutMs,
-                  executionTimeoutSource,
-                  statusDescription: '待启动确认',
-                  targetCwd: args.target_cwd,
-                  gitRoot: gitInfo.gitRoot,
-                  gitCommit: gitInfo.headCommit,
-                  webUrl,
-                  message:
-                    '任务包已成功上传到工作台，处于【待启动确认】状态。请用户在工作台页面核对目录并点击【确认并开始】。',
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      } catch (err: any) {
-        logger.error('[WorkbenchMCP] Error in workbench_submit_task:', err);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `上传任务包失败: ${err.message}` }],
-        };
-      }
-    }
-  );
-
-  // 2. Tool: workbench_revise_task
-  server.tool(
-    'workbench_revise_task',
-    '提交任务包的修订版本（如调整需求、补充测试用例或修正提示词）。',
-    {
-      task_id: z.string().describe('原任务的 ID'),
-      manifest_json: z.string().describe('修订后的 manifest.json'),
-      task_md: z.string().describe('修订后的 task.md'),
-      development_md: z.string().describe('修订后的 development.md'),
-      tests_md: z.string().describe('修订后的 tests.md'),
-      acceptance_md: z.string().describe('修订后的 acceptance.md'),
-      verifier_prompt_md: z.string().describe('修订后的 prompts/verifier.md'),
-      worker_prompts: z.record(z.string()).describe('修订后的 Worker 提示词映射'),
-    },
-    async (args) => {
-      try {
-        const task = db.getTask(args.task_id);
-        if (!task) {
-          return {
-            isError: true,
-            content: [{ type: 'text', text: `未找到任务: ${args.task_id}` }],
-          };
-        }
-
-        const newRevision = task.revision + 1;
-
-        // Atomically save revision and worker prompts
-        db.transaction(() => {
-          db.saveRevision({
-            task_id: args.task_id,
-            revision: newRevision,
-            manifest_json: args.manifest_json,
-            task_md: args.task_md,
-            development_md: args.development_md,
-            tests_md: args.tests_md,
-            acceptance_md: args.acceptance_md,
-            verifier_prompt_md: args.verifier_prompt_md,
-          });
-
-          for (const [workerId, promptText] of Object.entries(args.worker_prompts)) {
-            db.saveWorkerPrompt({
-              task_id: args.task_id,
-              revision: newRevision,
-              worker_id: workerId,
-              role: 'worker',
-              prompt_text: promptText,
-            });
-          }
-        });
-
-        taskFileStore.saveTaskPackage(args.task_id, newRevision, {
-          manifest_json: args.manifest_json,
-          task_md: args.task_md,
-          development_md: args.development_md,
-          tests_md: args.tests_md,
-          acceptance_md: args.acceptance_md,
-          verifier_prompt_md: args.verifier_prompt_md,
-          worker_prompts: args.worker_prompts,
-        });
-
-        const webUrl = `http://${DEFAULT_HOST}:${DEFAULT_PORT}/tasks/${args.task_id}`;
-        logger.info(`[WorkbenchMCP] Task revised: ${args.task_id} -> r${newRevision}`);
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: true,
-                  taskId: args.task_id,
-                  revision: newRevision,
-                  webUrl,
-                  message: `已保存第 ${newRevision} 版任务材料。用户可在工作台核对新版本。`,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      } catch (err: any) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `修订任务失败: ${err.message}` }],
-        };
-      }
-    }
-  );
-
-  // 3. Tool: workbench_get_task_status
-  server.tool(
-    'workbench_get_task_status',
-    '查询任务在工作台中的当前执行状态、当前轮次、当前执行阶段及阻塞信息。',
-    {
-      task_id: z.string().describe('任务 ID'),
-    },
-    async (args) => {
-      const task = db.getTask(args.task_id);
-      if (!task) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `未找到任务: ${args.task_id}` }],
-        };
-      }
-
-      const taskWf = db.getTaskWorkflow(args.task_id);
-      let currentExecCount = 0;
-      let currentMaxExec = 3;
-      let currentNodeName = task.current_stage || '';
-
-      if (taskWf) {
-        try {
-          const nodes = JSON.parse(taskWf.nodes_json) as WorkflowNode[];
-          const node = nodes.find((n) => n.id === taskWf.current_node_id);
-          if (node) {
-            currentNodeName = node.name;
-            currentMaxExec = node.max_executions || 0;
-            currentExecCount = db.getNodeRunCount(args.task_id, node.id);
-          }
-        } catch {}
-      }
-
-      const webUrl = `http://${DEFAULT_HOST}:${DEFAULT_PORT}/tasks/${args.task_id}`;
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              {
-                taskId: task.id,
-                taskKey: task.task_key,
-                revision: task.revision,
-                title: task.title,
-                status: task.status,
-                workflowId: taskWf?.workflow_id || 'default',
-                currentNodeId: taskWf?.current_node_id || 'start',
-                currentNodeName,
-                currentNodeExecutionCount: currentExecCount,
-                currentNodeMaxExecutions: currentMaxExec,
-                currentRound: task.current_round,
-                currentStage: task.current_stage,
-                activeWorkerId: task.active_worker_id,
-                blockedReason: task.blocked_reason,
-                webUrl,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    }
-  );
-
-  // 4. Tool: workbench_get_task_artifacts
-  server.tool(
-    'workbench_get_task_artifacts',
-    '读取任务的代码变更差异、测试报告或 Codex 验收结论证据。',
-    {
-      task_id: z.string().describe('任务 ID'),
-      round_number: z.number().optional().describe('可选：指定轮次，不传则返回最新轮次数据'),
-    },
-    async (args) => {
-      const task = db.getTask(args.task_id);
-      if (!task) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `未找到任务: ${args.task_id}` }],
-        };
-      }
-
-      const testRuns = db.getTestRuns(args.task_id, args.round_number);
-      const acceptanceRuns = db.getAcceptanceRuns(args.task_id);
-      const latestAcceptance = acceptanceRuns[acceptanceRuns.length - 1];
-
-      let diff = null;
-      try {
-        const cwd = task.confirmed_cwd || task.target_cwd;
-        diff = GitService.getDiffSnapshot(cwd);
-      } catch {}
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              {
-                taskId: task.id,
-                revision: task.revision,
-                diffSnapshot: diff,
-                testRuns,
-                latestAcceptance,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    }
-  );
-
-  // 5. Tool: workbench_delete_task
-  server.tool(
-    'workbench_delete_task',
-    '从工作台中删除指定任务，一并删除该任务相关的方案和文件。',
-    {
-      task_id: z.string().describe('要删除的任务 ID'),
-    },
-    async (args) => {
-      const task = db.getTask(args.task_id);
-      if (!task) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `未找到任务: ${args.task_id}` }],
-        };
-      }
-      await workflowEngine.handleTaskDeleted(args.task_id);
-      db.deleteTask(args.task_id);
-      taskFileStore.deleteTaskFiles(args.task_id);
-      logger.info(`[WorkbenchMCP] Task deleted: ${args.task_id}`);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              {
-                success: true,
-                taskId: args.task_id,
-                message: `任务 ${args.task_id} 及其相关方案和文件已成功删除`,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    }
-  );
-
-  // 6. Tool: workbench_list_workflows
-  server.tool(
-    'workbench_list_workflows',
-    '获取工作台中所有可用的工作流模板列表及节点数量。',
+    'workbench_get_package_protocol',
+    '查询 cb.task-package/2.0 任务包协议规范、大小限制、传输能力（仅支持 local_path）、模板、实例 ID 与当前绝对数据目录。',
     {},
     async () => {
-      const list = db.listWorkflows().map((wf) => {
-        let nodeCount = 0;
+      try {
+        await verifyInstanceBindingIfConfigured();
+        return okJson({ ...packageService.getProtocol() });
+      } catch (err) {
+        return errJson(err);
+      }
+    }
+  );
+
+  // 2. workbench_list_workflows
+  server.tool(
+    'workbench_list_workflows',
+    '获取工作台中所有可用的工作流模板列表、节点数量及定义摘要 (definition_sha256)。',
+    {},
+    async () => {
+      try {
+        const list = db.listWorkflows().map((wf) => {
+          let nodes: WorkflowNode[] = [];
+          try {
+            nodes = JSON.parse(wf.nodes_json);
+          } catch {}
+          const defSha = computeWorkflowDefinitionSha256({
+            id: wf.id,
+            name: wf.name,
+            description: wf.description,
+            nodes,
+          });
+          return {
+            id: wf.id,
+            name: wf.name,
+            description: wf.description,
+            isDefault: Boolean(wf.is_default),
+            nodeCount: nodes.length,
+            definition_sha256: defSha,
+            updatedAt: wf.updated_at,
+          };
+        });
+
+        return okJson({ success: true, workflows: list });
+      } catch (err) {
+        return errJson(err);
+      }
+    }
+  );
+
+  // 3. workbench_get_workflow
+  server.tool(
+    'workbench_get_workflow',
+    '获取指定工作流的完整节点图定义、definition_sha256、安全目录名及各任务节点的统一材料契约 (material_contract)。',
+    {
+      workflow_id: z.string().describe('工作流唯一标识（如 "default"）'),
+      node_ids: z.array(z.string()).optional().describe('可选：仅返回指定节点列表的详情'),
+    },
+    async (args) => {
+      try {
+        const wf = db.getWorkflow(args.workflow_id);
+        if (!wf) {
+          throw new PackageProtocolError('WORKFLOW_NOT_FOUND', `未找到工作流: ${args.workflow_id}`);
+        }
+
+        let nodes: WorkflowNode[] = [];
         try {
-          nodeCount = JSON.parse(wf.nodes_json).length;
+          nodes = JSON.parse(wf.nodes_json);
         } catch {}
-        return {
+
+        const definitionSha = computeWorkflowDefinitionSha256({
           id: wf.id,
           name: wf.name,
           description: wf.description,
-          isDefault: Boolean(wf.is_default),
-          nodeCount,
-          updatedAt: wf.updated_at,
-        };
-      });
+          nodes,
+        });
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ success: true, workflows: list }, null, 2),
+        const filterSet = args.node_ids ? new Set(args.node_ids) : null;
+        const enrichedNodes = nodes
+          .filter((n) => !filterSet || filterSet.has(n.id))
+          .map((n) => ({
+            ...n,
+            ...(n.type === 'task'
+              ? {
+                  dir_name: encodeNodeDirName(n.id),
+                  material_contract: buildUniformNodeMaterialContract(n),
+                }
+              : {}),
+          }));
+
+        return okJson({
+          success: true,
+          workflow: {
+            id: wf.id,
+            name: wf.name,
+            description: wf.description,
+            isDefault: Boolean(wf.is_default),
+            definition_sha256: definitionSha,
+            total_nodes: nodes.length,
+            truncated: Boolean(filterSet && enrichedNodes.length < nodes.length),
+            nodes: enrichedNodes,
+            createdAt: wf.created_at,
+            updatedAt: wf.updated_at,
           },
-        ],
-      };
-    }
-  );
-
-  // 7. Tool: workbench_get_workflow
-  server.tool(
-    'workbench_get_workflow',
-    '获取指定工作流的完整节点图定义（包含稳定节点 ID、执行方式、提示词模板、成功/失败去向和最大执行次数）。',
-    {
-      workflow_id: z.string().describe('工作流唯一标识（如 "default"）'),
-    },
-    async (args) => {
-      const wf = db.getWorkflow(args.workflow_id);
-      if (!wf) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `未找到工作流: ${args.workflow_id}` }],
-        };
+        });
+      } catch (err) {
+        return errJson(err);
       }
-
-      let nodes = [];
-      try {
-        nodes = JSON.parse(wf.nodes_json);
-      } catch {}
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              {
-                success: true,
-                workflow: {
-                  id: wf.id,
-                  name: wf.name,
-                  description: wf.description,
-                  isDefault: Boolean(wf.is_default),
-                  nodes,
-                  createdAt: wf.created_at,
-                  updatedAt: wf.updated_at,
-                },
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
     }
   );
 
-  // 8. Tool: workbench_delete_workflow
+  // 4. workbench_delete_workflow
   server.tool(
     'workbench_delete_workflow',
     '删除指定的工作流模板。注意：系统默认工作流（default）及正被任务引用的工作流禁止删除。',
@@ -506,65 +258,292 @@ export function createWorkbenchMcpServer(): McpServer {
       workflow_id: z.string().describe('待删除的工作流唯一标识（ID）'),
     },
     async (args) => {
-      const wf = db.getWorkflow(args.workflow_id);
-      if (!wf) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `未找到工作流: ${args.workflow_id}` }],
-        };
-      }
-      if (wf.id === DEFAULT_WORKFLOW_ID || Boolean(wf.is_default)) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: '系统默认工作流禁止删除' }],
-        };
-      }
-      if (db.isWorkflowReferenced(wf.id)) {
-        const refTasks = db.getWorkflowReferencingTasks(wf.id);
-        return {
-          isError: true,
-          content: [
-            {
-              type: 'text',
-              text: `工作流 [${wf.id}] 正被 ${refTasks.length} 个任务引用，禁止删除！请先清理相关任务。引用任务: ${refTasks.map((t) => `${t.title} (${t.id})`).join(', ')}`,
-            },
-          ],
-        };
-      }
       try {
+        const wf = db.getWorkflow(args.workflow_id);
+        if (!wf) {
+          throw new PackageProtocolError('WORKFLOW_NOT_FOUND', `未找到工作流: ${args.workflow_id}`);
+        }
+        if (wf.id === DEFAULT_WORKFLOW_ID || Boolean(wf.is_default)) {
+          throw new PackageProtocolError('FORBIDDEN_DELETE_DEFAULT', '系统默认工作流禁止删除');
+        }
+        if (db.isWorkflowReferenced(wf.id)) {
+          const refTasks = db.getWorkflowReferencingTasks(wf.id);
+          throw new PackageProtocolError(
+            'WORKFLOW_IN_USE',
+            `工作流 [${wf.id}] 正被 ${refTasks.length} 个任务引用，禁止删除！引用任务: ${refTasks.map((t) => `${t.title} (${t.id})`).join(', ')}`
+          );
+        }
         db.deleteWorkflow(wf.id);
         logger.info(`[WorkbenchMCP] Workflow deleted: ${wf.id}`);
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: true,
-                  message: `工作流 [${wf.name || wf.id}] 已成功删除`,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      } catch (e: any) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `删除工作流失败: ${e.message}` }],
-        };
+        return okJson({
+          success: true,
+          message: `工作流 [${wf.name || wf.id}] 已成功删除`,
+        });
+      } catch (err) {
+        return errJson(err);
       }
     }
   );
 
-  // 9. Tool: workbench_advance_workflow
+  // 5. workbench_stage_package
+  server.tool(
+    'workbench_stage_package',
+    '通过本机路径 (local_path) 导入并校验 cb.task-package/2.0 任务包或修订包至任务暂存区 (.staging)。注意：暂存不会创建可启动任务，须调用 workbench_finalize_package 完成冻结。',
+    {
+      protocol_version: z.string().describe('协议版本，固定为 "cb.task-package/2.0"'),
+      operation: z.enum(['create', 'revise']).describe('操作类型：create (新建任务) 或 revise (提交修订)'),
+      task_id: z.string().optional().describe('revise 时必填：原任务 ID；create 时可选预指定 ID'),
+      expected_revision: z.number().int().positive().optional().describe('revise 时必填：期望的当前修订号，防止并发覆盖'),
+      idempotency_key: z.string().describe('请求幂等键（建议 <task_key>:r<rev>:<manifest_sha256>）'),
+      execution_timeout_ms: executionTimeoutSchema.optional().describe('可选：单次执行超时（毫秒，1–1440 分钟整数倍）'),
+      budget_max_rounds: z.number().int().positive().max(100).optional().describe('可选：最大执行轮次预算（默认 10）'),
+      source: z
+        .object({
+          mode: z.string().describe('传输模式，当前仅支持 "local_path"'),
+          package_root: z.string().describe('本地任务包根目录绝对路径'),
+          manifest_path: z.string().optional().describe('包内 Manifest 相对路径（默认 "manifest.json"）'),
+          manifest_sha256: z.string().describe('manifest.json 原始字节的 64 位小写 SHA-256'),
+        })
+        .strict(),
+    },
+    async (args) => {
+      try {
+        await verifyInstanceBindingIfConfigured();
+        const res = packageService.stagePackage(args);
+        return okJson(res);
+      } catch (err) {
+        return errJson(err);
+      }
+    }
+  );
+
+  // 6. workbench_finalize_package
+  server.tool(
+    'workbench_finalize_package',
+    '对已暂存草稿执行完整校验并原子冻结为正式不可变修订 (revisions/rNNNN)。支持 validate_only=true 预检。正式提交后任务进入【待启动确认】状态，等待用户在 Web 端手动点击启动。',
+    {
+      draft_id: z.string().describe('暂存草稿 ID'),
+      manifest_sha256: z.string().describe('与暂存一致的 Manifest SHA-256 摘要'),
+      idempotency_key: z.string().describe('幂等键'),
+      validate_only: z.boolean().optional().describe('为 true 时仅执行完整性校验，不创建正式修订'),
+    },
+    async (args) => {
+      try {
+        await verifyInstanceBindingIfConfigured();
+        const res = packageService.finalizePackage(args);
+        return okJson(res);
+      } catch (err) {
+        return errJson(err);
+      }
+    }
+  );
+
+  // 7. workbench_get_package
+  server.tool(
+    'workbench_get_package',
+    '查询暂存草稿或正式任务包的 Manifest、文件索引、提交回执，并支持按 resource_path + offset_bytes + max_bytes 分页读取包内文件。',
+    {
+      idempotency_key: z.string().optional().describe('按幂等键查询提交或草稿结果'),
+      task_id: z.string().optional().describe('按任务 ID 查询'),
+      revision: z.number().int().positive().optional().describe('可选修订号（不传则返回任务当前修订）'),
+      draft_id: z.string().optional().describe('按暂存草稿 ID 查询'),
+      resource_path: z.string().optional().describe('可选：读取指定包内相对路径的文件内容（支持分页）'),
+      offset_bytes: z.number().int().nonnegative().optional().describe('读取起始字节偏移（默认 0）'),
+      max_bytes: z.number().int().positive().optional().describe('单次读取最大字节数（上限 262144）'),
+    },
+    async (args) => {
+      try {
+        await verifyInstanceBindingIfConfigured();
+        const res = packageService.getPackage(args);
+        return okJson(res);
+      } catch (err) {
+        return errJson(err);
+      }
+    }
+  );
+
+  // 8. workbench_get_node_context
+  server.tool(
+    'workbench_get_node_context',
+    '按任务、节点、执行 attempt_id 与 completion_token 获取当前节点运行视图与允许访问的资源（严格节点隔离，禁止读取他节点私有资源）。',
+    {
+      task_id: z.string().describe('任务 ID'),
+      node_id: z.string().describe('当前节点 ID'),
+      attempt_id: z.string().describe('当前节点执行 ID (run_id)'),
+      completion_token: z.string().describe('后台为本次节点执行分配的凭据'),
+      resource_path: z.string().optional().describe('可选：按节点权限读取允许的材料、共同资源、绑定输入或本尝试输出'),
+      offset_bytes: z.number().int().nonnegative().optional().describe('读取起始字节偏移'),
+      max_bytes: z.number().int().positive().optional().describe('单次读取最大字节数'),
+    },
+    async (args) => {
+      try {
+        await verifyInstanceBindingIfConfigured();
+        const res = packageService.getNodeContext(args);
+        return okJson(res);
+      } catch (err) {
+        return errJson(err);
+      }
+    }
+  );
+
+  // 9. workbench_get_task_status
+  server.tool(
+    'workbench_get_task_status',
+    '查询任务在工作台中的当前执行状态、当前节点、节点执行次数、修订版本、包摘要及阻塞信息。',
+    {
+      task_id: z.string().describe('任务 ID'),
+    },
+    async (args) => {
+      try {
+        const task = db.getTask(args.task_id);
+        if (!task) {
+          throw new PackageProtocolError('TASK_NOT_FOUND', `未找到任务: ${args.task_id}`);
+        }
+
+        const taskWf = db.getTaskWorkflow(args.task_id);
+        const rev = db.getRevision(args.task_id, task.revision);
+        let currentExecCount = 0;
+        let currentMaxExec = 0;
+        let currentNodeName = task.current_stage || '';
+
+        if (taskWf) {
+          try {
+            const nodes = JSON.parse(taskWf.nodes_json) as WorkflowNode[];
+            const node = nodes.find((n) => n.id === taskWf.current_node_id);
+            if (node) {
+              currentNodeName = node.name;
+              currentMaxExec = node.max_executions || 0;
+              currentExecCount = db.getNodeRunCount(args.task_id, node.id);
+            }
+          } catch {}
+        }
+
+        const webUrl = `http://${DEFAULT_HOST}:${DEFAULT_PORT}/tasks/${args.task_id}`;
+        return okJson({
+          taskId: task.id,
+          taskKey: task.task_key,
+          revision: task.revision,
+          title: task.title,
+          status: task.status,
+          workflowId: taskWf?.workflow_id || 'default',
+          workflowSha256: taskWf?.workflow_sha256 || rev?.workflow_sha256 || '',
+          packageDigest: rev?.package_digest || null,
+          readiness: rev?.readiness || null,
+          currentNodeId: taskWf?.current_node_id || 'start',
+          currentNodeName,
+          currentNodeExecutionCount: currentExecCount,
+          currentNodeMaxExecutions: currentMaxExec,
+          currentRound: task.current_round,
+          currentStage: task.current_stage,
+          activeWorkerId: task.active_worker_id,
+          blockedReason: task.blocked_reason,
+          webUrl,
+        });
+      } catch (err) {
+        return errJson(err);
+      }
+    }
+  );
+
+  // 10. workbench_get_task_artifacts
+  server.tool(
+    'workbench_get_task_artifacts',
+    '读取任务的代码变更差异、节点执行产物、命令执行记录及验收结论证据。',
+    {
+      task_id: z.string().describe('任务 ID'),
+      round_number: z.number().optional().describe('可选：指定轮次，不传则返回全部测试记录与最新验收'),
+    },
+    async (args) => {
+      try {
+        const task = db.getTask(args.task_id);
+        if (!task) {
+          throw new PackageProtocolError('TASK_NOT_FOUND', `未找到任务: ${args.task_id}`);
+        }
+
+        const nodeRuns = db.getNodeRuns(args.task_id);
+        const testRuns = db.getTestRuns(args.task_id, args.round_number);
+        const acceptanceRuns = db.getAcceptanceRuns(args.task_id);
+        const latestAcceptance = acceptanceRuns[acceptanceRuns.length - 1];
+
+        let diff = null;
+        try {
+          const cwd = task.confirmed_cwd || task.target_cwd;
+          diff = GitService.getDiffSnapshot(cwd);
+        } catch {}
+
+        return okJson({
+          taskId: task.id,
+          revision: task.revision,
+          diffSnapshot: diff,
+          nodeRuns,
+          testRuns,
+          latestAcceptance,
+        });
+      } catch (err) {
+        return errJson(err);
+      }
+    }
+  );
+
+  // 11. workbench_delete_task
+  server.tool(
+    'workbench_delete_task',
+    '从工作台中删除指定任务及其全部所属节点材料、历史修订、运行产物与草稿。若常驻后台正在运行，统一委托常驻后台执行可恢复清理。',
+    {
+      task_id: z.string().describe('要删除的任务 ID'),
+    },
+    async (args) => {
+      try {
+        const serverUrl = await verifyInstanceBindingIfConfigured();
+        if (serverUrl) {
+          const res = await fetch(`${serverUrl}/api/tasks/${encodeURIComponent(args.task_id)}`, {
+            method: 'DELETE',
+          });
+          const data = (await res.json()) as any;
+          if (!res.ok || !data?.success) {
+            throw new PackageProtocolError(
+              data?.code || 'CLEANUP_FAILED',
+              data?.message || `常驻后台删除任务失败 (HTTP ${res.status})`
+            );
+          }
+          return okJson({
+            success: true,
+            taskId: args.task_id,
+            delegatedToServer: serverUrl,
+            message: data.message,
+          });
+        }
+
+        const existingTask = db.getTask(args.task_id);
+        const hasDraft = db.hasActiveDraftForTask(args.task_id);
+        if (!existingTask && !hasDraft) {
+          throw new PackageProtocolError('TASK_NOT_FOUND', `未找到任务: ${args.task_id}`);
+        }
+
+        const result = await taskCleanupService.deleteTask(args.task_id);
+        if (!result.ok) {
+          throw new PackageProtocolError(result.code || 'CLEANUP_FAILED', result.message);
+        }
+
+        logger.info(`[WorkbenchMCP] Task deleted: ${args.task_id}`);
+        return okJson({
+          success: true,
+          taskId: args.task_id,
+          message: result.message,
+        });
+      } catch (err) {
+        return errJson(err);
+      }
+    }
+  );
+
+  // 12. workbench_advance_workflow
   server.tool(
     'workbench_advance_workflow',
     '当前正在运行的 Agent 报告本节点执行完成或失败并请求推进。后台结合连线配置统一推进，调用方无需也不得指定下一节点。',
     {
       task_id: z.string().describe('任务唯一标识'),
-      node_id: z.string().describe('当前节点 ID（如 "acceptance" 或 "development"）'),
+      node_id: z.string().describe('当前节点 ID'),
       attempt_id: z.string().describe('本次节点执行唯一 ID (run_id)'),
       completion_token: z.string().describe('本次节点执行分配的安全凭据'),
       request_id: z.string().describe('本次报告调用的唯一幂等请求 ID'),
@@ -572,43 +551,33 @@ export function createWorkbenchMcpServer(): McpServer {
       summary: z.string().describe('本次节点完成摘要或失败原因说明'),
     },
     async (args) => {
-      const res = db.registerAdvanceReport(
-        args.task_id,
-        args.node_id,
-        args.attempt_id,
-        args.completion_token,
-        args.request_id,
-        args.outcome,
-        args.summary
-      );
+      try {
+        const res = db.registerAdvanceReport(
+          args.task_id,
+          args.node_id,
+          args.attempt_id,
+          args.completion_token,
+          args.request_id,
+          args.outcome,
+          args.summary
+        );
 
-      if (!res.success) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `报告推进失败: ${res.message}` }],
-        };
+        if (!res.success) {
+          throw new PackageProtocolError('ADVANCE_REJECTED', `报告推进失败: ${res.message}`);
+        }
+
+        return okJson({
+          success: true,
+          taskId: args.task_id,
+          nodeId: args.node_id,
+          attemptId: args.attempt_id,
+          requestId: args.request_id,
+          duplicate: res.duplicate || false,
+          message: res.message,
+        });
+      } catch (err) {
+        return errJson(err);
       }
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              {
-                success: true,
-                taskId: args.task_id,
-                nodeId: args.node_id,
-                attemptId: args.attempt_id,
-                requestId: args.request_id,
-                duplicate: res.duplicate || false,
-                message: res.message,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
     }
   );
 
@@ -619,5 +588,5 @@ export async function startMcpServer(): Promise<void> {
   const server = createWorkbenchMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  logger.info('[WorkbenchMCP] Workbench stdio MCP server connected.');
+  logger.info(`[WorkbenchMCP] Workbench stdio MCP server connected. instance=${INSTANCE_ID}, dataDir=${DATA_DIR}`);
 }
