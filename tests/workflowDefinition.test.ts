@@ -13,6 +13,14 @@ const defaultRes = validateWorkflowNodes(DEFAULT_WORKFLOW_NODES, DEFAULT_WORKFLO
 assert.strictEqual(defaultRes.valid, true, `Default workflow should be valid: ${defaultRes.errors.join(', ')}`);
 console.log('  ✓ Default workflow passes validation');
 
+const defaultTest = DEFAULT_WORKFLOW_NODES.find((node) => node.id === 'test')!;
+assert.equal(defaultTest.execution_mode, 'agent');
+assert.equal(defaultTest.result_rule, 'verification');
+assert.ok(!('command' in defaultTest));
+const removedCommandMode = DEFAULT_WORKFLOW_NODES.map((node) => node.id === 'test'
+  ? { ...node, execution_mode: 'command', command: 'npm test' } as any : node);
+assert.equal(validateWorkflowNodes(removedCommandMode).valid, false, '工作流不再接受用户配置命令');
+
 // 2. Reject missing start or end
 const noStart = DEFAULT_WORKFLOW_NODES.filter((n) => n.type !== 'start');
 const noStartRes = validateWorkflowNodes(noStart);
@@ -76,7 +84,7 @@ const unreachableNodes: WorkflowNode[] = [
     id: 'orphan',
     name: '孤立任务',
     type: 'task',
-    execution_mode: 'command',
+    execution_mode: 'agent',
     on_success: 'end',
   },
 ];
@@ -89,7 +97,7 @@ console.log('  ✓ Rejects unreachable orphan nodes');
 const cycleNodes: WorkflowNode[] = [
   { id: 'start', name: '开始', type: 'start', on_success: 'taskA' },
   { id: 'taskA', name: 'A', type: 'task', execution_mode: 'agent', on_success: 'taskB', on_failure: 'taskB' },
-  { id: 'taskB', name: 'B', type: 'task', execution_mode: 'command', on_success: 'taskA', on_failure: 'taskA' },
+  { id: 'taskB', name: 'B', type: 'task', execution_mode: 'agent', on_success: 'taskA', on_failure: 'taskA' },
   { id: 'end', name: '结束', type: 'end' },
 ];
 const cycleRes = validateWorkflowNodes(cycleNodes);

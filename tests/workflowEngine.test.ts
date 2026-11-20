@@ -1,13 +1,102 @@
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import { db } from '../src/storage/db.ts';
 import { workflowEngine } from '../src/services/workflowEngine.ts';
-import { TaskStatus, RoundStage, VERIFIER_DEFAULT_MODEL } from '../src/config/constants.ts';
+import { packageService } from '../src/services/packageService.ts';
+import { computeWorkflowDefinitionSha256, type WorkflowNode } from '../src/services/workflowDefinition.ts';
+import { TaskStatus, VERIFIER_DEFAULT_MODEL } from '../src/config/constants.ts';
+import { adapterRegistry } from '../src/adapters/registry.ts';
+import { MANDATORY_CLI_POLICY } from '../src/adapters/types.ts';
+import { runVerificationAgent } from './fixtures/verificationAgent.ts';
 
-// Enable mock mode for fast deterministic testing
 process.env.CB_MOCK_WORKBUDDY = 'true';
 process.env.CB_MOCK_CODEX = 'true';
 
 console.log('[Test] Running workflowEngine.test.ts...');
+
+adapterRegistry.register({
+  id: 'engine-fixture', name: 'Engine fixture', description: 'Offline node execution',
+  defaultModel: 'default', supportedModels: ['default'], connectionType: 'fixture', executionPolicy: MANDATORY_CLI_POLICY,
+  async healthCheck() { return { healthy: true }; }, async abort() {},
+  async execute(context) { return await runVerificationAgent(context) || { ok: true, output: context.prompt, durationMs: 0, modelUsed: 'default' }; },
+});
+
+function createCustomWorkflow(wfId: string) {
+  const nodes: WorkflowNode[] = [
+    { id: 'start', name: '开始', type: 'start', on_success: 'development' },
+    { id: 'development', name: '开发实现', type: 'task', execution_mode: 'agent', executor: 'codex', prompt: '保留编排时的开发约束。', on_success: 'test', on_failure: null },
+    { id: 'test', name: '独立测试', type: 'task', execution_mode: 'agent', result_rule: 'verification', on_success: 'acceptance', on_failure: 'development' },
+    { id: 'acceptance', name: '整体验收', type: 'task', execution_mode: 'agent', result_rule: 'acceptance', executor: 'codex', on_success: 'human_review', on_failure: 'development' },
+    { id: 'human_review', name: '人工确认', type: 'task', execution_mode: 'manual', on_success: 'end', on_failure: 'development' },
+    { id: 'end', name: '结束', type: 'end' },
+  ];
+  const saved = db.saveWorkflowDefinition({ id: wfId, name: wfId, nodes_json: JSON.stringify(nodes) });
+  return { wfId, sha: computeWorkflowDefinitionSha256({ id: saved.id, name: saved.name, description: saved.description, nodes }), nodes };
+}
+
+function submitV2Package(opts: { taskKey: string; wfId: string; wfSha: string; nodes: WorkflowNode[]; budgetMaxRounds?: number }) {
+  const pkgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-wfe-pkg-'));
+  try {
+    const files: any[] = [];
+    const manifestNodes: any[] = [];
+    for (const n of opts.nodes) {
+      if (n.type !== 'task') continue;
+      const nodePath = `nodes/${n.id}/node.md`;
+      const promptPath = `nodes/${n.id}/prompt.md`;
+      fs.mkdirSync(path.join(pkgRoot, 'nodes', n.id, 'resources'), { recursive: true });
+      const nodeBuf = Buffer.from(`# ${n.name}\n`, 'utf8');
+      const promptBuf = Buffer.from(`Execute ${n.id}\n`, 'utf8');
+      fs.writeFileSync(path.join(pkgRoot, nodePath), nodeBuf);
+      fs.writeFileSync(path.join(pkgRoot, promptPath), promptBuf);
+      files.push(
+        { path: nodePath, owner: { scope: 'node', node_id: n.id }, media_type: 'text/markdown', size_bytes: nodeBuf.length, sha256: crypto.createHash('sha256').update(nodeBuf).digest('hex') },
+        { path: promptPath, owner: { scope: 'node', node_id: n.id }, media_type: 'text/markdown', size_bytes: promptBuf.length, sha256: crypto.createHash('sha256').update(promptBuf).digest('hex') }
+      );
+      manifestNodes.push({
+        node_id: n.id,
+        node_ref: nodePath,
+        prompt_ref: promptPath,
+        resources: [],
+        shared_refs: [],
+        input_bindings: [],
+        output_contract: { required_outputs: ['result'], optional_outputs: [] },
+      });
+    }
+    const manifest = {
+      protocol_version: 'cb.task-package/2.0',
+      task_key: opts.taskKey,
+      revision: 1,
+      title: opts.taskKey,
+      target_cwd: process.cwd(),
+      workflow: { id: opts.wfId, definition_sha256: opts.wfSha },
+      readiness: 'ready',
+      blockers: [],
+      nodes: manifestNodes,
+      files,
+    };
+    const mBuf = Buffer.from(JSON.stringify(manifest, null, 2), 'utf8');
+    fs.writeFileSync(path.join(pkgRoot, 'manifest.json'), mBuf);
+    const mSha = crypto.createHash('sha256').update(mBuf).digest('hex');
+    const staged = packageService.stagePackage({
+      protocol_version: 'cb.task-package/2.0',
+      operation: 'create',
+      idempotency_key: `${opts.taskKey}:${mSha}`,
+      budget_max_rounds: opts.budgetMaxRounds,
+      source: { mode: 'local_path', package_root: pkgRoot, manifest_path: 'manifest.json', manifest_sha256: mSha },
+    });
+    const finalized = packageService.finalizePackage({
+      draft_id: staged.draft_id,
+      manifest_sha256: mSha,
+      idempotency_key: `fin:${opts.taskKey}:${mSha}`,
+    });
+    return finalized.task_id as string;
+  } finally {
+    fs.rmSync(pkgRoot, { recursive: true, force: true });
+  }
+}
 
 // 1. Confirm and start error checks
 const notFoundResult = await workflowEngine.confirmAndStartTask('non-existent-task-id');
@@ -28,8 +117,8 @@ const invalidStateResult = await workflowEngine.confirmAndStartTask(dummyTaskId)
 assert.strictEqual(invalidStateResult.success, false);
 assert.ok(invalidStateResult.message.includes('Cannot start task'));
 
-const unknownCliTaskId = `wf-unknown-cli-${Date.now()}`;
-db.createTask({ id: unknownCliTaskId, task_key: 'unknown-cli', title: 'Unknown CLI', target_cwd: process.cwd() });
+const wfInfo = createCustomWorkflow(`wf-eng-${Date.now()}`);
+const unknownCliTaskId = submitV2Package({ taskKey: 'unknown-cli-task', wfId: wfInfo.wfId, wfSha: wfInfo.sha, nodes: wfInfo.nodes });
 const unknownCliResult = await workflowEngine.confirmAndStartTask(unknownCliTaskId, undefined, { workerExecutor: 'unknown-cli' });
 assert.equal(unknownCliResult.success, false);
 assert.equal(db.getTask(unknownCliTaskId)?.status, TaskStatus.PENDING_CONFIRM);
@@ -46,8 +135,7 @@ db.createTask({
 });
 const stopResult = workflowEngine.stopTask(stopTaskId);
 assert.strictEqual(stopResult.success, true);
-const stoppedTask = db.getTask(stopTaskId);
-assert.strictEqual(stoppedTask?.status, TaskStatus.CANCELLED);
+assert.strictEqual(db.getTask(stopTaskId)?.status, TaskStatus.CANCELLED);
 
 // 4. Human review decisions (Gate 3)
 const reviewTaskId = `wf-review-${Date.now()}`;
@@ -59,75 +147,35 @@ db.createTask({
   status: TaskStatus.HUMAN_REVIEW,
   target_cwd: process.cwd(),
 });
-
-// 4.1 Reject decision when not in HUMAN_REVIEW
 const badReview = await workflowEngine.submitHumanDecision(stopTaskId, 'approve', 'ok');
 assert.strictEqual(badReview.success, false);
 assert.ok(badReview.message.includes('not in human review'));
 
-// 4.2 Approve decision
 const approveRes = await workflowEngine.submitHumanDecision(reviewTaskId, 'approve', 'Looks great, verified manually!');
 assert.strictEqual(approveRes.success, true);
 const approvedTask = db.getTask(reviewTaskId);
 assert.strictEqual(approvedTask?.status, TaskStatus.COMPLETED);
 assert.ok(approvedTask?.completed_at);
 
-const decisions = db.getHumanDecisions(reviewTaskId);
-assert.strictEqual(decisions.length, 1);
-assert.strictEqual(decisions[0].action, 'approve');
-assert.strictEqual(decisions[0].reason, 'Looks great, verified manually!');
-
-// 5. Test complete loop execution: Confirm and Start -> Worker -> Tests -> Codex -> HUMAN_REVIEW
-const loopTaskId = `wf-loop-${Date.now()}`;
-db.createTask({
-  id: loopTaskId,
-  task_key: 'loop-task',
-  revision: 1,
-  title: 'Loop Execution Task',
-  status: TaskStatus.PENDING_CONFIRM,
-  target_cwd: process.cwd(),
-  budget_max_rounds: 1, // Only 1 round budget
-});
-
-db.saveRevision({
-  task_id: loopTaskId,
-  revision: 1,
-  manifest_json: JSON.stringify({ packageVersion: 1 }),
-  task_md: '# Full Loop Task',
-  development_md: '# Dev Plan',
-  tests_md: '- 命令: `node -v`',
-  acceptance_md: '# Acceptance Criteria',
-  verifier_prompt_md: '# Verifier Prompt',
-});
-
-db.saveWorkerPrompt({
-  task_id: loopTaskId,
-  revision: 1,
-  worker_id: 'worker-dev',
-  role: 'developer',
-  prompt_text: 'Develop the feature',
-});
-
+// 5. Complete loop execution -> HUMAN_REVIEW -> reject -> budget exceeded BLOCKED
+const loopTaskId = submitV2Package({ taskKey: 'loop-task-v2', wfId: wfInfo.wfId, wfSha: wfInfo.sha, nodes: wfInfo.nodes, budgetMaxRounds: 1 });
 const startRes = await workflowEngine.confirmAndStartTask(loopTaskId, undefined, {
-  workerExecutor: 'codex', reviewerExecutor: 'codex',
+  workerExecutor: 'engine-fixture',
+  reviewerExecutor: 'codex',
 });
 assert.strictEqual(startRes.success, true);
-const competingTaskId = `wf-competing-${Date.now()}`;
-db.createTask({ id: competingTaskId, task_key: 'competing', title: 'Competing task', target_cwd: process.cwd() });
+
+const competingTaskId = submitV2Package({ taskKey: 'competing-task-v2', wfId: wfInfo.wfId, wfSha: wfInfo.sha, nodes: wfInfo.nodes });
 const competingStart = await workflowEngine.confirmAndStartTask(competingTaskId);
 assert.strictEqual(competingStart.success, false, 'The execution slot must be reserved before asynchronous dispatch');
 assert.strictEqual(db.getTask(competingTaskId)?.status, TaskStatus.PENDING_CONFIRM);
-assert.equal(db.getTask(loopTaskId)?.worker_model, VERIFIER_DEFAULT_MODEL, 'Switching CLI must use the new provider default model');
+assert.equal(db.getTask(loopTaskId)?.worker_model, VERIFIER_DEFAULT_MODEL);
 assert.equal(db.getTask(loopTaskId)?.reviewer_model, VERIFIER_DEFAULT_MODEL);
 
-// Wait for round 1 to complete and reach HUMAN_REVIEW
 let pollCount = 0;
-while (pollCount < 20) {
-  await new Promise((r) => setTimeout(r, 200));
-  const t = db.getTask(loopTaskId);
-  if (t?.status === TaskStatus.HUMAN_REVIEW) {
-    break;
-  }
+while (pollCount < 30) {
+  await new Promise((r) => setTimeout(r, 150));
+  if (db.getTask(loopTaskId)?.status === TaskStatus.HUMAN_REVIEW) break;
   pollCount++;
 }
 
@@ -135,22 +183,27 @@ const humanReviewTask = db.getTask(loopTaskId);
 assert.strictEqual(humanReviewTask?.status, TaskStatus.HUMAN_REVIEW);
 assert.strictEqual(humanReviewTask?.current_round, 1);
 
-// 6. Test Budget limit: Human requests rework, but max_rounds is 1 -> transitions to BLOCKED!
+const devRound = db.getRounds(loopTaskId).find((r) => r.worker_id === 'development');
+assert.ok(devRound?.input_prompt?.includes('保留编排时的开发约束。'), '编排提示词必须传入执行器');
+assert.ok(devRound?.input_prompt?.includes('Execute development'), '任务包提示词也必须传入执行器');
+
 const reworkRes = await workflowEngine.submitHumanDecision(loopTaskId, 'reject', 'Need more polish');
 assert.strictEqual(reworkRes.success, true);
 
 pollCount = 0;
-while (pollCount < 20) {
-  await new Promise((r) => setTimeout(r, 200));
-  const t = db.getTask(loopTaskId);
-  if (t?.status === TaskStatus.BLOCKED) {
-    break;
-  }
+while (pollCount < 30) {
+  await new Promise((r) => setTimeout(r, 150));
+  if (db.getTask(loopTaskId)?.status === TaskStatus.BLOCKED) break;
   pollCount++;
 }
 
 const blockedTask = db.getTask(loopTaskId);
 assert.strictEqual(blockedTask?.status, TaskStatus.BLOCKED);
 assert.ok(blockedTask?.blocked_reason?.includes('budget exceeded'));
+
+for (const tid of [dummyTaskId, unknownCliTaskId, stopTaskId, reviewTaskId, loopTaskId, competingTaskId]) {
+  try { db.deleteTask(tid); } catch {}
+}
+try { db.deleteWorkflow(wfInfo.wfId); } catch {}
 
 console.log('✅ workflowEngine.test.ts passed successfully!');

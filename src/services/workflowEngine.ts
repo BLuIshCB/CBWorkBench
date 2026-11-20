@@ -1,15 +1,45 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import crypto from 'node:crypto';
 import { resolveExecutionTimeout } from './executionPolicy.ts';
-import { db, type TaskRecord, type TaskRevisionRecord } from '../storage/db.ts';
-import { taskFileStore } from '../storage/fileStore.ts';
+import { db, type WorkflowNodeRunRecord } from '../storage/db.ts';
+import { taskFileStore, type BoundInputEntry } from '../storage/fileStore.ts';
 import { GitService } from './gitService.ts';
-import { TestRunner } from './testRunner.ts';
+import { z } from 'zod';
 import { CliRunner } from './cliRunner.ts';
 import { adapterRegistry } from '../adapters/registry.ts';
 import { AcceptanceService } from './acceptanceService.ts';
 import { TaskStatus, RoundStage, DEFAULT_BUDGET_MAX_ROUNDS } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
-import { type WorkflowNode, DEFAULT_MAX_EXECUTIONS } from './workflowDefinition.ts';
+import { type WorkflowNode, DEFAULT_MAX_EXECUTIONS, validateWorkflowNodes } from './workflowDefinition.ts';
+import {
+  NODE_RESULT_SCHEMA_VERSION,
+  PackageProtocolError,
+  type ManifestNodeEntry,
+  type TaskPackageManifest,
+  type UnifiedNodeResult,
+} from './packageProtocol.ts';
+import { computeBufferSha256, encodeNodeDirName, readRegularFileSafely } from '../utils/pathSecurity.ts';
+import { validateJsonAgainstSchema } from '../utils/jsonSchemaValidator.ts';
+
+const verificationReportSchema = z.object({
+  tests: z.array(z.object({
+    command: z.string().trim().min(1),
+    cwd: z.string().trim().min(1),
+    exit_code: z.number().int(),
+    stdout: z.string(),
+    stderr: z.string(),
+  })).min(1),
+});
+
+function readNodeOutputMap(run: WorkflowNodeRunRecord): Record<string, { path: string; sha256?: string; size_bytes?: number }> {
+  if (!run.outputs_json) return {};
+  try {
+    return JSON.parse(run.outputs_json);
+  } catch {
+    return {};
+  }
+}
 
 export class WorkflowEngine {
   private static instance: WorkflowEngine;
@@ -32,9 +62,6 @@ export class WorkflowEngine {
     return this.isProcessing || CliRunner.hasCleanupFailure();
   }
 
-  /**
-   * Called by Web UI to manually confirm and start a task (Gate 2).
-   */
   async confirmAndStartTask(
     taskId: string,
     confirmedCwd?: string,
@@ -51,6 +78,10 @@ export class WorkflowEngine {
       return { success: false, message: `Task not found: ${taskId}` };
     }
 
+    if (task.status === TaskStatus.DELETING || task.status === TaskStatus.CLEANUP_FAILED) {
+      return { success: false, message: `Task ${taskId} is being deleted (${task.status})` };
+    }
+
     if (task.status !== TaskStatus.PENDING_CONFIRM && task.status !== TaskStatus.BLOCKED) {
       return { success: false, message: `Cannot start task with status: ${task.status}` };
     }
@@ -59,29 +90,68 @@ export class WorkflowEngine {
       return { success: false, message: `Workbench is currently executing another task: ${this.activeTaskId}` };
     }
 
+    const revRecord = db.getRevision(taskId, task.revision);
+    if (!revRecord) {
+      return { success: false, message: `Task package revision r${task.revision} not found` };
+    }
+    if (revRecord.readiness !== 'ready') {
+      return { success: false, message: `Task package revision r${task.revision} is blocked and not ready to start` };
+    }
+
     const targetCwd = confirmedCwd ? confirmedCwd.trim() : task.target_cwd;
-    let gitInfo;
     try {
-      gitInfo = GitService.inspectWorkspace(targetCwd);
+      GitService.inspectWorkspace(targetCwd);
     } catch (e: any) {
       return { success: false, message: `Invalid workspace path: ${e.message}` };
     }
 
-    const workerExecutor = options?.workerExecutor || task.worker_executor || 'workbuddy';
-    const reviewerExecutor = options?.reviewerExecutor || task.reviewer_executor || 'workbuddy';
-    let workerModel: string;
-    let reviewerModel: string;
+    let taskWf = db.getTaskWorkflow(taskId);
+    if (!taskWf) {
+      taskWf = db.initTaskWorkflow(taskId, { revision: task.revision });
+    }
+    let nodes: WorkflowNode[] = [];
     try {
-      const worker = adapterRegistry.getAdapter(workerExecutor);
-      const reviewer = adapterRegistry.getAdapter(reviewerExecutor);
-      workerModel = options?.workerModel || (workerExecutor === task.worker_executor ? task.worker_model : undefined) || worker.defaultModel;
-      reviewerModel = options?.reviewerModel || (reviewerExecutor === task.reviewer_executor ? task.reviewer_model : undefined) || reviewer.defaultModel;
-    } catch (error) {
-      return { success: false, message: String(error) };
+      nodes = JSON.parse(taskWf.nodes_json);
+    } catch {
+      nodes = [];
     }
 
+    // Apply any test/runtime overrides to agent nodes
+    if (options?.workerExecutor || options?.workerModel || options?.reviewerExecutor || options?.reviewerModel) {
+      let modified = false;
+      for (const node of nodes) {
+        if (node.execution_mode === 'agent') {
+          if (node.result_rule === 'acceptance') {
+            if (options.reviewerExecutor) { node.executor = options.reviewerExecutor; modified = true; }
+            if (options.reviewerModel) { node.model = options.reviewerModel; modified = true; }
+          } else {
+            if (options.workerExecutor) { node.executor = options.workerExecutor; modified = true; }
+            if (options.workerModel) { node.model = options.workerModel; modified = true; }
+          }
+        }
+      }
+      if (modified) {
+        db.updateTaskWorkflow(taskId, { nodes_json: JSON.stringify(nodes) });
+      }
+    }
+
+    // Validate that every agent node has a registered adapter
+    for (const node of nodes) {
+      if (node.execution_mode === 'agent' && node.executor) {
+        try {
+          adapterRegistry.getAdapter(node.executor);
+        } catch (error) {
+          return { success: false, message: String(error) };
+        }
+      }
+    }
+
+    const workerExecutor = options?.workerExecutor || task.worker_executor || 'workbuddy';
+    const reviewerExecutor = options?.reviewerExecutor || task.reviewer_executor || 'workbuddy';
+    const workerModel = options?.workerModel || task.worker_model;
+    const reviewerModel = options?.reviewerModel || task.reviewer_model;
+
     const executionTimeoutMs = resolveExecutionTimeout(options?.executionTimeoutMs, task.execution_timeout_ms);
-    // 在排队前占用执行槽，避免异步调度之前重复确认。
     this.isProcessing = true;
     this.activeTaskId = taskId;
 
@@ -97,12 +167,6 @@ export class WorkflowEngine {
         reviewer_executor: reviewerExecutor,
         reviewer_model: reviewerModel,
       });
-
-      // Ensure task workflow is initialized
-      let taskWf = db.getTaskWorkflow(taskId);
-      if (!taskWf) {
-        taskWf = db.initTaskWorkflow(taskId);
-      }
     } catch (error) {
       this.isProcessing = false;
       this.activeTaskId = null;
@@ -110,10 +174,9 @@ export class WorkflowEngine {
     }
 
     logger.info(
-      `[WorkflowEngine] Task ${taskId} confirmed and queued. Development: ${workerExecutor}(${workerModel}), Acceptance: ${reviewerExecutor}(${reviewerModel}), Target cwd: ${targetCwd}`
+      `[WorkflowEngine] Task ${taskId} confirmed and queued. Cwd: ${targetCwd}`
     );
 
-    // Trigger execution asynchronously
     setImmediate(() => {
       this.runTaskLoop(taskId).catch((err) => {
         logger.error(`[WorkflowEngine] Unhandled error in task loop for ${taskId}:`, err);
@@ -126,9 +189,6 @@ export class WorkflowEngine {
     return { success: true, message: 'Task confirmed and started successfully.' };
   }
 
-  /**
-   * Request that the task stop further execution.
-   */
   stopTask(taskId: string): { success: boolean; message: string } {
     const task = db.getTask(taskId);
     if (!task) return { success: false, message: 'Task not found' };
@@ -145,26 +205,26 @@ export class WorkflowEngine {
     return { success: true, message: 'Stop requested. Current operation will finish or terminate.' };
   }
 
-  /**
-   * Handle task deletion during active execution.
-   */
   async handleTaskDeleted(taskId: string): Promise<void> {
     if (this.activeTaskId !== taskId && !CliRunner.hasTaskRuns(taskId)) return;
     this.stopTask(taskId);
     await CliRunner.abort(taskId);
     const deadline = Date.now() + 10000;
-    while (this.activeTaskId === taskId && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
-    if (this.activeTaskId === taskId || CliRunner.hasTaskRuns(taskId)) throw new Error('CLEANUP_FAILED: 进程回收未确认，保留任务与日志。');
+    while (this.activeTaskId === taskId && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (this.activeTaskId === taskId || CliRunner.hasTaskRuns(taskId)) {
+      throw new Error('CLEANUP_FAILED: 进程回收未确认，保留任务与日志。');
+    }
   }
 
   async handleAllTasksDeleted(): Promise<void> {
     if (this.activeTaskId) await this.handleTaskDeleted(this.activeTaskId);
-    if (CliRunner.hasCleanupFailure()) throw new Error('CLEANUP_FAILED: 存在未回收进程，保留任务与日志。' + CliRunner.pendingRunIds().join(','));
+    if (CliRunner.hasCleanupFailure()) {
+      throw new Error('CLEANUP_FAILED: 存在未回收进程，保留任务与日志。' + CliRunner.pendingRunIds().join(','));
+    }
   }
 
-  /**
-   * Submit human review decision (Gate 3).
-   */
   async submitHumanDecision(
     taskId: string,
     action: 'approve' | 'reject',
@@ -172,6 +232,10 @@ export class WorkflowEngine {
   ): Promise<{ success: boolean; message: string }> {
     const task = db.getTask(taskId);
     if (!task) return { success: false, message: 'Task not found' };
+
+    if (task.status === TaskStatus.DELETING || task.status === TaskStatus.CLEANUP_FAILED) {
+      return { success: false, message: `Task is being deleted (${task.status})` };
+    }
 
     if (task.status !== TaskStatus.HUMAN_REVIEW) {
       return { success: false, message: `Task is not in human review state (current: ${task.status})` };
@@ -185,7 +249,7 @@ export class WorkflowEngine {
 
     let taskWf = db.getTaskWorkflow(taskId);
     if (!taskWf) {
-      taskWf = db.initTaskWorkflow(taskId);
+      taskWf = db.initTaskWorkflow(taskId, { revision: task.revision });
     }
 
     let nodes: WorkflowNode[] = [];
@@ -201,23 +265,76 @@ export class WorkflowEngine {
     }
 
     const latestRun = db.getLatestNodeRun(taskId, currentNode?.id || currentNodeId);
+    const outcome = action === 'approve' ? 'passed' : 'failed';
+    const summaryText = reason || (action === 'approve' ? '人工审核通过' : '人工审核退回');
+
     if (latestRun && latestRun.status === 'waiting_manual') {
+      let resultJsonStr: string | null = null;
+      let resultSha: string | null = null;
+      let outputsJsonStr: string | null = null;
+
+      if (latestRun.attempt_dir && fs.existsSync(latestRun.attempt_dir)) {
+        const revRec = db.getRevision(taskId, task.revision);
+        const resultObj: UnifiedNodeResult = {
+          schema_version: NODE_RESULT_SCHEMA_VERSION,
+          task_id: taskId,
+          revision: task.revision,
+          package_digest: revRec?.package_digest || '0'.repeat(64),
+          node_id: latestRun.node_id,
+          attempt_id: latestRun.run_id,
+          execution_index: latestRun.execution_index,
+          code_generation: latestRun.code_generation,
+          outcome,
+          summary: summaryText,
+          issues: action === 'reject' && reason ? [{ id: 'HUMAN-REJECT', description: reason }] : [],
+          outputs: {
+            result: { path: 'outputs/result.json' },
+          },
+        };
+        const outputsDir = path.join(latestRun.attempt_dir, 'outputs');
+        fs.mkdirSync(outputsDir, { recursive: true });
+        resultJsonStr = JSON.stringify(resultObj, null, 2) + '\n';
+        const resultBuf = Buffer.from(resultJsonStr, 'utf8');
+        fs.writeFileSync(path.join(outputsDir, 'result.json'), resultBuf);
+        resultSha = computeBufferSha256(resultBuf);
+        outputsJsonStr = JSON.stringify({
+          result: { path: 'outputs/result.json', sha256: resultSha, size_bytes: resultBuf.length },
+        });
+      }
+
       db.updateNodeRun(latestRun.run_id, {
-        status: action === 'approve' ? 'passed' : 'failed',
-        result_summary: reason || (action === 'approve' ? '人工审核通过' : '人工审核退回'),
+        status: outcome,
+        result_summary: summaryText,
+        result_json: resultJsonStr,
+        result_sha256: resultSha,
+        outputs_json: outputsJsonStr,
         finished_at: Date.now(),
       });
     }
 
-    const nextNodeId = action === 'approve'
-      ? (currentNode?.on_success || 'end')
-      : (currentNode?.on_failure || 'development');
+    const nextNodeId = action === 'approve' ? currentNode?.on_success : currentNode?.on_failure;
+    if (!nextNodeId || !nodes.some((n) => n.id === nextNodeId)) {
+      const pauseReason = `人工节点 [${currentNode?.name || currentNodeId}] ${action === 'approve' ? '通过' : '退回'}后未配置有效去向`;
+      db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: pauseReason });
+      return { success: false, message: pauseReason };
+    }
 
     db.updateTaskWorkflow(taskId, { current_node_id: nextNodeId });
 
     if (action === 'approve') {
       const nextNode = nodes.find((n) => n.id === nextNodeId);
-      if (!nextNode || nextNode.type === 'end') {
+      if (nextNode && nextNode.type === 'end') {
+        const hasVerificationNode = nodes.some((n) => n.type === 'task' && n.result_rule === 'verification');
+        const hasAcceptanceNode = nodes.some((n) => n.type === 'task' && n.result_rule === 'acceptance');
+        if (
+          taskWf.code_generation > 0 &&
+          ((hasVerificationNode && taskWf.tests_passed_generation !== taskWf.code_generation) ||
+            (hasAcceptanceNode && taskWf.acceptance_passed_generation !== taskWf.code_generation))
+        ) {
+          const blockMsg = `流程到达结束节点，但测试或验收代次未对齐当前代码代次 (代码: ${taskWf.code_generation}, 测试: ${taskWf.tests_passed_generation}, 验收: ${taskWf.acceptance_passed_generation})。`;
+          db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: blockMsg });
+          return { success: false, message: blockMsg };
+        }
         db.updateTaskStatus(taskId, TaskStatus.COMPLETED, {
           completed_at: Date.now(),
         });
@@ -228,7 +345,7 @@ export class WorkflowEngine {
 
     this.isProcessing = true;
     this.activeTaskId = taskId;
-    logger.info(`[WorkflowEngine] Task ${taskId} human review decision [${action}]. Resuming loop with feedback: ${reason}`);
+    logger.info(`[WorkflowEngine] Task ${taskId} manual decision [${action}]. Transitioning to [${nextNodeId}].`);
 
     try {
       db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
@@ -242,17 +359,280 @@ export class WorkflowEngine {
     }
 
     setImmediate(() => {
-      this.runTaskLoop(taskId, reason ? `Human Reviewer Feedback: ${reason}` : undefined).catch((err) => {
-        logger.error(`[WorkflowEngine] Error resuming task after rejection:`, err);
+      this.runTaskLoop(taskId, reason ? `Manual Review Feedback: ${reason}` : undefined).catch((err) => {
+        logger.error('[WorkflowEngine] Error resuming task after manual decision:', err);
       });
     });
 
-    return { success: true, message: 'Rework feedback submitted. Resuming execution loop.' };
+    return { success: true, message: 'Manual decision recorded. Resuming workflow execution.' };
   }
 
-  /**
-   * Main task execution loop (State Machine).
-   */
+  private resolveInputBindings(
+    taskId: string,
+    revision: number,
+    codeGeneration: number,
+    manifestNode: ManifestNodeEntry
+  ): {
+    ok: boolean;
+    errorMessage?: string;
+    bindings: Array<BoundInputEntry & { sourceAbsPath: string }>;
+    inputsSummaryText: string;
+  } {
+    const resolved: Array<BoundInputEntry & { sourceAbsPath: string }> = [];
+    const summaryLines: string[] = [];
+
+    for (const binding of manifestNode.input_bindings) {
+      const upstreamRun = db.getLatestCompletedNodeRunForRevision(taskId, revision, binding.from_node_id);
+      if (!upstreamRun) {
+        if (binding.required !== false) {
+          return {
+            ok: false,
+            errorMessage: `必需输入 [${binding.slot}] 缺失：来源节点 [${binding.from_node_id}] 在修订 r${revision} 尚未产生有效输出`,
+            bindings: [],
+            inputsSummaryText: '',
+          };
+        }
+        continue;
+      }
+
+      if (
+        binding.constraint === 'current_code_snapshot' &&
+        codeGeneration > 0 &&
+        upstreamRun.code_generation !== codeGeneration
+      ) {
+        if (binding.required !== false) {
+          return {
+            ok: false,
+            errorMessage: `必需输入 [${binding.slot}] 已过期：来源节点 [${binding.from_node_id}] 输出于代码代次 G${upstreamRun.code_generation}，当前为 G${codeGeneration}`,
+            bindings: [],
+            inputsSummaryText: '',
+          };
+        }
+        continue;
+      }
+
+      const outputsMap = readNodeOutputMap(upstreamRun);
+      const outputEntry = outputsMap[binding.output];
+      if (!outputEntry || !upstreamRun.attempt_dir) {
+        if (binding.required !== false) {
+          return {
+            ok: false,
+            errorMessage: `必需输入 [${binding.slot}] 缺失：来源节点 [${binding.from_node_id}] 的执行记录 [${upstreamRun.run_id}] 未产出 [${binding.output}]`,
+            bindings: [],
+            inputsSummaryText: '',
+          };
+        }
+        continue;
+      }
+
+      try {
+        const buf = readRegularFileSafely(upstreamRun.attempt_dir, outputEntry.path);
+        const sha256 = computeBufferSha256(buf);
+        if (outputEntry.sha256 && sha256 !== outputEntry.sha256) {
+          throw new Error(`产物哈希不匹配 (${outputEntry.path})`);
+        }
+        const sourceAbsPath = path.join(upstreamRun.attempt_dir, ...outputEntry.path.split('/'));
+        const fileName = path.posix.basename(outputEntry.path);
+        const mountedPath = `inputs/${binding.slot}/${fileName}`;
+        resolved.push({
+          slot: binding.slot,
+          from_node_id: binding.from_node_id,
+          output: binding.output,
+          source_attempt_id: upstreamRun.run_id,
+          source_execution_index: upstreamRun.execution_index,
+          source_code_generation: upstreamRun.code_generation,
+          source_path: outputEntry.path,
+          mounted_path: mountedPath,
+          sourceAbsPath,
+          sha256,
+          size_bytes: buf.length,
+        });
+        summaryLines.push(
+          `- slot=${binding.slot} (from ${binding.from_node_id}#${upstreamRun.execution_index}, attempt=${upstreamRun.run_id}, file=${mountedPath})`
+        );
+      } catch (err: any) {
+        if (binding.required !== false) {
+          return {
+            ok: false,
+            errorMessage: `必需输入 [${binding.slot}] 读取失败: ${err?.message || err}`,
+            bindings: [],
+            inputsSummaryText: '',
+          };
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      bindings: resolved,
+      inputsSummaryText: summaryLines.join('\n'),
+    };
+  }
+
+  /** 收录测试节点自行执行的证据，非零退出码不能被文字结论覆盖。 */
+  private recordVerificationReport(taskId: string, round: number, nodeId: string, attemptDir: string) {
+    const reportPath = 'outputs/test_report.json';
+    const buffer = readRegularFileSafely(attemptDir, reportPath);
+    const report = verificationReportSchema.parse(JSON.parse(buffer.toString('utf8')));
+    for (const [index, test] of report.tests.entries()) {
+      db.saveTestRun({
+        task_id: taskId,
+        round_number: round,
+        test_case_id: `${nodeId}-${index + 1}`,
+        command: test.command,
+        exit_code: test.exit_code,
+        stdout: test.stdout,
+        stderr: test.stderr,
+        report_path: reportPath,
+        report_content: JSON.stringify(test),
+        passed: test.exit_code === 0,
+      });
+    }
+    const failures = report.tests.filter((test) => test.exit_code !== 0);
+    return {
+      passed: failures.length === 0,
+      summary: failures.map((test) => `${test.command} (退出码 ${test.exit_code})\n${test.stderr || test.stdout}`).join('\n\n'),
+      output: { path: reportPath, sha256: computeBufferSha256(buffer), size_bytes: buffer.length },
+    };
+  }
+
+  private validateAndRecordNodeOutputs(params: {
+    taskId: string;
+    revision: number;
+    packageDigest: string;
+    nodeId: string;
+    attemptId: string;
+    executionIndex: number;
+    codeGeneration: number;
+    outcome: 'passed' | 'failed' | 'blocked';
+    summary: string;
+    issues: Array<{ id: string; description: string; evidence?: string }>;
+    manifestNode: ManifestNodeEntry;
+    attemptDir: string;
+    outputsDir: string;
+    extraOutputs?: Record<string, { path: string; sha256: string; size_bytes: number }>;
+  }): {
+    valid: boolean;
+    errorMessage?: string;
+    resultJson: string;
+    resultSha256: string;
+    outputsMap: Record<string, { path: string; sha256: string; size_bytes: number }>;
+  } {
+    const outputsMap: Record<string, { path: string; sha256: string; size_bytes: number }> = {
+      ...(params.extraOutputs || {}),
+    };
+
+    // Check if any declared outputs besides 'result' already exist in outputsDir
+    for (const outName of [
+      ...params.manifestNode.output_contract.required_outputs,
+      ...params.manifestNode.output_contract.optional_outputs,
+    ]) {
+      if (outName === 'result' || outputsMap[outName]) continue;
+      for (const candidate of [`${outName}.json`, `${outName}.md`, `${outName}.txt`, outName]) {
+        const candidatePath = path.join(params.outputsDir, candidate);
+        if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).isFile()) {
+          const buf = fs.readFileSync(candidatePath);
+          outputsMap[outName] = {
+            path: `outputs/${candidate}`,
+            sha256: computeBufferSha256(buf),
+            size_bytes: buf.length,
+          };
+          break;
+        }
+      }
+    }
+
+    const resultPath = path.join(params.outputsDir, 'result.json');
+    const resultObj: UnifiedNodeResult = {
+      schema_version: NODE_RESULT_SCHEMA_VERSION,
+      task_id: params.taskId,
+      revision: params.revision,
+      package_digest: params.packageDigest,
+      node_id: params.nodeId,
+      attempt_id: params.attemptId,
+      execution_index: params.executionIndex,
+      code_generation: params.codeGeneration,
+      outcome: params.outcome,
+      summary: params.summary,
+      issues: params.issues,
+      outputs: {
+        ...outputsMap,
+        result: { path: 'outputs/result.json' },
+      },
+    };
+
+    const resultJson = JSON.stringify(resultObj, null, 2) + '\n';
+    const resultBuf = Buffer.from(resultJson, 'utf8');
+    fs.writeFileSync(resultPath, resultBuf);
+    const resultSha256 = computeBufferSha256(resultBuf);
+
+    outputsMap.result = {
+      path: 'outputs/result.json',
+      sha256: resultSha256,
+      size_bytes: resultBuf.length,
+    };
+    resultObj.outputs.result = outputsMap.result;
+    const finalResultJson = JSON.stringify(resultObj, null, 2) + '\n';
+    const finalBuf = Buffer.from(finalResultJson, 'utf8');
+    fs.writeFileSync(resultPath, finalBuf);
+    const finalResultSha = computeBufferSha256(finalBuf);
+    outputsMap.result = {
+      path: 'outputs/result.json',
+      sha256: finalResultSha,
+      size_bytes: finalBuf.length,
+    };
+
+    // Enforce output_contract only when outcome is passed
+    if (params.outcome === 'passed') {
+      for (const reqOut of params.manifestNode.output_contract.required_outputs) {
+        if (!outputsMap[reqOut]) {
+          return {
+            valid: false,
+            errorMessage: `节点 [${params.nodeId}] 缺少契约声明的必需输出 [${reqOut}]`,
+            resultJson: finalResultJson,
+            resultSha256: finalResultSha,
+            outputsMap,
+          };
+        }
+      }
+
+      if (params.manifestNode.output_contract.schema_ref) {
+        try {
+          const revDir = taskFileStore.getRevisionDir(params.taskId, params.revision);
+          const schemaBuf = readRegularFileSafely(revDir, params.manifestNode.output_contract.schema_ref);
+          const schemaObj = JSON.parse(schemaBuf.toString('utf8'));
+          const schemaCheck = validateJsonAgainstSchema(resultObj, schemaObj);
+          if (!schemaCheck.valid) {
+            return {
+              valid: false,
+              errorMessage: `节点 [${params.nodeId}] 输出不满足声明 Schema (${params.manifestNode.output_contract.schema_ref}): ${schemaCheck.errors
+                .map((e) => `${e.path}: ${e.message}`)
+                .join('; ')}`,
+              resultJson: finalResultJson,
+              resultSha256: finalResultSha,
+              outputsMap,
+            };
+          }
+        } catch (err: any) {
+          return {
+            valid: false,
+            errorMessage: `输出 Schema 校验失败: ${err?.message || err}`,
+            resultJson: finalResultJson,
+            resultSha256: finalResultSha,
+            outputsMap,
+          };
+        }
+      }
+    }
+
+    return {
+      valid: true,
+      resultJson: finalResultJson,
+      resultSha256: finalResultSha,
+      outputsMap,
+    };
+  }
+
   private async runTaskLoop(taskId: string, initialReworkFeedback?: string): Promise<void> {
     this.isProcessing = true;
     this.activeTaskId = taskId;
@@ -262,7 +642,7 @@ export class WorkflowEngine {
       const task = db.getTask(taskId);
       if (!task) return;
 
-      const revisionRecord = db.getLatestRevision(taskId);
+      const revisionRecord = db.getRevision(taskId, task.revision) || db.getLatestRevision(taskId);
       if (!revisionRecord) {
         db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
           blocked_reason: 'Task package revision materials not found.',
@@ -270,9 +650,19 @@ export class WorkflowEngine {
         return;
       }
 
+      let manifest: TaskPackageManifest;
+      try {
+        manifest = JSON.parse(revisionRecord.manifest_json) as TaskPackageManifest;
+      } catch (err: any) {
+        db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+          blocked_reason: `任务包 Manifest 解析失败: ${err?.message || err}`,
+        });
+        return;
+      }
+
       let taskWorkflow = db.getTaskWorkflow(taskId);
       if (!taskWorkflow) {
-        taskWorkflow = db.initTaskWorkflow(taskId);
+        taskWorkflow = db.initTaskWorkflow(taskId, { revision: revisionRecord.revision });
       }
 
       let nodes: WorkflowNode[];
@@ -286,22 +676,39 @@ export class WorkflowEngine {
       }
 
       const confirmedCwd = task.confirmed_cwd || task.target_cwd;
-      const workerPrompts = db.getWorkerPrompts(taskId, revisionRecord.revision);
-      const definedWorkerIds = workerPrompts.map((w) => w.worker_id);
-      let nextWorkerId = definedWorkerIds[0] || 'worker-dev';
+      const workflowValidation = validateWorkflowNodes(nodes, taskWorkflow.workflow_id);
+      if (!workflowValidation.valid) {
+        db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+          blocked_reason: `工作流定义无效，请重新编排后提交任务: ${workflowValidation.errors.join('; ')}`,
+        });
+        return;
+      }
+      const manifestNodeMap = new Map(manifest.nodes.map((n) => [n.node_id, n]));
+      const definedTaskNodeIds = nodes.filter((n) => n.type === 'task').map((n) => n.id);
+      const hasVerificationNode = nodes.some((n) => n.type === 'task' && n.result_rule === 'verification');
+      const hasAcceptanceNode = nodes.some((n) => n.type === 'task' && n.result_rule === 'acceptance');
 
       let previousRoundIssues = initialReworkFeedback || '';
-      let previousTestFailureSummary: string | null = null;
       let currentRound = task.current_round || 0;
       const maxRounds = task.budget_max_rounds || DEFAULT_BUDGET_MAX_ROUNDS;
+      const nodesExecutedThisRound = new Set<string>();
+      if (currentRound > 0) {
+        for (const nr of db.getNodeRuns(taskId)) {
+          if (nr.round_number === currentRound && nr.status !== 'blocked') {
+            nodesExecutedThisRound.add(nr.node_id);
+          }
+        }
+      }
 
       db.updateTaskStatus(taskId, TaskStatus.RUNNING);
 
-      // --- STATE MACHINE LOOP ---
       while (true) {
-        // 1. Check stop request
         const freshTask = db.getTask(taskId);
-        if (freshTask?.stop_requested) {
+        if (!freshTask || freshTask.status === TaskStatus.DELETING || freshTask.status === TaskStatus.CLEANUP_FAILED) {
+          logger.info(`[WorkflowEngine] Task ${taskId} deleted or deleting; halting loop.`);
+          return;
+        }
+        if (freshTask.stop_requested) {
           db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
           logger.info(`[WorkflowEngine] Task ${taskId} cancelled per user request.`);
           return;
@@ -314,29 +721,26 @@ export class WorkflowEngine {
         if (!currentNode) {
           const reason = `未找到当前工作流节点: ${currentNodeId}`;
           db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: reason });
-          logger.error(`[WorkflowEngine] ${reason}`);
           return;
         }
 
-        // Start node: direct advance
         if (currentNode.type === 'start') {
           const targetId = currentNode.on_success;
           if (!targetId || !nodes.some((n) => n.id === targetId)) {
-            const reason = `开始节点的后继节点无效: ${targetId}`;
-            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: reason });
+            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+              blocked_reason: `开始节点的后继节点无效: ${targetId}`,
+            });
             return;
           }
           db.updateTaskWorkflow(taskId, { current_node_id: targetId });
           continue;
         }
 
-        // End node: completion
         if (currentNode.type === 'end') {
-          // Check final gate prerequisite: tests and acceptance must match current code generation
           if (
             taskWorkflow.code_generation > 0 &&
-            (taskWorkflow.tests_passed_generation !== taskWorkflow.code_generation ||
-              taskWorkflow.acceptance_passed_generation !== taskWorkflow.code_generation)
+            ((hasVerificationNode && taskWorkflow.tests_passed_generation !== taskWorkflow.code_generation) ||
+              (hasAcceptanceNode && taskWorkflow.acceptance_passed_generation !== taskWorkflow.code_generation))
           ) {
             const reason = `流程到达结束节点，但测试或验收代次未对齐当前代码代次 (代码: ${taskWorkflow.code_generation}, 测试: ${taskWorkflow.tests_passed_generation}, 验收: ${taskWorkflow.acceptance_passed_generation})。`;
             db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: reason });
@@ -350,19 +754,29 @@ export class WorkflowEngine {
           return;
         }
 
-        // Task node
         if (currentNode.type === 'task') {
-          const runCount = db.getNodeRunCount(taskId, currentNode.id);
-          const maxExecutions = currentNode.max_executions || DEFAULT_MAX_EXECUTIONS;
-
-          // Increment current round when returning to developer
-          if (currentNode.id === 'development' || !currentNode.on_failure) {
-            currentRound++;
-          } else if (currentRound === 0) {
-            currentRound = 1;
+          const manifestNode = manifestNodeMap.get(currentNode.id);
+          if (!manifestNode) {
+            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+              blocked_reason: `任务包缺失节点 [${currentNode.id}] 的材料声明`,
+            });
+            return;
           }
 
-          // Check budget max rounds limit
+          const runCount = db.getNodeRunCount(taskId, currentNode.id);
+          const maxExecutions = currentNode.max_executions || DEFAULT_MAX_EXECUTIONS;
+          if (maxExecutions > 0 && runCount >= maxExecutions) {
+            const reason = `节点 [${currentNode.name}] 已达到最大执行次数上限 (${maxExecutions} 次)`;
+            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: reason });
+            return;
+          }
+
+          if (currentRound === 0 || nodesExecutedThisRound.has(currentNode.id)) {
+            currentRound++;
+            nodesExecutedThisRound.clear();
+          }
+          nodesExecutedThisRound.add(currentNode.id);
+
           if (task.budget_max_rounds && currentRound > maxRounds) {
             const reason = `Maximum execution budget exceeded (${maxRounds} rounds). Execution paused.`;
             db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
@@ -373,21 +787,94 @@ export class WorkflowEngine {
             return;
           }
 
-          // 用户明确要求：每个节点不做次数限制（节点可随状态机路由多次循环，仅受全局任务轮数预算限制）
-          // 节点执行序号（runCount + 1）正常递增并持久化，供执行追踪与审计
+          const isAcceptance = currentNode.execution_mode === 'agent' && currentNode.result_rule === 'acceptance';
+          const isVerification = currentNode.execution_mode === 'agent' && currentNode.result_rule === 'verification';
+
+          // Code generation update for non-acceptance agent execution
+          if (currentNode.execution_mode === 'agent' && !isAcceptance && !isVerification) {
+            taskWorkflow.code_generation += 1;
+            db.updateTaskWorkflow(taskId, { code_generation: taskWorkflow.code_generation });
+          }
+
+          // 测试 Agent 的证据必须对应本轮代码，不能沿用返工前的结果。
+          if (
+            isAcceptance &&
+            hasVerificationNode &&
+            taskWorkflow.code_generation > 0 &&
+            taskWorkflow.tests_passed_generation !== taskWorkflow.code_generation
+          ) {
+            const testNode = nodes.find((n) => n.type === 'task' && n.result_rule === 'verification');
+            if (testNode) {
+              logger.warn(
+                `[WorkflowEngine] Acceptance requires fresh verification run for code generation ${taskWorkflow.code_generation}. Routing to [${testNode.id}].`
+              );
+              db.updateTaskWorkflow(taskId, { current_node_id: testNode.id });
+              continue;
+            }
+          }
+
+          // Resolve input_bindings
+          const inputResolution = this.resolveInputBindings(
+            taskId,
+            revisionRecord.revision,
+            taskWorkflow.code_generation,
+            manifestNode
+          );
+          if (!inputResolution.ok) {
+            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+              blocked_reason: inputResolution.errorMessage || '节点输入绑定未满足',
+            });
+            return;
+          }
+
           const currentExecIndex = runCount + 1;
           const runId = `run-${crypto.randomUUID()}`;
           const completionToken = crypto.randomBytes(16).toString('hex');
 
-          // Branch 1: Manual confirmation node
+          const feedbackSections: string[] = [];
+          if (previousRoundIssues) {
+            feedbackSections.push(`### 上游审查 / 退回反馈\n${previousRoundIssues}`);
+          }
+          const reworkFeedback = feedbackSections.join('\n\n');
+
+          const materialized = taskFileStore.materializeNodeRunDirectory({
+            taskId,
+            revision: revisionRecord.revision,
+            packageDigest: revisionRecord.package_digest,
+            workflowId: taskWorkflow.workflow_id,
+            workflowSha256: taskWorkflow.workflow_sha256,
+            nodeId: currentNode.id,
+            nodeName: currentNode.name,
+            executionMode: currentNode.execution_mode || 'agent',
+            resultRule: currentNode.result_rule,
+            attemptId: runId,
+            executionIndex: currentExecIndex,
+            codeGeneration: taskWorkflow.code_generation,
+            targetCwd: confirmedCwd,
+            manifestNode,
+            boundInputs: inputResolution.bindings,
+            reworkFeedback: reworkFeedback || undefined,
+            completionToken,
+          });
+
+          const inputsMetaJson = JSON.stringify(
+            inputResolution.bindings.map(({ sourceAbsPath, ...rest }) => rest)
+          );
+
+          // Branch 1: Manual node
           if (currentNode.execution_mode === 'manual') {
             db.createNodeRun({
               run_id: runId,
               task_id: taskId,
+              revision: revisionRecord.revision,
               node_id: currentNode.id,
               execution_index: currentExecIndex,
+              round_number: currentRound,
+              code_generation: taskWorkflow.code_generation,
               status: 'waiting_manual',
               completion_token: completionToken,
+              attempt_dir: materialized.paths.attemptDir,
+              inputs_json: inputsMetaJson,
             });
 
             db.updateTaskStatus(taskId, TaskStatus.HUMAN_REVIEW, {
@@ -396,158 +883,91 @@ export class WorkflowEngine {
               current_round: currentRound,
             });
 
-            logger.info(`[WorkflowEngine] Task ${taskId} reached manual node [${currentNode.name}]. Waiting for human review.`);
-            return; // Loop pauses until manual decision submitted
+            logger.info(`[WorkflowEngine] Task ${taskId} reached manual node [${currentNode.name}]. Waiting for user decision.`);
+            return;
           }
 
           let outcome: 'passed' | 'failed' = 'passed';
           let summary = '';
+          let issuesForResult: Array<{ id: string; description: string; evidence?: string }> = [];
+          const extraOutputs: Record<string, { path: string; sha256: string; size_bytes: number }> = {};
 
-          // Branch 2: Command execution node (e.g. independent testing)
-          if (currentNode.execution_mode === 'command') {
+          // 自动节点统一由 Agent 按提示词执行。
+          {
             db.createNodeRun({
               run_id: runId,
               task_id: taskId,
+              revision: revisionRecord.revision,
               node_id: currentNode.id,
               execution_index: currentExecIndex,
-              status: 'running',
-              completion_token: completionToken,
-            });
-
-            db.updateTaskStatus(taskId, TaskStatus.RUNNING, {
-              current_stage: RoundStage.RUNNING_TESTS,
-              current_round: currentRound,
-            });
-
-            const testRoundDbId = db.createExecutionRound({
-              task_id: taskId,
               round_number: currentRound,
-              stage: RoundStage.RUNNING_TESTS,
-              input_prompt: currentNode.command ? `Executing command: ${currentNode.command}` : 'Running automated test commands.',
-            });
-
-            const testCases = (currentNode.command && currentNode.command.trim())
-              ? [{ id: 'TEST-CMD', command: currentNode.command.trim(), required: true }]
-              : TestRunner.parseTestCases(revisionRecord.tests_md, revisionRecord.manifest_json);
-
-            const testAggResult = await TestRunner.runAllTests(
-              testCases,
-              confirmedCwd,
-              task.execution_timeout_ms || resolveExecutionTimeout(),
-              { taskId, roundId: testRoundDbId, signal: this.taskController.signal }
-            );
-
-            for (const tr of testAggResult.testRuns) {
-              db.saveTestRun({
-                task_id: taskId,
-                round_number: currentRound,
-                test_case_id: tr.testCaseId,
-                command: tr.command,
-                exit_code: tr.exitCode,
-                stdout: tr.stdout,
-                stderr: tr.stderr,
-                report_path: tr.reportPath,
-                report_content: tr.reportContent,
-                passed: tr.passed,
-              });
-            }
-
-            if (testAggResult.interrupted || db.getTask(taskId)?.stop_requested) {
-              db.completeExecutionRound(testRoundDbId, { status: 'blocked', output_text: testAggResult.failureSummary });
-              db.updateNodeRun(runId, { status: 'blocked', result_summary: testAggResult.failureSummary, finished_at: Date.now() });
-              db.updateTaskStatus(taskId, db.getTask(taskId)?.stop_requested ? TaskStatus.CANCELLED : TaskStatus.BLOCKED, {
-                blocked_reason: testAggResult.failureSummary,
-              });
-              return;
-            }
-
-            if (!testAggResult.allPassed) {
-              outcome = 'failed';
-              summary = testAggResult.failureSummary || 'Automated tests failed.';
-              previousTestFailureSummary = summary;
-              db.completeExecutionRound(testRoundDbId, {
-                status: 'failed',
-                output_text: summary,
-                error_message: 'Required automated tests failed.',
-              });
-            } else {
-              outcome = 'passed';
-              summary = 'All required test commands executed with exit code 0.';
-              previousTestFailureSummary = null;
-              db.completeExecutionRound(testRoundDbId, { status: 'passed', output_text: summary });
-              db.updateTaskWorkflow(taskId, { tests_passed_generation: taskWorkflow.code_generation });
-              taskWorkflow.tests_passed_generation = taskWorkflow.code_generation;
-            }
-          }
-          // Branch 3: Agent execution node
-          else if (currentNode.execution_mode === 'agent' || !currentNode.execution_mode) {
-            const isAcceptance = currentNode.result_rule === 'acceptance' || currentNode.id === 'acceptance';
-
-            // If developer node: increment code generation
-            if (!isAcceptance) {
-              taskWorkflow.code_generation += 1;
-              db.updateTaskWorkflow(taskId, { code_generation: taskWorkflow.code_generation });
-            }
-
-            // Prerequisite check for acceptance: tests must be passed on the current code generation
-            if (isAcceptance && taskWorkflow.code_generation > 0 && taskWorkflow.tests_passed_generation !== taskWorkflow.code_generation) {
-              logger.warn(`[WorkflowEngine] Acceptance requires valid tests for code generation ${taskWorkflow.code_generation}, but tests passed generation is ${taskWorkflow.tests_passed_generation}. Routing to tests.`);
-              // Route to test node if exists
-              const testNode = nodes.find((n) => n.id === 'test' || n.execution_mode === 'command');
-              if (testNode) {
-                db.updateTaskWorkflow(taskId, { current_node_id: testNode.id });
-                continue;
-              }
-            }
-
-            db.createNodeRun({
-              run_id: runId,
-              task_id: taskId,
-              node_id: currentNode.id,
-              execution_index: currentExecIndex,
+              code_generation: taskWorkflow.code_generation,
               status: 'running',
               completion_token: completionToken,
+              attempt_dir: materialized.paths.attemptDir,
+              inputs_json: inputsMetaJson,
             });
 
-            const executorName = (isAcceptance ? (task.reviewer_executor || currentNode.executor) : (task.worker_executor || currentNode.executor)) || 'workbuddy';
+            const executorName = currentNode.executor || (isAcceptance ? 'codex' : 'workbuddy');
             const adapter = adapterRegistry.getAdapter(executorName);
-            const modelName = (isAcceptance ? (task.reviewer_model || currentNode.model) : (task.worker_model || currentNode.model)) || adapter.defaultModel;
+            const modelName =
+              (currentNode.model && currentNode.model !== 'default')
+                ? currentNode.model
+                : adapter.defaultModel;
 
-            const roundStage = isAcceptance ? RoundStage.CODEX_ACCEPTANCE : RoundStage.WORKER_DEV;
+            const roundStage = isAcceptance
+              ? RoundStage.CODEX_ACCEPTANCE
+              : currentNode.result_rule === 'verification'
+              ? RoundStage.RUNNING_TESTS
+              : RoundStage.WORKER_DEV;
 
-            let basePrompt = currentNode.prompt || '';
-            if (!basePrompt) {
-              if (isAcceptance) {
-                basePrompt = revisionRecord.verifier_prompt_md || 'Perform strict acceptance verification.';
-              } else {
-                const promptRec = workerPrompts.find((w) => w.worker_id === nextWorkerId) || workerPrompts[0];
-                basePrompt = promptRec?.prompt_text || 'Develop the requested changes.';
-              }
-            }
+            let nodePromptContent = '';
+            try {
+              nodePromptContent = fs
+                .readFileSync(path.join(materialized.paths.materialDir, 'prompt.md'), 'utf8')
+                .trim();
+            } catch {}
+            // 编排要求与本次任务材料共同生效，任务包不能覆盖节点的固定职责。
+            const basePrompt = [
+              currentNode.prompt?.trim() ? `## 工作流节点提示词\n${currentNode.prompt.trim()}` : '',
+              nodePromptContent ? `## 本次任务提示词\n${nodePromptContent}` : '',
+            ].filter(Boolean).join('\n\n');
 
             const promptLines = [
               basePrompt,
               '',
               '---',
-              '## Current Execution Round Context',
-              `Round Number: ${currentRound}`,
-              `Task Root: ${taskFileStore.getRevisionDir(taskId, revisionRecord.revision)}`,
+              '## Isolated Node Attempt Runtime Context',
+              `Task ID: ${taskId} (Revision: r${revisionRecord.revision}, Digest: ${revisionRecord.package_digest})`,
+              `Node ID: ${currentNode.id} (${currentNode.name})`,
+              `Attempt ID: ${runId} (Execution #${currentExecIndex}, Round ${currentRound})`,
               `Working Directory: ${confirmedCwd}`,
+              `Isolated Attempt Directory: ${materialized.paths.attemptDir}`,
+              `Context Manifest: ${materialized.paths.contextPath}`,
+              `Node Spec: ${path.join(materialized.paths.materialDir, 'node.md')}`,
+              `Node Resources Dir: ${path.join(materialized.paths.materialDir, 'resources')}`,
+              `Shared Resources Dir: ${path.join(materialized.paths.sharedDir, 'resources')}`,
+              `Bound Inputs Dir: ${materialized.paths.inputsDir}`,
+              `Outputs Dir: ${materialized.paths.outputsDir}`,
             ];
-            if (previousTestFailureSummary) {
-              promptLines.push('', '### Previous Test Failures to Fix', previousTestFailureSummary);
+            if (isVerification) {
+              promptLines.push('', '自行检查项目和任务材料，选择并真实运行测试命令；不修改业务代码。',
+                '将证据保存为 Outputs Dir 下的 test_report.json，格式为 {"tests":[{"command":"实际运行的命令","cwd":"实际工作目录","exit_code":0,"stdout":"实际标准输出","stderr":"实际错误输出"}]}。',
+                'tests 至少包含一条实际执行记录；无法运行或缺失证据时如实报告阻塞。工作台根据退出码判定测试结果，不要求用户配置命令。');
             }
-            if (previousRoundIssues) {
-              promptLines.push('', '### Previous Acceptance Issues / Feedback', previousRoundIssues);
+            if (inputResolution.inputsSummaryText) {
+              promptLines.push('', '### Bound Upstream Inputs', inputResolution.inputsSummaryText);
             }
-
+            if (reworkFeedback) {
+              promptLines.push('', reworkFeedback);
+            }
             const fullPrompt = promptLines.join('\n');
 
             const roundDbId = db.createExecutionRound({
               task_id: taskId,
               round_number: currentRound,
               stage: roundStage,
-              worker_id: isAcceptance ? null : nextWorkerId,
+              worker_id: currentNode.id,
               adapter_id: adapter.id,
               model_name: modelName,
               input_prompt: fullPrompt,
@@ -555,17 +975,21 @@ export class WorkflowEngine {
 
             db.updateTaskStatus(taskId, TaskStatus.RUNNING, {
               current_stage: roundStage,
-              active_worker_id: isAcceptance ? null : nextWorkerId,
+              active_worker_id: currentNode.id,
               current_round: currentRound,
             });
 
             if (isAcceptance) {
               const diffSnapshot = GitService.getDiffSnapshot(confirmedCwd);
               const testRuns = db.getTestRuns(taskId, currentRound);
-              const testSummaryText = testRuns.map((t) => `Test ${t.test_case_id} [${t.command}]: Exit code ${t.exit_code}`).join('\n');
+              const testSummaryText = testRuns
+                .map((t) => `Command ${t.test_case_id} [${t.command}]: Exit code ${t.exit_code}`)
+                .join('\n');
 
               const verification = await new AcceptanceService().execute(adapter, {
                 taskId,
+                nodeId: currentNode.id,
+                attemptId: runId,
                 timeoutMs: task.execution_timeout_ms || resolveExecutionTimeout(),
                 roundId: roundDbId,
                 signal: this.taskController.signal,
@@ -573,11 +997,14 @@ export class WorkflowEngine {
                 model: modelName,
                 revision: revisionRecord.revision,
                 confirmedCwd,
-                taskPackageDir: taskFileStore.getRevisionDir(taskId, revisionRecord.revision),
+                attemptDir: materialized.paths.attemptDir,
+                nodePrompt: basePrompt,
+                materialFiles: manifestNode.resources.map((r) => r.path),
+                sharedFiles: manifestNode.shared_refs,
+                boundInputsSummary: inputResolution.inputsSummaryText,
                 testRunsSummary: testSummaryText,
                 gitDiff: diffSnapshot.diff,
-                verifierPrompt: basePrompt,
-                definedWorkerIds,
+                definedNodeIds: definedTaskNodeIds,
               });
 
               if (db.getTask(taskId)?.stop_requested) {
@@ -599,9 +1026,21 @@ export class WorkflowEngine {
                 raw_output: verification.rawOutput || JSON.stringify(verification),
               });
 
+              const accReportBuf = Buffer.from(JSON.stringify(verification, null, 2) + '\n', 'utf8');
+              fs.writeFileSync(path.join(materialized.paths.outputsDir, 'acceptance-report.json'), accReportBuf);
+              extraOutputs.acceptance_report = {
+                path: 'outputs/acceptance-report.json',
+                sha256: computeBufferSha256(accReportBuf),
+                size_bytes: accReportBuf.length,
+              };
+
               if (verification.decision === 'blocked') {
                 db.completeExecutionRound(roundDbId, { status: 'blocked', output_text: verification.summary });
-                db.updateNodeRun(runId, { status: 'blocked', result_summary: verification.summary, finished_at: Date.now() });
+                db.updateNodeRun(runId, {
+                  status: 'blocked',
+                  result_summary: verification.summary,
+                  finished_at: Date.now(),
+                });
                 db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
                   blocked_reason: `Reviewer acceptance blocked: ${verification.summary}`,
                 });
@@ -611,25 +1050,34 @@ export class WorkflowEngine {
               if (verification.decision === 'needs_changes') {
                 outcome = 'failed';
                 summary = verification.summary;
-                const firstIssue = verification.issues[0];
-                if (firstIssue?.targetWorkerId && definedWorkerIds.includes(firstIssue.targetWorkerId)) {
-                  nextWorkerId = firstIssue.targetWorkerId;
-                } else {
-                  nextWorkerId = definedWorkerIds[0] || 'worker-dev';
-                }
-
-                previousRoundIssues = verification.issues.map((i) => `Issue ${i.id}: ${i.description}\nEvidence: ${i.evidence || 'N/A'}`).join('\n\n') || summary;
-                db.completeExecutionRound(roundDbId, { status: 'failed', output_text: summary, issues_json: JSON.stringify(verification.issues), duration_ms: verification.durationMs });
+                issuesForResult = verification.issues.map((i) => ({
+                  id: i.id,
+                  description: i.description,
+                  evidence: i.evidence,
+                }));
+                previousRoundIssues =
+                  verification.issues
+                    .map((i) => `Issue ${i.id}: ${i.description}\nEvidence: ${i.evidence || 'N/A'}`)
+                    .join('\n\n') || summary;
+                db.completeExecutionRound(roundDbId, {
+                  status: 'failed',
+                  output_text: summary,
+                  issues_json: JSON.stringify(verification.issues),
+                  duration_ms: verification.durationMs,
+                });
               } else {
                 outcome = 'passed';
                 summary = verification.summary;
                 previousRoundIssues = '';
-                db.completeExecutionRound(roundDbId, { status: 'passed', output_text: summary, duration_ms: verification.durationMs });
+                db.completeExecutionRound(roundDbId, {
+                  status: 'passed',
+                  output_text: summary,
+                  duration_ms: verification.durationMs,
+                });
                 db.updateTaskWorkflow(taskId, { acceptance_passed_generation: taskWorkflow.code_generation });
                 taskWorkflow.acceptance_passed_generation = taskWorkflow.code_generation;
               }
             } else {
-              // Regular worker execution
               const workerResult = await adapter.execute({
                 taskId,
                 roundId: roundDbId,
@@ -650,7 +1098,7 @@ export class WorkflowEngine {
                 });
                 db.updateNodeRun(runId, {
                   status: 'blocked',
-                  result_summary: workerResult.error || 'Worker execution failed',
+                  result_summary: workerResult.error || 'Agent execution failed',
                   finished_at: Date.now(),
                 });
 
@@ -659,9 +1107,9 @@ export class WorkflowEngine {
                   return;
                 }
 
-                const errorMsg = workerResult.error || 'Worker execution failed';
+                const errorMsg = workerResult.error || 'Agent execution failed';
                 db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
-                  blocked_reason: `Worker execution encountered error: ${errorMsg}`,
+                  blocked_reason: `Agent execution encountered error: ${errorMsg}`,
                 });
                 return;
               }
@@ -672,28 +1120,93 @@ export class WorkflowEngine {
                 duration_ms: workerResult.durationMs,
               });
 
-              taskFileStore.saveArtifact(
-                taskId,
-                revisionRecord.revision,
-                `round_${currentRound}_worker_output.txt`,
-                workerResult.output
-              );
+              const outTxtBuf = Buffer.from(workerResult.output || '', 'utf8');
+              fs.writeFileSync(path.join(materialized.paths.outputsDir, 'agent-output.txt'), outTxtBuf);
+              extraOutputs.agent_output = {
+                path: 'outputs/agent-output.txt',
+                sha256: computeBufferSha256(outTxtBuf),
+                size_bytes: outTxtBuf.length,
+              };
 
               const updatedRun = db.getNodeRunByRunId(runId);
-              summary = updatedRun?.result_summary || 'Worker execution completed successfully.';
-              outcome = 'passed';
+              summary = updatedRun?.result_summary || `Node ${currentNode.name} completed.`;
+              if (updatedRun?.reported_outcome === 'failed') {
+                outcome = 'failed';
+                issuesForResult = [{ id: `REPORT-${currentNode.id}`, description: summary }];
+                previousRoundIssues = summary;
+              } else {
+                outcome = 'passed';
+              }
+              if (isVerification) {
+                try {
+                  const report = this.recordVerificationReport(taskId, currentRound, currentNode.id, materialized.paths.attemptDir);
+                  extraOutputs.test_report = report.output;
+                  if (!report.passed) {
+                    outcome = 'failed';
+                    summary = report.summary;
+                    issuesForResult = [{ id: `TEST-${currentNode.id}`, description: summary }];
+                    previousRoundIssues = summary;
+                  }
+                  db.completeExecutionRound(roundDbId, { status: outcome, output_text: workerResult.output });
+                } catch (error: any) {
+                  const reason = `测试节点 [${currentNode.name}] 缺少有效执行证据: ${error.message}`;
+                  db.completeExecutionRound(roundDbId, { status: 'blocked', output_text: workerResult.output, error_message: reason });
+                  db.updateNodeRun(runId, { status: 'blocked', result_summary: reason, finished_at: Date.now() });
+                  db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: reason });
+                  return;
+                }
+              }
             }
           }
 
-          // Advance logic
-          const nextTargetId = outcome === 'passed' ? currentNode.on_success : currentNode.on_failure;
+          // Validate output_contract and persist canonical result.json
+          const outputCheck = this.validateAndRecordNodeOutputs({
+            taskId,
+            revision: revisionRecord.revision,
+            packageDigest: revisionRecord.package_digest,
+            nodeId: currentNode.id,
+            attemptId: runId,
+            executionIndex: currentExecIndex,
+            codeGeneration: taskWorkflow.code_generation,
+            outcome,
+            summary,
+            issues: issuesForResult,
+            manifestNode,
+            attemptDir: materialized.paths.attemptDir,
+            outputsDir: materialized.paths.outputsDir,
+            extraOutputs,
+          });
+
+          if (!outputCheck.valid) {
+            const errMsg = outputCheck.errorMessage || '节点输出契约校验失败';
+            db.updateNodeRun(runId, {
+              status: 'blocked',
+              result_summary: errMsg,
+              result_json: outputCheck.resultJson,
+              result_sha256: outputCheck.resultSha256,
+              outputs_json: JSON.stringify(outputCheck.outputsMap),
+              finished_at: Date.now(),
+            });
+            db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
+              blocked_reason: errMsg,
+            });
+            return;
+          }
 
           db.updateNodeRun(runId, {
             status: outcome,
             result_summary: summary,
+            result_json: outputCheck.resultJson,
+            result_sha256: outputCheck.resultSha256,
+            outputs_json: JSON.stringify(outputCheck.outputsMap),
             finished_at: Date.now(),
           });
 
+          if (isVerification && outcome === 'passed') {
+            db.updateTaskWorkflow(taskId, { tests_passed_generation: taskWorkflow.code_generation });
+          }
+
+          const nextTargetId = outcome === 'passed' ? currentNode.on_success : currentNode.on_failure;
           if (!nextTargetId) {
             const pauseReason = `节点 [${currentNode.name}] ${outcome === 'failed' ? '失败' : '完成'}后未配置去向，已暂停。`;
             db.updateTaskStatus(taskId, TaskStatus.BLOCKED, { blocked_reason: pauseReason });

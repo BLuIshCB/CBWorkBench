@@ -8,13 +8,16 @@ export interface AdapterExecutionPolicy {
 }
 
 export const MANDATORY_CLI_POLICY: AdapterExecutionPolicy = {
-  transport: 'cli', interaction: 'headless', promptTransport: 'stdin-utf8', sessionPersistence: 'disabled',
+  transport: 'cli',
+  interaction: 'headless',
+  promptTransport: 'stdin-utf8',
+  sessionPersistence: 'disabled',
 };
 
 /** 所有用途共用一个请求，用途与业务边界由提示词表达。 */
-export type AdapterProgress = {type:'output'|'progress';text:string;stream?:'stdout'|'stderr';toolName?:string};
+export type AdapterProgress = { type: 'output' | 'progress'; text: string; stream?: 'stdout' | 'stderr'; toolName?: string };
 export interface AgentExecutionContext {
-  kind?: 'worker'|'reviewer'|'probe';
+  kind?: 'worker' | 'reviewer' | 'probe';
   taskId?: string;
   prompt: string;
   cwd: string;
@@ -22,14 +25,14 @@ export interface AgentExecutionContext {
   signal?: AbortSignal;
   runId?: string;
   roundId?: number;
-  onEvent?: (event:AdapterProgress)=>void;
+  onEvent?: (event: AdapterProgress) => void;
   timeoutMs?: number;
 }
 
 export interface AgentExecutionResult {
   runId?: string;
   roundId?: number;
-  stopReason?: import("../services/executionService.ts").StopReason;
+  stopReason?: import('../services/executionService.ts').StopReason;
   cleanupConfirmed?: boolean;
   ok: boolean;
   output: string;
@@ -49,7 +52,7 @@ export interface IAgentAdapter {
   readonly defaultModel: string;
   /** 静态模型建议；有原生目录的适配器通过 listModels 获取完整可见列表。 */
   readonly supportedModels: readonly string[];
-  readonly progressCapability?: 'raw'|'events';
+  readonly progressCapability?: 'raw' | 'events';
   readonly connectionType: string;
   readonly executionPolicy: AdapterExecutionPolicy;
   healthCheck(): Promise<{ healthy: boolean; message?: string }>;
@@ -78,18 +81,23 @@ export interface ReviewerExecutionContext {
   signal?: AbortSignal;
   runId?: string;
   roundId?: number;
-  onEvent?: (event:AdapterProgress)=>void;
+  onEvent?: (event: AdapterProgress) => void;
   timeoutMs?: number;
   taskId: string;
+  nodeId: string;
+  attemptId: string;
   roundNumber: number;
   model: string;
   revision: number;
   confirmedCwd: string;
-  taskPackageDir: string;
+  attemptDir: string;
+  nodePrompt: string;
+  materialFiles: string[];
+  sharedFiles: string[];
+  boundInputsSummary: string;
   testRunsSummary: string;
   gitDiff?: string;
-  verifierPrompt: string;
-  definedWorkerIds: string[];
+  definedNodeIds: string[];
 }
 
 export interface ReviewerExecutionResult {
@@ -111,7 +119,7 @@ export interface AdapterMetaDto {
   description: string;
   defaultModel: string;
   supportedModels: string[];
-  progressCapability?: 'raw'|'events';
+  progressCapability?: 'raw' | 'events';
   connectionType: string;
   executionPolicy: AdapterExecutionPolicy;
   healthy?: boolean;

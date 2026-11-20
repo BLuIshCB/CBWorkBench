@@ -31,7 +31,7 @@ try {
   // 3. POST /api/workflows validation failure (e.g. missing end node)
   const invalidGraph = [
     { id: 'start', name: '开始', type: 'start', on_success: 'task1' },
-    { id: 'task1', name: '任务1', type: 'task', execution_mode: 'command', on_success: 'start' },
+    { id: 'task1', name: '任务1', type: 'task', execution_mode: 'agent', on_success: 'start' },
   ];
   const invalidRes = await fetch(`${baseUrl}/api/workflows`, {
     method: 'POST',
@@ -52,7 +52,7 @@ try {
   // 4. POST /api/workflows valid custom workflow
   const validGraph = [
     { id: 'start', name: '开始', type: 'start', on_success: 'task1' },
-    { id: 'task1', name: '任务1', type: 'task', execution_mode: 'command', command: 'echo hi', on_success: 'end' },
+    { id: 'task1', name: '任务1', type: 'task', execution_mode: 'agent', prompt: '自行检查项目并执行任务', on_success: 'end' },
     { id: 'end', name: '结束', type: 'end' },
   ];
   const validRes = await fetch(`${baseUrl}/api/workflows`, {
@@ -205,6 +205,73 @@ try {
   assert.strictEqual(delSuccessData.success, true);
   assert.strictEqual(db.getWorkflow('good-wf'), null);
   console.log('  ✓ DELETE /api/workflows/good-wf succeeds once task is removed');
+
+  // 8.5 Unmatched /api/* route returns structured JSON 404 instead of plain text
+  const unmatchedApiRes = await fetch(`${baseUrl}/api/workflows/non-existent/unknown-action`, {
+    method: 'DELETE',
+  });
+  assert.strictEqual(unmatchedApiRes.status, 404);
+  assert(unmatchedApiRes.headers.get('content-type')?.includes('application/json'));
+  const unmatchedApiData = await unmatchedApiRes.json();
+  assert.strictEqual(unmatchedApiData.success, false);
+  assert.strictEqual(unmatchedApiData.code, 'NOT_FOUND');
+  console.log('  ✓ Unmatched /api/* routes return JSON 404');
+
+  // 8.6 Malformed percent encoding returns 400 JSON instead of 500
+  const malformedRes = await fetch(`${baseUrl}/api/workflows/%E0%A4%A`, {
+    method: 'DELETE',
+  });
+  assert.strictEqual(malformedRes.status, 400);
+  const malformedData = await malformedRes.json();
+  assert.strictEqual(malformedData.success, false);
+  assert.strictEqual(malformedData.code, 'INVALID_INPUT');
+  console.log('  ✓ Malformed workflow ID encoding returns 400 INVALID_INPUT');
+
+  // 9. Frontend api.js client integration & non-JSON 404 handling
+  const prevWindow = (globalThis as any).window;
+  const prevFetch = globalThis.fetch;
+  try {
+    (globalThis as any).window = { location: { origin: baseUrl } };
+    const { api } = await import('../src/ui/js/api.js');
+
+    // Create workflow with special characters (spaces + slash) and delete via api.deleteWorkflow
+    const specialId = 'wf space/1';
+    const createSpecialRes = await api.saveWorkflow({
+      id: specialId,
+      name: 'Special ID Workflow',
+      nodes: validGraph,
+    });
+    assert.strictEqual(createSpecialRes.success, true);
+
+    const delSpecialRes = await api.deleteWorkflow(specialId);
+    assert.strictEqual(delSpecialRes.success, true);
+    assert.strictEqual(db.getWorkflow(specialId), null);
+    console.log('  ✓ api.deleteWorkflow deletes workflow with encoded ID characters');
+
+    // Simulate stale backend returning plain-text 404 "Not Found"
+    globalThis.fetch = async () =>
+      new Response('Not Found', {
+        status: 404,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      });
+    await assert.rejects(
+      () => api.deleteWorkflow('good-wf'),
+      (err: any) => {
+        assert(err instanceof Error);
+        assert(err.message.includes('HTTP 404'));
+        assert(!err.message.includes('is not valid JSON'));
+        return true;
+      }
+    );
+    console.log('  ✓ api.js converts plain-text 404 Not Found into actionable HTTP 404 error');
+  } finally {
+    globalThis.fetch = prevFetch;
+    if (prevWindow === undefined) {
+      delete (globalThis as any).window;
+    } else {
+      (globalThis as any).window = prevWindow;
+    }
+  }
 
   console.log('✅ workflowHttp.test.ts passed successfully!');
 } finally {

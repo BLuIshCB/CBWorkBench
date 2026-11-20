@@ -12,9 +12,9 @@ delete process.env.CB_MOCK_WORKBUDDY;
 delete process.env.CB_MOCK_CODEX;
 const adapter = new WorkBuddyAdapter();
 const context = {
-  taskId: 'regular-task', roundNumber: 1, revision: 7, model: 'deepseek-v4-flash',
-  confirmedCwd: cwd, taskPackageDir: cwd, testRunsSummary: 'Test T1: Exit code 0',
-  verifierPrompt: 'Verify acceptance criteria.', definedWorkerIds: ['worker-dev'],
+  taskId: 'regular-task', nodeId: 'acceptance', attemptId: 'run-reg-1', roundNumber: 1, revision: 7, model: 'deepseek-v4-flash',
+  confirmedCwd: cwd, attemptDir: cwd, testRunsSummary: 'Test T1: Exit code 0',
+  nodePrompt: 'Verify acceptance criteria.', materialFiles: [], sharedFiles: [], boundInputsSummary: '', definedNodeIds: ['development'],
 };
 try {
   WorkBuddyAdapter.prototype.execute = async () => ({ ok: false, output: '', error: 'Authentication required' });
@@ -53,7 +53,7 @@ try {
       criteriaResults: [{ id: 'C1', passed: true, evidence: 'file:1' }], issues: [], manualChecksPending: [],
     }) };
   };
-  const legacy = await new AcceptanceService().execute(adapter, { ...context, verifierPrompt: 'Legacy task output example: {"revision":"r04"}' });
+  const legacy = await new AcceptanceService().execute(adapter, { ...context, nodePrompt: 'Legacy task output example: {"revision":"r04"}' });
   assert.equal(legacy.decision, 'passed');
   assert.ok(legacyPrompt.indexOf('workbench output contract takes precedence') > legacyPrompt.indexOf('Legacy task output example'));
   assert.ok(legacyPrompt.includes('"revision":7'));

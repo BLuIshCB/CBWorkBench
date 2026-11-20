@@ -1,19 +1,20 @@
-import { z } from 'zod';
+import crypto from 'node:crypto';
+import { encodeNodeDirName } from '../utils/pathSecurity.ts';
 
 export type WorkflowNodeType = 'start' | 'end' | 'task';
-export type TaskExecutionMode = 'agent' | 'command' | 'manual';
-export type TaskResultRule = 'default' | 'acceptance';
+export type TaskExecutionMode = 'agent' | 'manual';
+export type TaskResultRule = 'default' | 'verification' | 'acceptance';
 
 export interface WorkflowNode {
   id: string;
   name: string;
+  description?: string;
   type: WorkflowNodeType;
   execution_mode?: TaskExecutionMode;
   result_rule?: TaskResultRule;
   executor?: string;
   model?: string;
   prompt?: string;
-  command?: string;
   max_executions?: number;
   on_success?: string | null;
   on_failure?: string | null;
@@ -29,6 +30,21 @@ export interface WorkflowDefinition {
   is_default?: boolean;
 }
 
+export interface UniformNodeMaterialContract {
+  node_dir: string;
+  node_ref: string;
+  prompt_ref: string;
+  resources_dir: string;
+  instruction_usage: 'agent_prompt' | 'manual_guide';
+  supports_resources: boolean;
+  supports_shared_refs: boolean;
+  supports_input_bindings: boolean;
+  supports_output_contract: boolean;
+  default_required_outputs: string[];
+  purpose: string;
+  purpose_configured: boolean;
+}
+
 export const DEFAULT_WORKFLOW_ID = 'default';
 export const DEFAULT_MAX_EXECUTIONS = 0; // 0 表示不做次数限制
 
@@ -42,11 +58,12 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
   {
     id: 'development',
     name: '开发实现',
+    description: '按需求与开发清单实现功能变更，并在返工时依据上游反馈完成修复。',
     type: 'task',
     execution_mode: 'agent',
     executor: 'workbuddy',
     model: 'default',
-    prompt: '实现本次需求，并根据测试与验收反馈修复。',
+    prompt: '实现本次需求，并根据上游反馈完成修复。',
     max_executions: DEFAULT_MAX_EXECUTIONS,
     on_success: 'test',
     on_failure: null,
@@ -54,9 +71,13 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
   {
     id: 'test',
     name: '独立测试',
+    description: '根据项目与任务材料自行选择并运行测试命令，提交命令、退出码和输出证据。',
     type: 'task',
-    execution_mode: 'command',
-    command: '',
+    execution_mode: 'agent',
+    result_rule: 'verification',
+    executor: 'workbuddy',
+    model: 'default',
+    prompt: '阅读项目测试入口与本节点材料，自行选择并运行必要的测试命令，不修改业务代码。记录实际命令、工作目录、退出码及输出到 outputs/test_report.json；测试失败或无法执行时如实报告，不得声称通过。',
     max_executions: DEFAULT_MAX_EXECUTIONS,
     on_success: 'acceptance',
     on_failure: 'development',
@@ -64,12 +85,13 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
   {
     id: 'acceptance',
     name: '整体验收',
+    description: '只读核验代码变更、上游产物证据及验收清单，输出结构化验收判定。',
     type: 'task',
     execution_mode: 'agent',
     result_rule: 'acceptance',
     executor: 'codex',
     model: 'default',
-    prompt: '依据任务标准和本轮测试证据进行验收。',
+    prompt: '依据本节点材料和上游证据进行严格只读验收。',
     max_executions: DEFAULT_MAX_EXECUTIONS,
     on_success: 'human_review',
     on_failure: 'development',
@@ -77,9 +99,10 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
   {
     id: 'human_review',
     name: '人工确认',
+    description: '人类工程师复核最终交付结果、运行产物与待办人工核验项，决定通过或退回。',
     type: 'task',
     execution_mode: 'manual',
-    prompt: '请人工审核代码与交付结果，确认是否通过。',
+    prompt: '请人工审核代码变更、运行产物与核验清单，确认是否通过。',
     max_executions: DEFAULT_MAX_EXECUTIONS,
     on_success: 'end',
     on_failure: 'development',
@@ -96,13 +119,68 @@ export interface ValidationResult {
   errors: string[];
 }
 
+function canonicalizeValue(val: unknown): unknown {
+  if (Array.isArray(val)) {
+    return val.map(canonicalizeValue);
+  }
+  if (val !== null && typeof val === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(val as Record<string, unknown>).sort()) {
+      const v = (val as Record<string, unknown>)[key];
+      if (v !== undefined) {
+        out[key] = canonicalizeValue(v);
+      }
+    }
+    return out;
+  }
+  return val;
+}
+
+export function computeWorkflowDefinitionSha256(wf: {
+  id: string;
+  name: string;
+  description?: string | null;
+  nodes: WorkflowNode[];
+}): string {
+  const payload = canonicalizeValue({
+    id: wf.id,
+    name: wf.name,
+    description: wf.description ?? null,
+    nodes: wf.nodes,
+  });
+  return crypto.createHash('sha256').update(JSON.stringify(payload), 'utf8').digest('hex');
+}
+
+export function buildUniformNodeMaterialContract(node: WorkflowNode): UniformNodeMaterialContract | null {
+  if (node.type !== 'task') return null;
+  const dirName = encodeNodeDirName(node.id);
+  const purpose = (node.prompt?.trim() || node.description || '').trim();
+  const instructionUsage: UniformNodeMaterialContract['instruction_usage'] =
+    node.execution_mode === 'manual' ? 'manual_guide' : 'agent_prompt';
+
+  return {
+    node_dir: `nodes/${dirName}`,
+    node_ref: `nodes/${dirName}/node.md`,
+    prompt_ref: `nodes/${dirName}/prompt.md`,
+    resources_dir: `nodes/${dirName}/resources`,
+    instruction_usage: instructionUsage,
+    supports_resources: true,
+    supports_shared_refs: true,
+    supports_input_bindings: true,
+    supports_output_contract: true,
+    default_required_outputs: node.result_rule === 'verification' ? ['result', 'test_report'] : ['result'],
+    purpose,
+    purpose_configured: Boolean(purpose),
+  };
+}
+
 /**
  * Validates a workflow definition's node graph according to CBWorkBench rules:
  * 1. Exactly one 'start' node and one 'end' node.
  * 2. Unique non-empty node IDs.
  * 3. 'start' node has no incoming edges, only one on_success pointing to an existing task node.
  * 4. 'end' node has no outgoing edges, must have at least one incoming edge.
- * 5. 'task' nodes have valid execution_mode ('agent', 'command', 'manual') and positive max_executions.
+ * 5. 'task' nodes have valid execution_mode ('agent', 'manual') and valid max_executions.
  * 6. No edges may point back to 'start'.
  * 7. All targets (on_success, on_failure) must reference existing nodes.
  * 8. All nodes must be reachable from 'start'.
@@ -128,6 +206,9 @@ export function validateWorkflowNodes(nodes: WorkflowNode[], workflowId?: string
       continue;
     }
     const id = node.id.trim();
+    if (id.toLowerCase() === 'shared') {
+      errors.push('节点 ID 不得使用保留名称 shared');
+    }
     if (nodeMap.has(id)) {
       errors.push(`重复的节点 ID: ${id}`);
     }
@@ -180,9 +261,17 @@ export function validateWorkflowNodes(nodes: WorkflowNode[], workflowId?: string
 
   for (const node of nodes) {
     if (node.type === 'task') {
-      const validModes: TaskExecutionMode[] = ['agent', 'command', 'manual'];
+      const validModes: TaskExecutionMode[] = ['agent', 'manual'];
       if (!node.execution_mode || !validModes.includes(node.execution_mode)) {
-        errors.push(`任务节点 ${node.id} 的执行方式无效: ${node.execution_mode}，必须为 agent、command 或 manual`);
+        errors.push(`任务节点 ${node.id} 的执行方式无效: ${node.execution_mode}，必须为 agent 或 manual；测试命令由 Agent 节点自行执行`);
+      }
+
+      if ('command' in node) errors.push(`任务节点 ${node.id} 不再支持 command 配置，命令由节点自行确定并执行`);
+      if (node.result_rule && !['default', 'verification', 'acceptance'].includes(node.result_rule)) {
+        errors.push(`任务节点 ${node.id} 的结果规则无效: ${node.result_rule}`);
+      }
+      if (node.execution_mode !== 'agent' && node.result_rule && node.result_rule !== 'default') {
+        errors.push(`任务节点 ${node.id} 的测试或验收规则仅适用于 Agent 节点`);
       }
 
       if (node.max_executions !== undefined && node.max_executions !== 0 && (!Number.isInteger(node.max_executions) || node.max_executions < 1)) {
@@ -282,7 +371,6 @@ export function validateWorkflowNodes(nodes: WorkflowNode[], workflowId?: string
 
   // Default workflow rule check
   if (workflowId === DEFAULT_WORKFLOW_ID && startNode && endNode && errors.length === 0) {
-    // Check that every path from start to end must pass through development, test, acceptance, and manual
     const requiredNodes = ['test', 'acceptance'];
     for (const reqNode of requiredNodes) {
       if (!nodeMap.has(reqNode)) {

@@ -32,7 +32,7 @@ try {
   // 3. Save new workflow definition and direct modification (no V versions)
   const customNodes = [
     { id: 'start', name: '开始', type: 'start', on_success: 'step1' },
-    { id: 'step1', name: '步骤1', type: 'task', execution_mode: 'command', command: 'echo 1', on_success: 'end' },
+    { id: 'step1', name: '步骤1', type: 'task', execution_mode: 'agent', prompt: '执行步骤1', on_success: 'end' },
     { id: 'end', name: '结束', type: 'end' },
   ];
   const createdWf = testDb.saveWorkflowDefinition({
