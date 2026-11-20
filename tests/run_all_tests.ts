@@ -29,6 +29,11 @@ const testSuites = [
   'workflowDb.test.ts',
   'workflowStateMachine.test.ts',
   'workflowHttp.test.ts',
+  'taskWorkflowView.test.ts',
+  'dataDir.test.ts',
+  'entryExe.test.ts',
+  'packageProtocol.test.ts',
+  'taskCleanup.test.ts',
 ];
 
 console.log('============================================================');

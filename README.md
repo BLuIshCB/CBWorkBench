@@ -11,17 +11,17 @@
 
 ```mermaid
 flowchart TD
-    A["主 Agent 对话 (cb-flow)"] -->|"生成独立无上下文任务包"| B["门禁 1: 聊天内上传授权"]
-    B -->|"用户确认授权"| C["工作台 MCP 提交: workbench_submit_task"]
+    A["主 Agent 对话 (cb-flow)"] -->|"生成 cb.task-package/2.0 统一节点包"| B["门禁 1: 聊天内上传授权"]
+    B -->|"用户确认授权"| C["工作台 MCP 导入与冻结: stage + finalize"]
     C -->|"写入待启动状态: pending_confirm"| D["门禁 2: 工作台 Web 手动启动确认"]
-    D -->|"用户核对目标路径 & 点击【确认并开始】"| E["执行闭环: 选定 CLI 执行开发提示词"]
-    E --> F["工作台独立执行自动化测试 (tests.md)"]
-    F -->|"测试未通过"| E
-    F -->|"测试通过"| G["选定 CLI 执行验收提示词"]
+    D -->|"用户核对目标路径 & 点击【确认并开始】"| E["执行闭环: 节点隔离视图 + Agent 推进"]
+    E --> F["测试节点自行选择并运行命令，提交执行证据"]
+    F -->|"命令未通过"| E
+    F -->|"命令通过"| G["选定 CLI 按节点材料执行只读验收"]
     G -->|"验收未通过 (needs_changes)"| E
-    G -->|"验收通过 (passed)"| H["门禁 3: 最终人工审核 (human_review)"]
+    G -->|"验收通过 (passed)"| H["门禁 3: 人工处理节点 (human_review)"]
     H -->|"人工退回并附原因"| E
-    H -->|"人工审核通过"| I["任务最终归档完成 (completed)"]
+    H -->|"人工审核通过"| I["到达结束节点归档完成 (completed)"]
 ```
 
 ### 1. 门禁一：主 Agent 对话内上传授权
@@ -34,7 +34,7 @@ flowchart TD
 - 用户必须在 Web 控制台中亲自核对任务所属的工作目录（`target_cwd`）及 Git 变更状态，点击 **【确认并开始】** 按钮后，后台才开始串行调度。
 
 ### 3. 门禁三：最终人工审核门禁（最终人工审核）
-- 开发修复、独立测试命令与选定 CLI 的自动验收全通过后，任务进入 `human_review`。
+- 开发修复、测试节点提交的执行证据与选定 CLI 的自动验收全通过后，任务进入 `human_review`。
 - 用户在 Web 控制台查阅代码完整 Working Tree Diff、各轮次运行记录和验收报告。
 - 用户点击 **【通过并完成】** 正式结项；或点击 **【退回修改】** 输入重修反馈，驱动引擎进入下一轮闭环修复。
 
@@ -110,10 +110,13 @@ CBWorkBench 提供了标准 Stdio MCP 服务 `bin/cb-workbench-mcp.js`。
 ```
 
 ### MCP 提供的可用工具
-- `workbench_submit_task`: 上传完整任务包，任务进入【待启动确认】状态，返回任务详情链接。
-- `workbench_revise_task`: 提交任务包的新版本修订（如补充用例或调整需求）。
-- `workbench_get_task_status`: 查询任务当前状态（`pending_confirm`、`running`、`human_review`、`blocked` 等）。
-- `workbench_get_task_artifacts`: 读取最新一轮代码变更差异 Diff、测试运行结果与 Codex 验收结论。
+- `workbench_get_package_protocol`: 查询 `cb.task-package/2.0` 协议规范、限制、传输能力（仅 `local_path`）、实例 ID 与实际数据目录。
+- `workbench_list_workflows` / `workbench_get_workflow`: 获取工作流列表、定义摘要（`definition_sha256`）、安全目录名及各任务节点统一材料契约。
+- `workbench_stage_package` / `workbench_finalize_package`: 通过 `local_path` 暂存校验并原子冻结不可变修订版本（支持 `validate_only`），任务进入【待启动确认】状态。
+- `workbench_get_package` / `workbench_get_node_context`: 按幂等键、修订或节点执行凭据分页读取材料，严格隔离各节点私有文件。
+- `workbench_get_task_status` / `workbench_get_task_artifacts`: 查询任务当前节点、状态、变更 Diff、节点产物及命令/验收证据。
+- `workbench_delete_task`: 调用统一可恢复清理服务（若常驻后台存活则委托后台执行）。
+- `workbench_advance_workflow`: 运行中 Agent 报告当前节点结果，由后台按工作流连线统一推进。
 
 > **安全约定**：MCP 绝不包含 `start_task` 或 `approve_task` 接口。
 
@@ -147,11 +150,13 @@ CBWorkBench 提供了标准 Stdio MCP 服务 `bin/cb-workbench-mcp.js`。
 
 | 端点 | 方法 | 说明 |
 | :--- | :---: | :--- |
-| `/api/system/status` | `GET` | 查询工作台系统状态、Node 版本、Worker/Verifier 模型及并发占用 |
+| `/api/system/status` | `GET` | 查询工作台系统状态、Node 版本、实例 ID、数据目录及并发占用 |
+| `/api/system/instance` | `GET` | 查询当前常驻后台实例标识 (`instance_id`) 与绝对数据目录 (`data_dir`) |
 | `/api/runtime/clis` | `GET` | 查询当前工作台检测并配置的各类 CLI 工具与就绪状态 |
 | `/api/runtime/probe` | `POST` | 使用自定义或预设提示词对指定 CLI 发起可用性与连通性即时探测 |
 | `/api/tasks` | `GET` | 获取任务列表（支持 `?status=` 过滤） |
-| `/api/tasks/:id` | `GET` | 获取指定任务详情、版本材料、轮次、测试记录、验收记录与 Diff 快照 |
+| `/api/tasks/:id` | `GET` | 获取指定任务详情、Manifest、节点文件索引、执行记录与 Diff 快照 |
+| `/api/tasks/:id/revisions/:rev/resource` | `GET` | 分页安全读取指定修订中的节点/共同材料文件 |
 | `/api/tasks/:id/confirm-start` | `POST` | 门禁二：手动确认并启动任务（可选入参 `{ confirmed_cwd }`） |
 | `/api/tasks/:id/stop` | `POST` | 请求立即终止当前正在执行的任务 |
 | `/api/tasks/:id/human-review` | `POST` | 门禁三：提交人工决议 `{ action: "approve" \| "reject", reason: "..." }` |
@@ -162,7 +167,7 @@ CBWorkBench 提供了标准 Stdio MCP 服务 `bin/cb-workbench-mcp.js`。
 
 本项目将所有 Markdown 文档集中收敛至 [`docs/`](./docs/README.md) 目录，并在工程上严格实施单分支策略：
 
-* **追踪分支**：本仓库唯一主干分支为 `master`，直接追踪远端 `origin/master`。开发过程**不需要也不切分多个分支**。
+* **追踪分支**：本仓库唯一主干分支为 `main`，直接追踪远端 `origin/main`。开发过程**不需要也不切分多个分支**。
 * **开发边界规范**：详细约定了系统定位边界、三道硬门禁、Worker 工作区读写边界与 Codex 只读沙箱原则，详见 [**`docs/BOUNDARIES.md`**](./docs/BOUNDARIES.md)。
 * **总体架构与流程**：详见 [**`docs/ARCHITECTURE.md`**](./docs/ARCHITECTURE.md)。
 
@@ -222,7 +227,7 @@ CBWorkBench/
 
 源码版需要 Node 24+、Git 和项目依赖（`npm install`）。已有 Codex 时无需重装：先启动工作台检查入口与版本，再在运行时页面点击“验证真实对话”。认证失败时在原生终端运行 `codex login`；不读取或展示 token。默认模型“沿用CLI配置”不传 `-m`。选定项目后依照 MCP 配置上传完整任务包，在网页确认目录、执行器和单次执行超时时间，最终仍需人工审核。
 
-单次默认60分钟，范围1–1440整数分钟。一次开发、一次验收或每条独立测试命令各自重新计时；停止使用整个任务总预算，最多轮次规则继续生效。5分钟无输出仅提醒，任何输出都不延长硬上限。超时保留文件改动与输出，受阻后须人工重新确认，重试不恢复原CLI会话。
+单次默认60分钟，范围1–1440整数分钟。每次 Agent 节点执行独立计时，节点内选择和运行测试命令也包含在该时限内；最多轮次规则继续生效。5分钟无输出仅提醒，任何输出都不延长硬上限。超时保留文件改动与输出，受阻后须人工重新确认，重试不恢复原CLI会话。
 
 当前 Codex 参数包含 `--dangerously-bypass-approvals-and-sandbox`：命令具有当前用户权限，工作目录不构成安全隔离，验收也不具备强制只读保护。本轮保持既有权限策略。原始日志属于敏感本地材料，任意输出无法保证自动脱敏。
 
