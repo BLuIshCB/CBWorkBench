@@ -1,6 +1,7 @@
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { WorkbenchDatabase } from '../src/storage/db.ts';
 import { TaskStatus, RoundStage } from '../src/config/constants.ts';
 
@@ -21,47 +22,54 @@ const task = testDb.createTask({
   target_cwd: 'D:\\CODE\\AI\\CBWorkBench_TestSpace',
   git_root: 'D:\\CODE\\AI\\CBWorkBench_TestSpace',
   git_commit: 'abc1234',
-  git_status: 'clean'
+  git_status: 'clean',
 });
 
 assert.strictEqual(task.id, 'task-test-001');
 assert.strictEqual(task.status, TaskStatus.PENDING_CONFIRM);
 assert.strictEqual(task.current_round, 0);
 
-// 2. Save Revision & Prompts
+// 2. Save Revision & Package Files
+const manifestJson = JSON.stringify({ protocol_version: 'cb.task-package/2.0', revision: 1 });
+const manifestSha = crypto.createHash('sha256').update(manifestJson, 'utf8').digest('hex');
+const fileSha = crypto.createHash('sha256').update('# Node doc', 'utf8').digest('hex');
+
 testDb.saveRevision({
   task_id: 'task-test-001',
   revision: 1,
-  manifest_json: JSON.stringify({ packageVersion: 1 }),
-  task_md: '# Task Description',
-  development_md: '# Dev Plan',
-  tests_md: '# Tests',
-  acceptance_md: '# Acceptance Criteria',
-  verifier_prompt_md: '# Verifier Prompt'
+  manifest_json: manifestJson,
+  manifest_sha256: manifestSha,
+  package_digest: manifestSha,
+  workflow_id: 'default',
+  workflow_sha256: manifestSha,
+  readiness: 'ready',
+  files: [
+    {
+      path: 'nodes/development/node.md',
+      owner_scope: 'node',
+      owner_node_id: 'development',
+      media_type: 'text/markdown',
+      size_bytes: 10,
+      sha256: fileSha,
+    },
+  ],
 });
 
 const rev = testDb.getLatestRevision('task-test-001');
 assert.ok(rev);
 assert.strictEqual(rev.revision, 1);
-assert.strictEqual(rev.task_md, '# Task Description');
+assert.strictEqual(rev.package_digest, manifestSha);
 
-testDb.saveWorkerPrompt({
-  task_id: 'task-test-001',
-  revision: 1,
-  worker_id: 'worker-dev',
-  role: 'developer',
-  prompt_text: 'You are developer worker.'
-});
-
-const prompts = testDb.getWorkerPrompts('task-test-001', 1);
-assert.strictEqual(prompts.length, 1);
-assert.strictEqual(prompts[0].worker_id, 'worker-dev');
+const files = testDb.getPackageFiles('task-test-001', 1);
+assert.strictEqual(files.length, 1);
+assert.strictEqual(files[0].path, 'nodes/development/node.md');
+assert.strictEqual(files[0].owner_node_id, 'development');
 
 // 3. Update Status
 testDb.updateTaskStatus('task-test-001', TaskStatus.RUNNING, {
   current_round: 1,
   current_stage: RoundStage.WORKER_DEV,
-  active_worker_id: 'worker-dev'
+  active_worker_id: 'development',
 });
 
 const updatedTask = testDb.getTask('task-test-001');
@@ -74,7 +82,7 @@ const deleteResult = testDb.deleteTask('task-test-001');
 assert.strictEqual(deleteResult, true);
 assert.strictEqual(testDb.getTask('task-test-001'), null);
 assert.strictEqual(testDb.getLatestRevision('task-test-001'), null);
-assert.strictEqual(testDb.getWorkerPrompts('task-test-001', 1).length, 0);
+assert.strictEqual(testDb.getPackageFiles('task-test-001', 1).length, 0);
 
 // 5. Test deleteAllTasks
 testDb.createTask({
@@ -106,7 +114,6 @@ try {
       title: 'Rollback Test',
       target_cwd: 'D:\\Test',
     });
-    // Throw error to trigger rollback
     throw new Error('Forced error inside transaction');
   });
 } catch (e: any) {

@@ -1,12 +1,18 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import {
+  resolveDataDirConfig,
+  parseCliRuntimeArgs,
+  type InstanceMetadata,
+} from './dataDir.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export const DEFAULT_PORT = Number(process.env.CB_PORT) || 3721;
-export const DEFAULT_HOST = process.env.CB_HOST || '127.0.0.1';
+export const CLI_RUNTIME_ARGS = parseCliRuntimeArgs();
+export const DEFAULT_PORT = Number(CLI_RUNTIME_ARGS.port || process.env.CB_PORT) || 3721;
+export const DEFAULT_HOST = CLI_RUNTIME_ARGS.host || process.env.CB_HOST || '127.0.0.1';
 
 export const WORKER_FIXED_MODEL = 'deepseek-v4-flash';
 export const VERIFIER_DEFAULT_MODEL = 'default';
@@ -33,26 +39,34 @@ function resolveRootDir(): string {
 }
 
 export const ROOT_DIR = resolveRootDir();
-export const DATA_DIR = path.resolve(process.env.CB_DATA_DIR || path.join(ROOT_DIR, 'data'));
+const resolvedData = resolveDataDirConfig({ rootDir: ROOT_DIR });
+export const DATA_DIR = resolvedData.dataDir;
+export const DATA_DIR_SOURCE = resolvedData.source;
+export const INSTANCE_META: InstanceMetadata = resolvedData.instance;
+export const INSTANCE_ID = resolvedData.instance.instance_id;
+export const LEGACY_DATA_PATH = resolvedData.legacyDataPath;
+
 export const TASKS_DATA_DIR = path.join(DATA_DIR, 'tasks');
+export const MAINTENANCE_DELETIONS_DIR = path.join(DATA_DIR, 'maintenance', 'deletions');
 export const DB_PATH = path.join(DATA_DIR, 'workbench.db');
 
 export const TaskStatus = {
   PENDING_CONFIRM: 'pending_confirm', // 待启动确认 (Gate 2)
   QUEUED: 'queued',                   // 排队中
-  RUNNING: 'running',                 // 执行中 (Worker / Tests / Codex loop)
-  BLOCKED: 'blocked',                 // 异常待处理 (Budget exceeded, prerequisite missing)
-  HUMAN_REVIEW: 'human_review',       // 最终人工审核 (Gate 3, Codex passed)
-  COMPLETED: 'completed',             // 已完成 (Human approved)
+  RUNNING: 'running',                 // 执行中
+  BLOCKED: 'blocked',                 // 异常待处理
+  HUMAN_REVIEW: 'human_review',       // 人工处理节点等待确认
+  COMPLETED: 'completed',             // 已完成
   CANCELLED: 'cancelled',             // 已停止/取消
+  DELETING: 'deleting',               // 正在清理删除中
+  CLEANUP_FAILED: 'cleanup_failed',   // 清理失败待重试
 } as const;
 export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
 
 export const RoundStage = {
-  WORKER_DEV: 'worker_dev',           // WorkBuddy Worker 执行开发或修复
-  WORKER_REVIEW: 'worker_review',     // Worker 审查与测试准备
-  RUNNING_TESTS: 'running_tests',     // 工作台独立运行必需测试
-  CODEX_ACCEPTANCE: 'codex_acceptance', // Codex CLI 自动验收
-  HUMAN_REVIEW: 'human_review',       // 人工审核门禁
+  WORKER_DEV: 'worker_dev',
+  RUNNING_TESTS: 'running_tests',
+  CODEX_ACCEPTANCE: 'codex_acceptance',
+  HUMAN_REVIEW: 'human_review',
 } as const;
 export type RoundStage = (typeof RoundStage)[keyof typeof RoundStage];

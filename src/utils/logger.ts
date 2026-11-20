@@ -2,8 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR } from '../config/constants.ts';
 
+const MAX_LOG_FILE_BYTES = 5 * 1024 * 1024;
+
 export class Logger {
   private logFile: string;
+  private rotatedLogFile: string;
   private context: string;
 
   constructor(context: string = 'Workbench') {
@@ -12,6 +15,22 @@ export class Logger {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
     this.logFile = path.join(DATA_DIR, 'workbench.log');
+    this.rotatedLogFile = path.join(DATA_DIR, 'workbench.log.1');
+  }
+
+  private rotateIfNeeded(): void {
+    try {
+      if (!fs.existsSync(this.logFile)) return;
+      const stat = fs.statSync(this.logFile);
+      if (stat.size >= MAX_LOG_FILE_BYTES) {
+        if (fs.existsSync(this.rotatedLogFile)) {
+          fs.unlinkSync(this.rotatedLogFile);
+        }
+        fs.renameSync(this.logFile, this.rotatedLogFile);
+      }
+    } catch {
+      // Ignore rotation failures
+    }
   }
 
   private write(level: string, message: string, data?: unknown): void {
@@ -38,6 +57,7 @@ export class Logger {
     }
 
     try {
+      this.rotateIfNeeded();
       fs.appendFileSync(this.logFile, formatted + '\n', 'utf8');
     } catch {
       // Ignore file write failure

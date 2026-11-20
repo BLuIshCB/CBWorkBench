@@ -2,18 +2,14 @@ import type { RunSnapshot, ExecutionEvent } from '../services/executionService.t
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import { DB_PATH, DATA_DIR, TaskStatus, RoundStage } from '../config/constants.ts';
+import { DB_PATH, TaskStatus, RoundStage } from '../config/constants.ts';
 import { resolveExecutionTimeout } from '../services/executionPolicy.ts';
 import { logger } from '../utils/logger.ts';
-import crypto from 'node:crypto';
 import {
   type WorkflowNode,
-  type WorkflowNodeType,
-  type TaskExecutionMode,
-  type TaskResultRule,
   DEFAULT_WORKFLOW_ID,
   DEFAULT_WORKFLOW_NODES,
-  DEFAULT_MAX_EXECUTIONS,
+  computeWorkflowDefinitionSha256,
 } from '../services/workflowDefinition.ts';
 
 export interface WorkflowDefinitionRecord {
@@ -29,6 +25,8 @@ export interface WorkflowDefinitionRecord {
 export interface TaskWorkflowRecord {
   task_id: string;
   workflow_id: string;
+  workflow_sha256: string;
+  revision: number;
   nodes_json: string;
   current_node_id: string;
   current_run_id: string | null;
@@ -42,13 +40,22 @@ export interface WorkflowNodeRunRecord {
   id: number;
   run_id: string;
   task_id: string;
+  revision: number;
   node_id: string;
   execution_index: number;
+  round_number: number;
+  code_generation: number;
   status: 'running' | 'passed' | 'failed' | 'blocked' | 'waiting_manual' | 'cancelled';
   result_summary: string | null;
+  reported_outcome: 'passed' | 'failed' | null;
   completion_token: string | null;
   request_id: string | null;
   execution_run_id: string | null;
+  attempt_dir: string | null;
+  result_json: string | null;
+  result_sha256: string | null;
+  inputs_json: string | null;
+  outputs_json: string | null;
   created_at: number;
   finished_at: number | null;
 }
@@ -80,6 +87,7 @@ export interface TaskRecord {
   reviewer_executor?: string;
   reviewer_model?: string;
   workflow_id?: string;
+  workflow_sha256?: string;
   current_node_id?: string;
 }
 
@@ -88,21 +96,48 @@ export interface TaskRevisionRecord {
   task_id: string;
   revision: number;
   manifest_json: string;
-  task_md: string;
-  development_md: string;
-  tests_md: string;
-  acceptance_md: string;
-  verifier_prompt_md: string;
+  manifest_sha256: string;
+  package_digest: string;
+  workflow_id: string;
+  workflow_sha256: string;
+  readiness: 'ready' | 'blocked';
+  idempotency_key: string | null;
   created_at: number;
 }
 
-export interface WorkerPromptRecord {
+export interface TaskPackageFileRecord {
   id: number;
   task_id: string;
   revision: number;
-  worker_id: string;
-  role: string;
-  prompt_text: string;
+  path: string;
+  owner_scope: 'shared' | 'node';
+  owner_node_id: string | null;
+  media_type: string;
+  size_bytes: number;
+  sha256: string;
+}
+
+export interface PackageDraftRecord {
+  draft_id: string;
+  task_id: string;
+  operation: 'create' | 'revise';
+  target_revision: number;
+  expected_revision: number | null;
+  idempotency_key: string;
+  manifest_json: string;
+  manifest_sha256: string;
+  workflow_id: string;
+  workflow_sha256: string;
+  readiness: 'ready' | 'blocked';
+  blockers_json: string;
+  validation_errors_json: string;
+  execution_timeout_ms: number | null;
+  budget_max_rounds: number | null;
+  status: 'staging' | 'invalid' | 'finalized' | 'cancelled';
+  receipt_json: string | null;
+  created_at: number;
+  updated_at: number;
+  expires_at: number;
 }
 
 export interface ExecutionRoundRecord {
@@ -180,9 +215,6 @@ export class WorkbenchDatabase {
     this.initTables();
   }
 
-  /**
-   * Execute operations within a native SQLite transaction
-   */
   transaction<T>(fn: () => T): T {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -197,21 +229,24 @@ export class WorkbenchDatabase {
     }
   }
 
-  /**
-   * Crash Recovery: on startup, detect and recover any tasks stuck in 'running' or 'queued'
-   */
   recoverPendingTasks(): { recoveredCount: number; taskIds: string[] } {
     for (const row of this.db.prepare('SELECT snapshot_json FROM execution_runs').all() as any[]) {
-      const run=JSON.parse(row.snapshot_json) as RunSnapshot;
-      if(['starting','running','stopping'].includes(run.state)) {
-        Object.assign(run,{state:'blocked',activity:'finished',stopReason:'INTERRUPTED',finishedAt:Date.now(),cleanupConfirmed:false});
+      const run = JSON.parse(row.snapshot_json) as RunSnapshot;
+      if (['starting', 'running', 'stopping'].includes(run.state)) {
+        Object.assign(run, {
+          state: 'blocked',
+          activity: 'finished',
+          stopReason: 'INTERRUPTED',
+          finishedAt: Date.now(),
+          cleanupConfirmed: false,
+        });
         this.saveRun(run);
-        const last=this.db.prepare('SELECT MAX(seq) AS seq FROM execution_events WHERE run_id=?').get(run.runId) as any;
-        this.saveRunEvent({runId:run.runId,seq:(last.seq || 0)+1,at:Date.now(),type:'finished',data:{snapshot:run}});
+        const last = this.db.prepare('SELECT MAX(seq) AS seq FROM execution_events WHERE run_id=?').get(run.runId) as any;
+        this.saveRunEvent({ runId: run.runId, seq: (last.seq || 0) + 1, at: Date.now(), type: 'finished', data: { snapshot: run } });
       }
     }
     const unfinalized = this.db.prepare(`
-      SELECT id, status, current_round, current_stage FROM tasks 
+      SELECT id, status, current_round, current_stage FROM tasks
       WHERE status IN ('running', 'queued')
     `).all() as unknown as Array<{ id: string; status: string; current_round: number; current_stage: string | null }>;
 
@@ -224,9 +259,9 @@ export class WorkbenchDatabase {
       const now = Date.now();
       for (const t of unfinalized) {
         taskIds.push(t.id);
-        const reason = `服务意外终止或重启：任务在第 ${t.current_round || 1} 轮 [${t.current_stage || t.status}] 中断。系统已安全挂起现场，请核对工作区 Git 状态后重新确认开始。`;
+        const reason = `服务意外终止或重启：任务在第 ${t.current_round || 1} 轮 [${t.current_stage || t.status}] 中断。系统已安全挂起现场，请核对工作区状态后重新确认开始。`;
         this.db.prepare(`
-          UPDATE tasks 
+          UPDATE tasks
           SET status = ?, blocked_reason = ?, updated_at = ?
           WHERE id = ?
         `).run(TaskStatus.BLOCKED, reason, now, t.id);
@@ -277,23 +312,50 @@ export class WorkbenchDatabase {
         task_id TEXT NOT NULL,
         revision INTEGER NOT NULL,
         manifest_json TEXT NOT NULL,
-        task_md TEXT NOT NULL,
-        development_md TEXT NOT NULL,
-        tests_md TEXT NOT NULL,
-        acceptance_md TEXT NOT NULL,
-        verifier_prompt_md TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        package_digest TEXT NOT NULL,
+        workflow_id TEXT NOT NULL,
+        workflow_sha256 TEXT NOT NULL,
+        readiness TEXT NOT NULL DEFAULT 'ready',
+        idempotency_key TEXT,
         created_at INTEGER NOT NULL,
         UNIQUE(task_id, revision)
       );
 
-      CREATE TABLE IF NOT EXISTS worker_prompts (
+      CREATE TABLE IF NOT EXISTS task_package_files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id TEXT NOT NULL,
         revision INTEGER NOT NULL,
-        worker_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        prompt_text TEXT NOT NULL,
-        UNIQUE(task_id, revision, worker_id)
+        path TEXT NOT NULL,
+        owner_scope TEXT NOT NULL,
+        owner_node_id TEXT,
+        media_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        UNIQUE(task_id, revision, path)
+      );
+
+      CREATE TABLE IF NOT EXISTS package_drafts (
+        draft_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        target_revision INTEGER NOT NULL,
+        expected_revision INTEGER,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        manifest_json TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        workflow_id TEXT NOT NULL,
+        workflow_sha256 TEXT NOT NULL,
+        readiness TEXT NOT NULL,
+        blockers_json TEXT NOT NULL,
+        validation_errors_json TEXT NOT NULL,
+        execution_timeout_ms INTEGER,
+        budget_max_rounds INTEGER,
+        status TEXT NOT NULL,
+        receipt_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS execution_rounds (
@@ -367,6 +429,8 @@ export class WorkbenchDatabase {
       CREATE TABLE IF NOT EXISTS task_workflows (
         task_id TEXT PRIMARY KEY,
         workflow_id TEXT NOT NULL,
+        workflow_sha256 TEXT NOT NULL DEFAULT '',
+        revision INTEGER NOT NULL DEFAULT 1,
         nodes_json TEXT NOT NULL,
         current_node_id TEXT NOT NULL,
         current_run_id TEXT,
@@ -380,13 +444,22 @@ export class WorkbenchDatabase {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         run_id TEXT NOT NULL UNIQUE,
         task_id TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
         node_id TEXT NOT NULL,
         execution_index INTEGER NOT NULL,
+        round_number INTEGER NOT NULL DEFAULT 1,
+        code_generation INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL,
         result_summary TEXT,
+        reported_outcome TEXT,
         completion_token TEXT,
         request_id TEXT,
         execution_run_id TEXT,
+        attempt_dir TEXT,
+        result_json TEXT,
+        result_sha256 TEXT,
+        inputs_json TEXT,
+        outputs_json TEXT,
         created_at INTEGER NOT NULL,
         finished_at INTEGER,
         UNIQUE(task_id, node_id, execution_index)
@@ -394,6 +467,9 @@ export class WorkbenchDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
       CREATE INDEX IF NOT EXISTS idx_task_revisions_task_id ON task_revisions(task_id);
+      CREATE INDEX IF NOT EXISTS idx_task_revisions_idem ON task_revisions(idempotency_key);
+      CREATE INDEX IF NOT EXISTS idx_task_package_files_rev ON task_package_files(task_id, revision);
+      CREATE INDEX IF NOT EXISTS idx_package_drafts_task ON package_drafts(task_id);
       CREATE INDEX IF NOT EXISTS idx_execution_rounds_task_id ON execution_rounds(task_id);
       CREATE INDEX IF NOT EXISTS idx_task_workflows_task ON task_workflows(task_id);
       CREATE INDEX IF NOT EXISTS idx_wf_node_runs_task ON workflow_node_runs(task_id);
@@ -401,7 +477,6 @@ export class WorkbenchDatabase {
       CREATE INDEX IF NOT EXISTS idx_wf_node_runs_req ON workflow_node_runs(request_id);
     `);
 
-    // Ensure default workflow template exists
     try {
       const defRow = this.db.prepare('SELECT id FROM workflow_definitions WHERE id = ?').get('default');
       if (!defRow) {
@@ -420,56 +495,70 @@ export class WorkbenchDatabase {
       }
     } catch {}
 
-    this.db.exec(`CREATE TABLE IF NOT EXISTS execution_runs (run_id TEXT PRIMARY KEY, task_id TEXT, snapshot_json TEXT NOT NULL, output_bytes INTEGER NOT NULL DEFAULT 0);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS execution_runs (run_id TEXT PRIMARY KEY, task_id TEXT, snapshot_json TEXT NOT NULL, output_bytes INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS execution_events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, at INTEGER NOT NULL, type TEXT NOT NULL, data_json TEXT NOT NULL, PRIMARY KEY(run_id,seq));
-      CREATE INDEX IF NOT EXISTS idx_runs_task ON execution_runs(task_id);`);
+      CREATE INDEX IF NOT EXISTS idx_runs_task ON execution_runs(task_id);
+    `);
   }
 
-  taskOutputBytes(taskId:string):number {
-    return (this.db.prepare("SELECT COALESCE(SUM(output_bytes),0) AS bytes FROM execution_runs WHERE task_id=?").get(taskId) as any).bytes;
+  taskOutputBytes(taskId: string): number {
+    return (this.db.prepare('SELECT COALESCE(SUM(output_bytes),0) AS bytes FROM execution_runs WHERE task_id=?').get(taskId) as any).bytes;
   }
-  pruneProbeRuns():void {
-    let total=(this.db.prepare('SELECT COALESCE(SUM(output_bytes),0) AS bytes FROM execution_runs WHERE task_id IS NULL').get() as any).bytes;
-    for(const row of this.db.prepare('SELECT run_id,snapshot_json,output_bytes FROM execution_runs WHERE task_id IS NULL ORDER BY rowid').all() as any[]) {
-      const run=JSON.parse(row.snapshot_json);
-      if(run.finishedAt===null || (Date.now()-run.finishedAt<7*86400000 && total<=100*1024*1024))continue;
-      const size=row.output_bytes;
+
+  pruneProbeRuns(): void {
+    let total = (this.db.prepare('SELECT COALESCE(SUM(output_bytes),0) AS bytes FROM execution_runs WHERE task_id IS NULL').get() as any).bytes;
+    for (const row of this.db.prepare('SELECT run_id,snapshot_json,output_bytes FROM execution_runs WHERE task_id IS NULL ORDER BY rowid').all() as any[]) {
+      const run = JSON.parse(row.snapshot_json);
+      if (run.finishedAt === null || (Date.now() - run.finishedAt < 7 * 86400000 && total <= 100 * 1024 * 1024)) continue;
+      const size = row.output_bytes;
       this.db.prepare('DELETE FROM execution_events WHERE run_id=?').run(row.run_id);
-      this.db.prepare('DELETE FROM execution_runs WHERE run_id=?').run(row.run_id);total-=size;
+      this.db.prepare('DELETE FROM execution_runs WHERE run_id=?').run(row.run_id);
+      total -= size;
     }
   }
-  updateRoundTermination(roundId:number,runId:string,reason:string|null,confirmed:boolean):void {
-    this.db.prepare('UPDATE execution_rounds SET run_id=?,termination_reason=?,cleanup_confirmed=? WHERE id=?').run(runId,reason,confirmed?1:0,roundId);
+
+  updateRoundTermination(roundId: number, runId: string, reason: string | null, confirmed: boolean): void {
+    this.db.prepare('UPDATE execution_rounds SET run_id=?,termination_reason=?,cleanup_confirmed=? WHERE id=?').run(runId, reason, confirmed ? 1 : 0, roundId);
   }
-  recordRunCleanup(runId:string):void {
-    const run=this.getRun(runId);if(!run)return;
-    run.cleanupConfirmed=true;this.saveRun(run);
-    if(run.roundId!==null)this.updateRoundTermination(run.roundId,runId,run.stopReason,true);
-    const last=this.db.prepare('SELECT MAX(seq) AS seq FROM execution_events WHERE run_id=?').get(runId) as any;
-    this.saveRunEvent({runId,seq:(last.seq || 0)+1,at:Date.now(),type:'finished',data:{snapshot:run}});
+
+  recordRunCleanup(runId: string): void {
+    const run = this.getRun(runId);
+    if (!run) return;
+    run.cleanupConfirmed = true;
+    this.saveRun(run);
+    if (run.roundId !== null) this.updateRoundTermination(run.roundId, runId, run.stopReason, true);
+    const last = this.db.prepare('SELECT MAX(seq) AS seq FROM execution_events WHERE run_id=?').get(runId) as any;
+    this.saveRunEvent({ runId, seq: (last.seq || 0) + 1, at: Date.now(), type: 'finished', data: { snapshot: run } });
   }
+
   saveRun(run: RunSnapshot): void {
-    this.db.prepare('INSERT INTO execution_runs(run_id,task_id,snapshot_json) VALUES (?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET snapshot_json=excluded.snapshot_json').run(run.runId,run.taskId,JSON.stringify(run));
+    this.db.prepare('INSERT INTO execution_runs(run_id,task_id,snapshot_json) VALUES (?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET snapshot_json=excluded.snapshot_json').run(run.runId, run.taskId, JSON.stringify(run));
   }
+
   getRun(id: string): RunSnapshot | null {
-    const row=this.db.prepare('SELECT snapshot_json FROM execution_runs WHERE run_id=?').get(id) as any;
+    const row = this.db.prepare('SELECT snapshot_json FROM execution_runs WHERE run_id=?').get(id) as any;
     return row ? JSON.parse(row.snapshot_json) : null;
   }
+
   latestRun(taskId: string): RunSnapshot | null {
-    const row=this.db.prepare('SELECT snapshot_json FROM execution_runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1').get(taskId) as any;
+    const row = this.db.prepare('SELECT snapshot_json FROM execution_runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1').get(taskId) as any;
     return row ? JSON.parse(row.snapshot_json) : null;
   }
-  saveRunEvent(event: ExecutionEvent, snapshot?:RunSnapshot): void {
-    this.transaction(()=>{
-      this.db.prepare('INSERT INTO execution_events VALUES (?,?,?,?,?)').run(event.runId,event.seq,event.at,event.type,JSON.stringify(event.data));
-      if(event.type==='output') this.db.prepare('UPDATE execution_runs SET output_bytes=output_bytes+? WHERE run_id=?').run(Buffer.byteLength(event.data.text,'utf8'),event.runId);
-      if(snapshot)this.saveRun(snapshot);
+
+  saveRunEvent(event: ExecutionEvent, snapshot?: RunSnapshot): void {
+    this.transaction(() => {
+      this.db.prepare('INSERT INTO execution_events VALUES (?,?,?,?,?)').run(event.runId, event.seq, event.at, event.type, JSON.stringify(event.data));
+      if (event.type === 'output') this.db.prepare('UPDATE execution_runs SET output_bytes=output_bytes+? WHERE run_id=?').run(Buffer.byteLength(event.data.text, 'utf8'), event.runId);
+      if (snapshot) this.saveRun(snapshot);
     });
   }
+
   runEvents(id: string, after: number, limit: number): ExecutionEvent[] {
-    return (this.db.prepare('SELECT * FROM execution_events WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?').all(id,after,limit) as any[])
-      .map(row=>({runId:row.run_id,seq:row.seq,at:row.at,type:row.type,data:JSON.parse(row.data_json)}));
+    return (this.db.prepare('SELECT * FROM execution_events WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?').all(id, after, limit) as any[])
+      .map((row) => ({ runId: row.run_id, seq: row.seq, at: row.at, type: row.type, data: JSON.parse(row.data_json) }));
   }
+
   // --- Task Methods ---
 
   createTask(data: {
@@ -488,6 +577,7 @@ export class WorkbenchDatabase {
     worker_model?: string;
     reviewer_executor?: string;
     reviewer_model?: string;
+    workflow_id?: string;
   }): TaskRecord {
     const now = Date.now();
     const revision = data.revision ?? 1;
@@ -530,14 +620,14 @@ export class WorkbenchDatabase {
     );
 
     if (!this.getTaskWorkflow(data.id)) {
-      this.initTaskWorkflow(data.id);
+      this.initTaskWorkflow(data.id, { workflowId: data.workflow_id, revision });
     }
     return this.getTask(data.id)!;
   }
 
   getTask(id: string): TaskRecord | null {
     const stmt = this.db.prepare(`
-      SELECT t.*, tw.workflow_id, tw.current_node_id 
+      SELECT t.*, tw.workflow_id, tw.workflow_sha256, tw.current_node_id
       FROM tasks t
       LEFT JOIN task_workflows tw ON t.id = tw.task_id
       WHERE t.id = ?
@@ -549,16 +639,16 @@ export class WorkbenchDatabase {
   listTasks(statusFilter?: TaskStatus): TaskRecord[] {
     if (statusFilter) {
       const stmt = this.db.prepare(`
-        SELECT t.*, tw.workflow_id, tw.current_node_id 
+        SELECT t.*, tw.workflow_id, tw.workflow_sha256, tw.current_node_id
         FROM tasks t
         LEFT JOIN task_workflows tw ON t.id = tw.task_id
-        WHERE t.status = ? 
+        WHERE t.status = ?
         ORDER BY t.created_at DESC
       `);
       return stmt.all(statusFilter) as unknown as TaskRecord[];
     }
     const stmt = this.db.prepare(`
-      SELECT t.*, tw.workflow_id, tw.current_node_id 
+      SELECT t.*, tw.workflow_id, tw.workflow_sha256, tw.current_node_id
       FROM tasks t
       LEFT JOIN task_workflows tw ON t.id = tw.task_id
       ORDER BY t.created_at DESC
@@ -570,14 +660,18 @@ export class WorkbenchDatabase {
     id: string,
     status: TaskStatus,
     extra?: {
+      title?: string;
+      target_cwd?: string;
+      revision?: number;
       blocked_reason?: string | null;
       active_worker_id?: string | null;
       current_stage?: RoundStage | null;
       current_round?: number;
       confirmed_cwd?: string;
       started_at?: number;
-      completed_at?: number;
+      completed_at?: number | null;
       execution_timeout_ms?: number;
+      budget_max_rounds?: number;
       stop_requested?: number;
       worker_executor?: string;
       worker_model?: string;
@@ -589,128 +683,207 @@ export class WorkbenchDatabase {
     const updates: string[] = ['status = ?', 'updated_at = ?'];
     const params: unknown[] = [status, now];
 
-    if (extra?.blocked_reason !== undefined) {
-      updates.push('blocked_reason = ?');
-      params.push(extra.blocked_reason);
-    }
-    if (extra?.active_worker_id !== undefined) {
-      updates.push('active_worker_id = ?');
-      params.push(extra.active_worker_id);
-    }
-    if (extra?.current_stage !== undefined) {
-      updates.push('current_stage = ?');
-      params.push(extra.current_stage);
-    }
-    if (extra?.current_round !== undefined) {
-      updates.push('current_round = ?');
-      params.push(extra.current_round);
-    }
-    if (extra?.confirmed_cwd !== undefined) {
-      updates.push('confirmed_cwd = ?');
-      params.push(extra.confirmed_cwd);
-    }
-    if (extra?.started_at !== undefined) {
-      updates.push('started_at = ?');
-      params.push(extra.started_at);
-    }
-    if (extra?.completed_at !== undefined) {
-      updates.push('completed_at = ?');
-      params.push(extra.completed_at);
-    }
-    if (extra?.worker_executor !== undefined) {
-      updates.push('worker_executor = ?');
-      params.push(extra.worker_executor);
-    }
-    if (extra?.worker_model !== undefined) {
-      updates.push('worker_model = ?');
-      params.push(extra.worker_model);
-    }
-    if (extra?.reviewer_executor !== undefined) {
-      updates.push('reviewer_executor = ?');
-      params.push(extra.reviewer_executor);
-    }
-    if (extra?.reviewer_model !== undefined) {
-      updates.push('reviewer_model = ?');
-      params.push(extra.reviewer_model);
-    }
-
+    if (extra?.title !== undefined) { updates.push('title = ?'); params.push(extra.title); }
+    if (extra?.target_cwd !== undefined) { updates.push('target_cwd = ?'); params.push(extra.target_cwd); }
+    if (extra?.revision !== undefined) { updates.push('revision = ?'); params.push(extra.revision); }
+    if (extra?.blocked_reason !== undefined) { updates.push('blocked_reason = ?'); params.push(extra.blocked_reason); }
+    if (extra?.active_worker_id !== undefined) { updates.push('active_worker_id = ?'); params.push(extra.active_worker_id); }
+    if (extra?.current_stage !== undefined) { updates.push('current_stage = ?'); params.push(extra.current_stage); }
+    if (extra?.current_round !== undefined) { updates.push('current_round = ?'); params.push(extra.current_round); }
+    if (extra?.confirmed_cwd !== undefined) { updates.push('confirmed_cwd = ?'); params.push(extra.confirmed_cwd); }
+    if (extra?.started_at !== undefined) { updates.push('started_at = ?'); params.push(extra.started_at); }
+    if (extra?.completed_at !== undefined) { updates.push('completed_at = ?'); params.push(extra.completed_at); }
+    if (extra?.worker_executor !== undefined) { updates.push('worker_executor = ?'); params.push(extra.worker_executor); }
+    if (extra?.worker_model !== undefined) { updates.push('worker_model = ?'); params.push(extra.worker_model); }
+    if (extra?.reviewer_executor !== undefined) { updates.push('reviewer_executor = ?'); params.push(extra.reviewer_executor); }
+    if (extra?.reviewer_model !== undefined) { updates.push('reviewer_model = ?'); params.push(extra.reviewer_model); }
     if (extra?.execution_timeout_ms !== undefined) { updates.push('execution_timeout_ms = ?'); params.push(extra.execution_timeout_ms); }
+    if (extra?.budget_max_rounds !== undefined) { updates.push('budget_max_rounds = ?'); params.push(extra.budget_max_rounds); }
     if (extra?.stop_requested !== undefined) { updates.push('stop_requested = ?'); params.push(extra.stop_requested); }
+
     params.push(id);
-    const sql = `UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`;
-    this.db.prepare(sql).run(...params);
+    this.db.prepare(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`).run(...params);
   }
 
   requestTaskStop(id: string): void {
-    this.db.prepare(`UPDATE tasks SET stop_requested = 1, updated_at = ? WHERE id = ?`).run(Date.now(), id);
+    this.db.prepare('UPDATE tasks SET stop_requested = 1, updated_at = ? WHERE id = ?').run(Date.now(), id);
   }
 
-  // --- Task Revisions & Prompts ---
+  // --- Task Revisions & Package Files ---
 
   saveRevision(data: {
     task_id: string;
     revision: number;
     manifest_json: string;
-    task_md: string;
-    development_md: string;
-    tests_md: string;
-    acceptance_md: string;
-    verifier_prompt_md: string;
+    manifest_sha256: string;
+    package_digest: string;
+    workflow_id: string;
+    workflow_sha256: string;
+    readiness?: 'ready' | 'blocked';
+    idempotency_key?: string | null;
+    files?: Array<{
+      path: string;
+      owner_scope: 'shared' | 'node';
+      owner_node_id: string | null;
+      media_type: string;
+      size_bytes: number;
+      sha256: string;
+    }>;
   }): void {
-    const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO task_revisions (
-        task_id, revision, manifest_json, task_md,
-        development_md, tests_md, acceptance_md, verifier_prompt_md, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO task_revisions (
+        task_id, revision, manifest_json, manifest_sha256, package_digest,
+        workflow_id, workflow_sha256, readiness, idempotency_key, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
       data.task_id,
       data.revision,
       data.manifest_json,
-      data.task_md,
-      data.development_md,
-      data.tests_md,
-      data.acceptance_md,
-      data.verifier_prompt_md,
-      Date.now()
+      data.manifest_sha256,
+      data.package_digest,
+      data.workflow_id,
+      data.workflow_sha256,
+      data.readiness || 'ready',
+      data.idempotency_key || null,
+      now
     );
 
-    // Update revision in tasks table
-    this.db.prepare(`UPDATE tasks SET revision = ?, updated_at = ? WHERE id = ?`).run(
+    if (data.files && data.files.length > 0) {
+      const fileStmt = this.db.prepare(`
+        INSERT INTO task_package_files (
+          task_id, revision, path, owner_scope, owner_node_id, media_type, size_bytes, sha256
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const f of data.files) {
+        fileStmt.run(
+          data.task_id,
+          data.revision,
+          f.path,
+          f.owner_scope,
+          f.owner_node_id || null,
+          f.media_type,
+          f.size_bytes,
+          f.sha256
+        );
+      }
+    }
+
+    this.db.prepare('UPDATE tasks SET revision = ?, updated_at = ? WHERE id = ?').run(
       data.revision,
-      Date.now(),
+      now,
       data.task_id
     );
   }
 
-  getLatestRevision(taskId: string): TaskRevisionRecord | null {
-    const stmt = this.db.prepare(`
-      SELECT * FROM task_revisions WHERE task_id = ? ORDER BY revision DESC LIMIT 1
-    `);
-    const row = stmt.get(taskId) as unknown as TaskRevisionRecord | undefined;
+  getRevision(taskId: string, revision: number): TaskRevisionRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM task_revisions WHERE task_id = ? AND revision = ?')
+      .get(taskId, revision) as unknown as TaskRevisionRecord | undefined;
     return row ?? null;
   }
 
-  saveWorkerPrompt(data: {
-    task_id: string;
-    revision: number;
-    worker_id: string;
-    role: string;
-    prompt_text: string;
-  }): void {
-    const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO worker_prompts (
-        task_id, revision, worker_id, role, prompt_text
-      ) VALUES (?, ?, ?, ?, ?)
-    `);
-    stmt.run(data.task_id, data.revision, data.worker_id, data.role, data.prompt_text);
+  getLatestRevision(taskId: string): TaskRevisionRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM task_revisions WHERE task_id = ? ORDER BY revision DESC LIMIT 1')
+      .get(taskId) as unknown as TaskRevisionRecord | undefined;
+    return row ?? null;
   }
 
-  getWorkerPrompts(taskId: string, revision: number): WorkerPromptRecord[] {
-    const stmt = this.db.prepare(`
-      SELECT * FROM worker_prompts WHERE task_id = ? AND revision = ?
-    `);
-    return stmt.all(taskId, revision) as unknown as WorkerPromptRecord[];
+  listRevisions(taskId: string): TaskRevisionRecord[] {
+    return this.db
+      .prepare('SELECT * FROM task_revisions WHERE task_id = ? ORDER BY revision DESC')
+      .all(taskId) as unknown as TaskRevisionRecord[];
+  }
+
+  getPackageFiles(taskId: string, revision: number): TaskPackageFileRecord[] {
+    return this.db
+      .prepare('SELECT * FROM task_package_files WHERE task_id = ? AND revision = ? ORDER BY path ASC')
+      .all(taskId, revision) as unknown as TaskPackageFileRecord[];
+  }
+
+  // --- Package Drafts ---
+
+  saveDraft(draft: Omit<PackageDraftRecord, 'created_at' | 'updated_at'>): PackageDraftRecord {
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO package_drafts (
+        draft_id, task_id, operation, target_revision, expected_revision,
+        idempotency_key, manifest_json, manifest_sha256, workflow_id, workflow_sha256,
+        readiness, blockers_json, validation_errors_json, execution_timeout_ms, budget_max_rounds,
+        status, receipt_json, created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      draft.draft_id,
+      draft.task_id,
+      draft.operation,
+      draft.target_revision,
+      draft.expected_revision ?? null,
+      draft.idempotency_key,
+      draft.manifest_json,
+      draft.manifest_sha256,
+      draft.workflow_id,
+      draft.workflow_sha256,
+      draft.readiness,
+      draft.blockers_json,
+      draft.validation_errors_json,
+      draft.execution_timeout_ms ?? null,
+      draft.budget_max_rounds ?? null,
+      draft.status,
+      draft.receipt_json ?? null,
+      now,
+      now,
+      draft.expires_at
+    );
+    return this.getDraft(draft.draft_id)!;
+  }
+
+  getDraft(draftId: string): PackageDraftRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM package_drafts WHERE draft_id = ?')
+      .get(draftId) as unknown as PackageDraftRecord | undefined;
+    return row ?? null;
+  }
+
+  getDraftByIdempotencyKey(key: string): PackageDraftRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM package_drafts WHERE idempotency_key = ?')
+      .get(key) as unknown as PackageDraftRecord | undefined;
+    return row ?? null;
+  }
+
+  updateDraft(
+    draftId: string,
+    updates: Partial<{
+      status: PackageDraftRecord['status'];
+      receipt_json: string | null;
+      validation_errors_json: string;
+    }>
+  ): void {
+    const sets: string[] = ['updated_at = ?'];
+    const params: unknown[] = [Date.now()];
+    if (updates.status !== undefined) { sets.push('status = ?'); params.push(updates.status); }
+    if (updates.receipt_json !== undefined) { sets.push('receipt_json = ?'); params.push(updates.receipt_json); }
+    if (updates.validation_errors_json !== undefined) { sets.push('validation_errors_json = ?'); params.push(updates.validation_errors_json); }
+    params.push(draftId);
+    this.db.prepare(`UPDATE package_drafts SET ${sets.join(', ')} WHERE draft_id = ?`).run(...params);
+  }
+
+  listExpiredDrafts(now: number = Date.now()): PackageDraftRecord[] {
+    return this.db
+      .prepare(`SELECT * FROM package_drafts WHERE status IN ('staging', 'invalid') AND expires_at < ?`)
+      .all(now) as unknown as PackageDraftRecord[];
+  }
+
+  deleteDraft(draftId: string): void {
+    this.db.prepare('DELETE FROM package_drafts WHERE draft_id = ?').run(draftId);
+  }
+
+  hasActiveDraftForTask(taskId: string): boolean {
+    const row = this.db
+      .prepare(`SELECT 1 FROM package_drafts WHERE task_id = ? AND status = 'staging' LIMIT 1`)
+      .get(taskId);
+    return Boolean(row);
   }
 
   // --- Execution Rounds & History ---
@@ -770,15 +943,13 @@ export class WorkbenchDatabase {
     }
 
     params.push(roundId);
-    const sql = `UPDATE execution_rounds SET ${updates.join(', ')} WHERE id = ?`;
-    this.db.prepare(sql).run(...params);
+    this.db.prepare(`UPDATE execution_rounds SET ${updates.join(', ')} WHERE id = ?`).run(...params);
   }
 
   getRounds(taskId: string): ExecutionRoundRecord[] {
-    const stmt = this.db.prepare(`
-      SELECT * FROM execution_rounds WHERE task_id = ? ORDER BY round_number ASC, id ASC
-    `);
-    return stmt.all(taskId) as unknown as ExecutionRoundRecord[];
+    return this.db
+      .prepare('SELECT * FROM execution_rounds WHERE task_id = ? ORDER BY round_number ASC, id ASC')
+      .all(taskId) as unknown as ExecutionRoundRecord[];
   }
 
   // --- Test & Acceptance Runs ---
@@ -795,13 +966,12 @@ export class WorkbenchDatabase {
     report_content?: string | null;
     passed: boolean;
   }): void {
-    const stmt = this.db.prepare(`
+    this.db.prepare(`
       INSERT INTO test_runs (
         task_id, round_number, test_case_id, command, exit_code,
         stdout, stderr, report_path, report_content, passed, executed_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
+    `).run(
       data.task_id,
       data.round_number,
       data.test_case_id,
@@ -818,15 +988,13 @@ export class WorkbenchDatabase {
 
   getTestRuns(taskId: string, roundNumber?: number): TestRunRecord[] {
     if (roundNumber !== undefined) {
-      const stmt = this.db.prepare(`
-        SELECT * FROM test_runs WHERE task_id = ? AND round_number = ? ORDER BY executed_at ASC
-      `);
-      return stmt.all(taskId, roundNumber) as unknown as TestRunRecord[];
+      return this.db
+        .prepare('SELECT * FROM test_runs WHERE task_id = ? AND round_number = ? ORDER BY executed_at ASC')
+        .all(taskId, roundNumber) as unknown as TestRunRecord[];
     }
-    const stmt = this.db.prepare(`
-      SELECT * FROM test_runs WHERE task_id = ? ORDER BY executed_at ASC
-    `);
-    return stmt.all(taskId) as unknown as TestRunRecord[];
+    return this.db
+      .prepare('SELECT * FROM test_runs WHERE task_id = ? ORDER BY executed_at ASC')
+      .all(taskId) as unknown as TestRunRecord[];
   }
 
   saveAcceptanceRun(data: {
@@ -840,14 +1008,13 @@ export class WorkbenchDatabase {
     code_snapshot_json?: string | null;
     raw_output: string;
   }): void {
-    const stmt = this.db.prepare(`
+    this.db.prepare(`
       INSERT INTO acceptance_runs (
         task_id, round_number, decision, summary,
         criteria_results_json, issues_json, manual_checks_json, code_snapshot_json,
         raw_output, executed_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
+    `).run(
       data.task_id,
       data.round_number,
       data.decision,
@@ -862,10 +1029,9 @@ export class WorkbenchDatabase {
   }
 
   getAcceptanceRuns(taskId: string): AcceptanceRunRecord[] {
-    const stmt = this.db.prepare(`
-      SELECT * FROM acceptance_runs WHERE task_id = ? ORDER BY executed_at ASC
-    `);
-    return stmt.all(taskId) as unknown as AcceptanceRunRecord[];
+    return this.db
+      .prepare('SELECT * FROM acceptance_runs WHERE task_id = ? ORDER BY executed_at ASC')
+      .all(taskId) as unknown as AcceptanceRunRecord[];
   }
 
   saveHumanDecision(data: {
@@ -873,18 +1039,16 @@ export class WorkbenchDatabase {
     action: 'approve' | 'reject';
     reason: string;
   }): void {
-    const stmt = this.db.prepare(`
+    this.db.prepare(`
       INSERT INTO human_decisions (task_id, action, reason, decided_at)
       VALUES (?, ?, ?, ?)
-    `);
-    stmt.run(data.task_id, data.action, data.reason, Date.now());
+    `).run(data.task_id, data.action, data.reason, Date.now());
   }
 
   getHumanDecisions(taskId: string): HumanDecisionRecord[] {
-    const stmt = this.db.prepare(`
-      SELECT * FROM human_decisions WHERE task_id = ? ORDER BY decided_at ASC
-    `);
-    return stmt.all(taskId) as unknown as HumanDecisionRecord[];
+    return this.db
+      .prepare('SELECT * FROM human_decisions WHERE task_id = ? ORDER BY decided_at ASC')
+      .all(taskId) as unknown as HumanDecisionRecord[];
   }
 
   // --- Workflow Definitions ---
@@ -895,28 +1059,27 @@ export class WorkbenchDatabase {
   }
 
   getWorkflowReferencingTasks(workflowId: string): { id: string; title: string; status: string }[] {
-    const stmt = this.db.prepare(`
+    return this.db.prepare(`
       SELECT t.id, t.title, t.status
       FROM task_workflows tw
       INNER JOIN tasks t ON tw.task_id = t.id
       WHERE tw.workflow_id = ?
       ORDER BY t.created_at DESC
-    `);
-    return stmt.all(workflowId) as { id: string; title: string; status: string }[];
+    `).all(workflowId) as { id: string; title: string; status: string }[];
   }
 
   getWorkflow(id: string): WorkflowDefinitionRecord | null {
-    const stmt = this.db.prepare('SELECT * FROM workflow_definitions WHERE id = ?');
-    const row = stmt.get(id) as unknown as WorkflowDefinitionRecord | undefined;
+    const row = this.db
+      .prepare('SELECT * FROM workflow_definitions WHERE id = ?')
+      .get(id) as unknown as WorkflowDefinitionRecord | undefined;
     return row ?? null;
   }
 
   listWorkflows(): WorkflowDefinitionRecord[] {
-    const stmt = this.db.prepare(`
+    return this.db.prepare(`
       SELECT * FROM workflow_definitions
       ORDER BY is_default DESC, id ASC
-    `);
-    return stmt.all() as unknown as WorkflowDefinitionRecord[];
+    `).all() as unknown as WorkflowDefinitionRecord[];
   }
 
   saveWorkflowDefinition(data: {
@@ -986,8 +1149,9 @@ export class WorkbenchDatabase {
   // --- Task Workflows ---
 
   getTaskWorkflow(taskId: string): TaskWorkflowRecord | null {
-    const stmt = this.db.prepare('SELECT * FROM task_workflows WHERE task_id = ?');
-    const row = stmt.get(taskId) as unknown as TaskWorkflowRecord | undefined;
+    const row = this.db
+      .prepare('SELECT * FROM task_workflows WHERE task_id = ?')
+      .get(taskId) as unknown as TaskWorkflowRecord | undefined;
     return row ?? null;
   }
 
@@ -995,29 +1159,41 @@ export class WorkbenchDatabase {
     taskId: string,
     options?: {
       workflowId?: string;
-      nodePrompts?: Record<string, string>;
+      workflowSha256?: string;
+      revision?: number;
       nodesOverride?: WorkflowNode[];
     }
   ): TaskWorkflowRecord {
     const wfId = options?.workflowId || DEFAULT_WORKFLOW_ID;
     let nodes: WorkflowNode[];
+    let wfSha = options?.workflowSha256 || '';
 
     if (options?.nodesOverride) {
       nodes = JSON.parse(JSON.stringify(options.nodesOverride));
+      if (!wfSha) {
+        wfSha = computeWorkflowDefinitionSha256({ id: wfId, name: wfId, description: null, nodes });
+      }
     } else {
       const def = this.getWorkflow(wfId);
       if (def) {
         nodes = JSON.parse(def.nodes_json);
+        if (!wfSha) {
+          wfSha = computeWorkflowDefinitionSha256({
+            id: def.id,
+            name: def.name,
+            description: def.description,
+            nodes,
+          });
+        }
       } else {
         nodes = JSON.parse(JSON.stringify(DEFAULT_WORKFLOW_NODES));
-      }
-    }
-
-    // Apply node prompts override if provided
-    if (options?.nodePrompts) {
-      for (const node of nodes) {
-        if (node.type === 'task' && node.execution_mode === 'agent' && options.nodePrompts[node.id]) {
-          node.prompt = options.nodePrompts[node.id];
+        if (!wfSha) {
+          wfSha = computeWorkflowDefinitionSha256({
+            id: DEFAULT_WORKFLOW_ID,
+            name: '默认开发交付流程',
+            description: null,
+            nodes,
+          });
         }
       }
     }
@@ -1025,16 +1201,16 @@ export class WorkbenchDatabase {
     const startNode = nodes.find((n) => n.type === 'start') || nodes[0];
     const initialNodeId = startNode ? startNode.id : 'start';
     const now = Date.now();
+    const revision = options?.revision ?? 1;
 
-    const stmt = this.db.prepare(`
+    this.db.prepare(`
       INSERT OR REPLACE INTO task_workflows (
-        task_id, workflow_id, nodes_json,
+        task_id, workflow_id, workflow_sha256, revision, nodes_json,
         current_node_id, current_run_id, code_generation,
         tests_passed_generation, acceptance_passed_generation, updated_at
-      ) VALUES (?, ?, ?, ?, NULL, 0, 0, 0, ?)
-    `);
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, 0, 0, ?)
+    `).run(taskId, wfId, wfSha, revision, JSON.stringify(nodes), initialNodeId, now);
 
-    stmt.run(taskId, wfId, JSON.stringify(nodes), initialNodeId, now);
     return this.getTaskWorkflow(taskId)!;
   }
 
@@ -1047,35 +1223,21 @@ export class WorkbenchDatabase {
       tests_passed_generation: number;
       acceptance_passed_generation: number;
       nodes_json: string;
+      revision: number;
+      workflow_sha256: string;
     }>
   ): void {
     const sets: string[] = ['updated_at = ?'];
     const params: unknown[] = [Date.now()];
 
-    if (updates.current_node_id !== undefined) {
-      sets.push('current_node_id = ?');
-      params.push(updates.current_node_id);
-    }
-    if (updates.current_run_id !== undefined) {
-      sets.push('current_run_id = ?');
-      params.push(updates.current_run_id);
-    }
-    if (updates.code_generation !== undefined) {
-      sets.push('code_generation = ?');
-      params.push(updates.code_generation);
-    }
-    if (updates.tests_passed_generation !== undefined) {
-      sets.push('tests_passed_generation = ?');
-      params.push(updates.tests_passed_generation);
-    }
-    if (updates.acceptance_passed_generation !== undefined) {
-      sets.push('acceptance_passed_generation = ?');
-      params.push(updates.acceptance_passed_generation);
-    }
-    if (updates.nodes_json !== undefined) {
-      sets.push('nodes_json = ?');
-      params.push(updates.nodes_json);
-    }
+    if (updates.current_node_id !== undefined) { sets.push('current_node_id = ?'); params.push(updates.current_node_id); }
+    if (updates.current_run_id !== undefined) { sets.push('current_run_id = ?'); params.push(updates.current_run_id); }
+    if (updates.code_generation !== undefined) { sets.push('code_generation = ?'); params.push(updates.code_generation); }
+    if (updates.tests_passed_generation !== undefined) { sets.push('tests_passed_generation = ?'); params.push(updates.tests_passed_generation); }
+    if (updates.acceptance_passed_generation !== undefined) { sets.push('acceptance_passed_generation = ?'); params.push(updates.acceptance_passed_generation); }
+    if (updates.nodes_json !== undefined) { sets.push('nodes_json = ?'); params.push(updates.nodes_json); }
+    if (updates.revision !== undefined) { sets.push('revision = ?'); params.push(updates.revision); }
+    if (updates.workflow_sha256 !== undefined) { sets.push('workflow_sha256 = ?'); params.push(updates.workflow_sha256); }
 
     params.push(taskId);
     this.db.prepare(`UPDATE task_workflows SET ${sets.join(', ')} WHERE task_id = ?`).run(...params);
@@ -1086,32 +1248,40 @@ export class WorkbenchDatabase {
   createNodeRun(data: {
     run_id: string;
     task_id: string;
+    revision?: number;
     node_id: string;
     execution_index: number;
-    status?: 'running' | 'passed' | 'failed' | 'blocked' | 'waiting_manual' | 'cancelled';
+    round_number?: number;
+    code_generation?: number;
+    status?: WorkflowNodeRunRecord['status'];
     completion_token?: string | null;
     execution_run_id?: string | null;
+    attempt_dir?: string | null;
+    inputs_json?: string | null;
     result_summary?: string | null;
   }): WorkflowNodeRunRecord {
     const now = Date.now();
     const status = data.status || 'running';
-    const stmt = this.db.prepare(`
+    this.db.prepare(`
       INSERT INTO workflow_node_runs (
-        run_id, task_id, node_id, execution_index, status,
+        run_id, task_id, revision, node_id, execution_index, round_number, code_generation, status,
         result_summary, completion_token, request_id,
-        execution_run_id, created_at, finished_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)
-    `);
-
-    stmt.run(
+        execution_run_id, attempt_dir, inputs_json, created_at, finished_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)
+    `).run(
       data.run_id,
       data.task_id,
+      data.revision ?? 1,
       data.node_id,
       data.execution_index,
+      data.round_number ?? 1,
+      data.code_generation ?? 0,
       status,
       data.result_summary || null,
       data.completion_token || null,
       data.execution_run_id || null,
+      data.attempt_dir || null,
+      data.inputs_json || null,
       now
     );
 
@@ -1121,90 +1291,97 @@ export class WorkbenchDatabase {
   updateNodeRun(
     runId: string,
     updates: Partial<{
-      status: 'running' | 'passed' | 'failed' | 'blocked' | 'waiting_manual' | 'cancelled';
+      status: WorkflowNodeRunRecord['status'];
       result_summary: string | null;
       completion_token: string | null;
       request_id: string | null;
       execution_run_id: string | null;
+      attempt_dir: string | null;
+      result_json: string | null;
+      result_sha256: string | null;
+      inputs_json: string | null;
+      outputs_json: string | null;
       finished_at: number | null;
     }>
   ): void {
     const sets: string[] = [];
     const params: unknown[] = [];
 
-    if (updates.status !== undefined) {
-      sets.push('status = ?');
-      params.push(updates.status);
-    }
-    if (updates.result_summary !== undefined) {
-      sets.push('result_summary = ?');
-      params.push(updates.result_summary);
-    }
-    if (updates.completion_token !== undefined) {
-      sets.push('completion_token = ?');
-      params.push(updates.completion_token);
-    }
-    if (updates.request_id !== undefined) {
-      sets.push('request_id = ?');
-      params.push(updates.request_id);
-    }
-    if (updates.execution_run_id !== undefined) {
-      sets.push('execution_run_id = ?');
-      params.push(updates.execution_run_id);
-    }
-    if (updates.finished_at !== undefined) {
-      sets.push('finished_at = ?');
-      params.push(updates.finished_at);
-    }
+    if (updates.status !== undefined) { sets.push('status = ?'); params.push(updates.status); }
+    if (updates.result_summary !== undefined) { sets.push('result_summary = ?'); params.push(updates.result_summary); }
+    if (updates.completion_token !== undefined) { sets.push('completion_token = ?'); params.push(updates.completion_token); }
+    if (updates.request_id !== undefined) { sets.push('request_id = ?'); params.push(updates.request_id); }
+    if (updates.execution_run_id !== undefined) { sets.push('execution_run_id = ?'); params.push(updates.execution_run_id); }
+    if (updates.attempt_dir !== undefined) { sets.push('attempt_dir = ?'); params.push(updates.attempt_dir); }
+    if (updates.result_json !== undefined) { sets.push('result_json = ?'); params.push(updates.result_json); }
+    if (updates.result_sha256 !== undefined) { sets.push('result_sha256 = ?'); params.push(updates.result_sha256); }
+    if (updates.inputs_json !== undefined) { sets.push('inputs_json = ?'); params.push(updates.inputs_json); }
+    if (updates.outputs_json !== undefined) { sets.push('outputs_json = ?'); params.push(updates.outputs_json); }
+    if (updates.finished_at !== undefined) { sets.push('finished_at = ?'); params.push(updates.finished_at); }
 
     if (sets.length === 0) return;
     params.push(runId);
     this.db.prepare(`UPDATE workflow_node_runs SET ${sets.join(', ')} WHERE run_id = ?`).run(...params);
   }
 
-  getNodeRuns(taskId: string, nodeId?: string): WorkflowNodeRunRecord[] {
-    if (nodeId) {
-      const stmt = this.db.prepare(
-        'SELECT * FROM workflow_node_runs WHERE task_id = ? AND node_id = ? ORDER BY execution_index ASC, id ASC'
-      );
-      return stmt.all(taskId, nodeId) as unknown as WorkflowNodeRunRecord[];
+  getNodeRuns(taskId: string, nodeId?: string, revision?: number): WorkflowNodeRunRecord[] {
+    if (nodeId && revision !== undefined) {
+      return this.db
+        .prepare('SELECT * FROM workflow_node_runs WHERE task_id = ? AND node_id = ? AND revision = ? ORDER BY execution_index ASC, id ASC')
+        .all(taskId, nodeId, revision) as unknown as WorkflowNodeRunRecord[];
     }
-    const stmt = this.db.prepare(
-      'SELECT * FROM workflow_node_runs WHERE task_id = ? ORDER BY id ASC'
-    );
-    return stmt.all(taskId) as unknown as WorkflowNodeRunRecord[];
+    if (nodeId) {
+      return this.db
+        .prepare('SELECT * FROM workflow_node_runs WHERE task_id = ? AND node_id = ? ORDER BY execution_index ASC, id ASC')
+        .all(taskId, nodeId) as unknown as WorkflowNodeRunRecord[];
+    }
+    return this.db
+      .prepare('SELECT * FROM workflow_node_runs WHERE task_id = ? ORDER BY id ASC')
+      .all(taskId) as unknown as WorkflowNodeRunRecord[];
   }
 
   getLatestNodeRun(taskId: string, nodeId?: string): WorkflowNodeRunRecord | null {
     if (nodeId) {
-      const stmt = this.db.prepare(
-        'SELECT * FROM workflow_node_runs WHERE task_id = ? AND node_id = ? ORDER BY execution_index DESC, id DESC LIMIT 1'
-      );
-      const row = stmt.get(taskId, nodeId) as unknown as WorkflowNodeRunRecord | undefined;
+      const row = this.db
+        .prepare('SELECT * FROM workflow_node_runs WHERE task_id = ? AND node_id = ? ORDER BY execution_index DESC, id DESC LIMIT 1')
+        .get(taskId, nodeId) as unknown as WorkflowNodeRunRecord | undefined;
       return row ?? null;
     }
-    const stmt = this.db.prepare(
-      'SELECT * FROM workflow_node_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1'
-    );
-    const row = stmt.get(taskId) as unknown as WorkflowNodeRunRecord | undefined;
+    const row = this.db
+      .prepare('SELECT * FROM workflow_node_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1')
+      .get(taskId) as unknown as WorkflowNodeRunRecord | undefined;
+    return row ?? null;
+  }
+
+  getLatestCompletedNodeRunForRevision(taskId: string, revision: number, nodeId: string): WorkflowNodeRunRecord | null {
+    const row = this.db
+      .prepare(`
+        SELECT * FROM workflow_node_runs
+        WHERE task_id = ? AND revision = ? AND node_id = ? AND status IN ('passed', 'failed')
+        ORDER BY execution_index DESC, id DESC LIMIT 1
+      `)
+      .get(taskId, revision, nodeId) as unknown as WorkflowNodeRunRecord | undefined;
     return row ?? null;
   }
 
   getNodeRunByRunId(runId: string): WorkflowNodeRunRecord | null {
-    const stmt = this.db.prepare('SELECT * FROM workflow_node_runs WHERE run_id = ?');
-    const row = stmt.get(runId) as unknown as WorkflowNodeRunRecord | undefined;
+    const row = this.db
+      .prepare('SELECT * FROM workflow_node_runs WHERE run_id = ?')
+      .get(runId) as unknown as WorkflowNodeRunRecord | undefined;
     return row ?? null;
   }
 
   getNodeRunByToken(taskId: string, token: string): WorkflowNodeRunRecord | null {
-    const stmt = this.db.prepare('SELECT * FROM workflow_node_runs WHERE task_id = ? AND completion_token = ?');
-    const row = stmt.get(taskId, token) as unknown as WorkflowNodeRunRecord | undefined;
+    const row = this.db
+      .prepare('SELECT * FROM workflow_node_runs WHERE task_id = ? AND completion_token = ?')
+      .get(taskId, token) as unknown as WorkflowNodeRunRecord | undefined;
     return row ?? null;
   }
 
   getNodeRunCount(taskId: string, nodeId: string): number {
-    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM workflow_node_runs WHERE task_id = ? AND node_id = ?');
-    const row = stmt.get(taskId, nodeId) as { count: number } | undefined;
+    const row = this.db
+      .prepare('SELECT COUNT(*) as count FROM workflow_node_runs WHERE task_id = ? AND node_id = ?')
+      .get(taskId, nodeId) as { count: number } | undefined;
     return row?.count ?? 0;
   }
 
@@ -1236,13 +1413,13 @@ export class WorkbenchDatabase {
         return { success: false, message: `未找到执行记录: ${attemptId}` };
       }
       if (run.task_id !== taskId || run.node_id !== nodeId) {
-        return { success: false, message: `执行记录与任务或节点不匹配` };
+        return { success: false, message: '执行记录与任务或节点不匹配' };
       }
       if (run.completion_token !== completionToken) {
-        return { success: false, message: `完成凭据 (completion_token) 不正确` };
+        return { success: false, message: '完成凭据 (completion_token) 不正确' };
       }
       if (run.request_id && run.request_id !== requestId) {
-        return { success: false, message: `本次执行已绑定其他请求标识，不得重复报告` };
+        return { success: false, message: '本次执行已绑定其他请求标识，不得重复报告' };
       }
 
       const task = this.getTask(taskId);
@@ -1252,9 +1429,9 @@ export class WorkbenchDatabase {
 
       this.db.prepare(`
         UPDATE workflow_node_runs
-        SET request_id = ?, result_summary = ?
+        SET request_id = ?, result_summary = ?, reported_outcome = ?
         WHERE run_id = ?
-      `).run(requestId, summary, attemptId);
+      `).run(requestId, summary, outcome, attemptId);
 
       const updated = this.getNodeRunByRunId(attemptId)!;
       return {
@@ -1269,7 +1446,8 @@ export class WorkbenchDatabase {
 
   deleteTask(taskId: string): boolean {
     const task = this.getTask(taskId);
-    if (!task) return false;
+    const hasDraft = Boolean(this.db.prepare('SELECT 1 FROM package_drafts WHERE task_id = ? LIMIT 1').get(taskId));
+    if (!task && !hasDraft) return false;
 
     return this.transaction(() => {
       this.db.prepare('DELETE FROM execution_events WHERE run_id IN (SELECT run_id FROM execution_runs WHERE task_id=?)').run(taskId);
@@ -1278,7 +1456,8 @@ export class WorkbenchDatabase {
       this.db.prepare('DELETE FROM task_workflows WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM workflow_node_runs WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM task_revisions WHERE task_id = ?').run(taskId);
-      this.db.prepare('DELETE FROM worker_prompts WHERE task_id = ?').run(taskId);
+      this.db.prepare('DELETE FROM task_package_files WHERE task_id = ?').run(taskId);
+      this.db.prepare('DELETE FROM package_drafts WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM execution_rounds WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM test_runs WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM acceptance_runs WHERE task_id = ?').run(taskId);
@@ -1295,7 +1474,8 @@ export class WorkbenchDatabase {
       this.db.exec('DELETE FROM task_workflows;');
       this.db.exec('DELETE FROM workflow_node_runs;');
       this.db.exec('DELETE FROM task_revisions;');
-      this.db.exec('DELETE FROM worker_prompts;');
+      this.db.exec('DELETE FROM task_package_files;');
+      this.db.exec('DELETE FROM package_drafts;');
       this.db.exec('DELETE FROM execution_rounds;');
       this.db.exec('DELETE FROM test_runs;');
       this.db.exec('DELETE FROM acceptance_runs;');
