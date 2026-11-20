@@ -34,14 +34,6 @@
           <span class="tab-label">CLI 连接</span>
         </a>
       </nav>
-
-      <div class="sidebar-footer">
-        <div class="sidebar-status-box" id="system-status-pills">
-          <div class="status-pill pill-node" id="pill-node">Node 24 SQLite</div>
-          <div class="status-pill pill-wb" id="pill-wb">CodeBuddy CLI 就绪</div>
-          <div class="status-pill pill-codex" id="pill-codex">Codex 就绪</div>
-        </div>
-      </div>
     </aside>
 
     <!-- Main Container -->
@@ -96,8 +88,8 @@
             <span>任务标识：<code id="detail-task-key">key</code></span>
             <span>材料版本：<code id="detail-task-rev">r1</code></span>
             <span>轮次：<b id="detail-current-round">0</b> / <span id="detail-max-rounds">10</span></span>
-            <span>Worker：<code id="detail-worker-info">codebuddycli</code></span>
-            <span>Reviewer：<code id="detail-reviewer-info">codebuddycli</code></span>
+            <span>工作流：<code id="detail-workflow-info">default</code></span>
+            <span>当前节点：<strong id="detail-current-node" style="color: var(--primary);">--</strong></span>
             <span>提交时间：<span id="detail-created-at">--</span></span>
           </div>
         </div>
@@ -106,65 +98,31 @@
         </div>
       </div>
 
-      <!-- Task Workflow Tracker Card -->
-      <div class="card task-wf-card" id="task-wf-tracker-card" style="display: none;">
-        <!-- Dynamic task workflow timeline injected by JS -->
-      </div>
-
-      <!-- Gate 2: Confirmation Card (Visible when pending_confirm) -->
-      <div class="card confirmation-card" id="gate2-card" style="display: none;">
-        <h3>门禁 2：用户确认并开始执行</h3>
-        <p class="desc">聊天中的同意、模型提交任务或 MCP 调用均不能代替此页面操作。请选择执行者与模型，核对工作目录后点击确认。</p>
-        <p class="desc">执行使用当前用户权限，工作目录不构成安全隔离。开发和验收 CLI 均可能写文件；当前参数沿用厂商的跳过审批策略。</p>
-        
-        <!-- Executor & Model Selection -->
-        <div class="form-row-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; background: #ffffff; padding: 14px; border-radius: 6px; border: 1px solid var(--surface-border);">
-          <div class="form-group">
-            <label for="select-worker-executor" style="font-weight: 600; color: #2563eb; display: block; margin-bottom: 6px; font-size: 13px;">
-              👨‍💻 WORKER (开发执行者)：
-            </label>
-            <div style="display: flex; gap: 8px;">
-              <select id="select-worker-executor" class="form-control" style="flex: 1;" onchange="app.handleWorkerExecutorChange()">
-                <option value="workbuddy">CodeBuddy CLI (本地执行 · 无沙箱)</option>
-              </select>
-              <div style="flex: 1; min-width: 0;">
-                <select id="select-worker-model" class="form-control" onchange="app.handleModelSelectionChange('select-worker-model')"></select>
-                <input id="select-worker-model-custom" class="form-control" style="display: none; margin-top: 6px;" aria-label="手动输入开发模型" placeholder="输入模型名称">
-              </div>
+      <!-- Gate 2: Clean Launch Card (Visible when pending_confirm or blocked) -->
+      <div class="card gate2-launch-card" id="gate2-launch-card" style="display: none;">
+        <div class="gate2-launch-header">
+          <div class="gate2-title-wrap">
+            <span class="gate-icon">⚡</span>
+            <div>
+              <h3>门禁 2：启动执行确认</h3>
+              <p class="desc">核对工作目录与单次执行时限；下方工作流中可选中节点查看提示词并切换执行模型；确认无误后点击启动。</p>
             </div>
           </div>
-
-          <div class="form-group">
-            <label for="select-reviewer-executor" style="font-weight: 600; color: #7c3aed; display: block; margin-bottom: 6px; font-size: 13px;">
-              ⚖️ REVIEWER (审查验收者)：
-            </label>
-            <div style="display: flex; gap: 8px;">
-              <select id="select-reviewer-executor" class="form-control" style="flex: 1;" onchange="app.handleReviewerExecutorChange()">
-                <option value="workbuddy">CodeBuddy CLI (质量审查 · 无沙箱)</option>
-              </select>
-              <div style="flex: 1; min-width: 0;">
-                <select id="select-reviewer-model" class="form-control" onchange="app.handleModelSelectionChange('select-reviewer-model')"></select>
-                <input id="select-reviewer-model-custom" class="form-control" style="display: none; margin-top: 6px;" aria-label="手动输入验收模型" placeholder="输入模型名称">
-              </div>
+          <div class="gate2-launch-actions">
+            <div class="launch-input-group">
+              <label for="execution-timeout-minutes">超时(分钟)：</label>
+              <input id="execution-timeout-minutes" type="number" min="1" max="1440" step="1" value="60" class="form-control" style="width: 80px;">
             </div>
+            <div class="launch-input-group launch-cwd-group">
+              <label for="input-confirmed-cwd">执行目录：</label>
+              <input type="text" id="input-confirmed-cwd" class="form-control" placeholder="D:/CODE/..." style="min-width: 280px;" />
+            </div>
+            <button class="btn btn-primary btn-start-flow" id="btn-confirm-start" onclick="app.handleConfirmStart()">
+              🚀 确认并开始
+            </button>
           </div>
         </div>
-
-        <div class="form-row">
-          <label for="execution-timeout-minutes">单次执行超时时间（分钟）</label>
-          <input id="execution-timeout-minutes" type="number" min="1" max="1440" step="1" value="60" class="form-control">
-          <p>每次 CLI 调用或每条独立测试命令分别计时。</p>
-        </div>
-        <div class="form-row">
-          <label for="input-confirmed-cwd">执行目录 (工作台识别的真实项目路径)：</label>
-          <div class="input-with-button">
-            <input type="text" id="input-confirmed-cwd" class="form-control" placeholder="D:/CODE/..." />
-            <button class="btn btn-primary" onclick="app.handleConfirmStart()">确认并开始</button>
-          </div>
-        </div>
-        <div class="workspace-check-result" id="gate2-git-info">
-          <!-- Git info -->
-        </div>
+        <div class="workspace-check-result" id="gate2-git-info" style="margin-top: 10px;"></div>
       </div>
 
       <!-- Gate 3: Human Review Banner (Visible when human_review) -->
@@ -182,53 +140,66 @@
         </div>
       </div>
 
-      <!-- Blocked Alert (Visible when blocked) -->
+      <!-- Blocked Alert (Visible when blocked or cleanup_failed) -->
       <div class="alert alert-blocked" id="blocked-alert" style="display: none;">
-        <strong>⚠️ 异常待处理：</strong>
+        <strong id="blocked-alert-title">⚠️ 异常待处理：</strong>
         <span id="blocked-reason-text">无</span>
-        <button class="btn btn-sm btn-outline" onclick="app.handleResumeBlocked()">重试并继续</button>
+        <button class="btn btn-sm btn-outline" id="blocked-action-btn" onclick="app.handleResumeBlocked()">重试并继续</button>
+      </div>
+
+      <!-- Task Workflow Workspace (Styled exactly like WorkflowView) -->
+      <div class="wf-workspace task-wf-workspace" id="task-wf-workspace" style="margin-bottom: 20px;">
+        <!-- Left/Center Diagram Area -->
+        <div class="wf-canvas-card">
+          <div class="wf-canvas-header">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-weight: 600; font-size: 14px; color: #1e293b;">工作流拓扑与节点状态</span>
+              <span class="badge badge-blue" id="task-wf-badge">工作流</span>
+            </div>
+            <span class="canvas-hint">💡 点击节点查看提示词与执行模型；任务开始执行后模型配置自动冻结。</span>
+          </div>
+          <div class="wf-svg-viewport" id="task-wf-svg-viewport">
+            <div class="loading-state">正在加载任务工作流拓扑...</div>
+          </div>
+        </div>
+
+        <!-- Right Config / Inspector Panel -->
+        <div class="wf-config-card" id="task-wf-node-panel">
+          <div class="config-empty-hint">请在左侧点击节点查看其提示词及执行配置。</div>
+        </div>
       </div>
 
       <!-- Tab Navigation for Detail Content (Diff Tab removed for streamlined UI) -->
       <div class="detail-tabs">
-        <button class="dtab-btn active" onclick="app.setDetailTab('overview')">执行现场与进度</button>
-        <button class="dtab-btn" onclick="app.setDetailTab('rounds')">轮次与模型调试 (Debugger)</button>
+        <button class="dtab-btn active" onclick="app.setDetailTab('rounds')">轮次与模型调试 (Debugger)</button>
         <button class="dtab-btn" onclick="app.setDetailTab('materials')">冻结任务材料阅读</button>
+        <button class="dtab-btn" onclick="app.setDetailTab('workspace')">工作区基准与代码状态</button>
       </div>
 
-      <!-- Tab Content 1: Overview & Stages -->
-      <div id="dtab-overview" class="dtab-content active">
-        <!-- Stage Flow Progress -->
-        <div class="card stage-flow-card">
-          <h4>执行流水线阶段</h4>
-          <div class="stage-stepper">
-            <div class="step-item" id="step-worker">
-              <div class="step-icon">1</div>
-              <div class="step-label">Worker 开发修复</div>
-              <div class="step-sub" id="stepper-worker-sub">CodeBuddy CLI (直连)</div>
-            </div>
-            <div class="step-arrow">→</div>
-            <div class="step-item" id="step-tests">
-              <div class="step-icon">2</div>
-              <div class="step-label">独立测试执行</div>
-              <div class="step-sub">工作台自动运行</div>
-            </div>
-            <div class="step-arrow">→</div>
-            <div class="step-item" id="step-codex">
-              <div class="step-icon">3</div>
-              <div class="step-label">Reviewer 自动验收</div>
-              <div class="step-sub" id="stepper-reviewer-sub">无沙箱直连审查</div>
-            </div>
-            <div class="step-arrow">→</div>
-            <div class="step-item" id="step-review">
-              <div class="step-icon">4</div>
-              <div class="step-label">最终人工审核</div>
-              <div class="step-sub">用户终审门禁</div>
-            </div>
+      <!-- Tab Content 1: Rounds & Model Debugger -->
+      <div id="dtab-rounds" class="dtab-content active">
+        <div id="rounds-timeline" class="rounds-container">
+          <!-- Dynamically filled with debugger cards -->
+        </div>
+      </div>
+
+      <!-- Tab Content 2: Task Materials (Markdown Reading View) -->
+      <div id="dtab-materials" class="dtab-content">
+        <div class="card">
+          <div class="material-subtabs" id="material-subtabs" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid var(--surface-border); padding-bottom: 10px;">
+            <!-- Dynamic tabs injected by TaskDetail -->
+          </div>
+          <div id="material-resource-nav" style="display: none; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; padding: 8px 10px; background: #f8fafc; border: 1px solid var(--surface-border); border-radius: 6px;">
+            <!-- Dynamic file selector pills -->
+          </div>
+          <div class="markdown-body" id="mat-rendered-content" style="min-height: 240px; padding: 12px 16px;">
+            <!-- Rendered rich markdown / JSON HTML -->
           </div>
         </div>
+      </div>
 
-        <!-- Git & Workspace Baseline Card -->
+      <!-- Tab Content 3: Git & Workspace Baseline Card -->
+      <div id="dtab-workspace" class="dtab-content">
         <div class="card">
           <h4>工作区基准与代码状态</h4>
           <div class="git-status-grid">
@@ -248,29 +219,6 @@
               <span class="label">工作区状态：</span>
               <span class="value" id="git-status">--</span>
             </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Tab Content 2: Rounds & Model Debugger -->
-      <div id="dtab-rounds" class="dtab-content">
-        <div id="rounds-timeline" class="rounds-container">
-          <!-- Dynamically filled with debugger cards -->
-        </div>
-      </div>
-
-      <!-- Tab Content 3: Task Materials (Markdown Reading View) -->
-      <div id="dtab-materials" class="dtab-content">
-        <div class="card">
-          <div class="material-subtabs" style="display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid var(--surface-border); padding-bottom: 10px;">
-            <button class="mat-subtab-btn active" id="mat-btn-task" onclick="app.setMaterialSubtab('task')">task.md (任务说明)</button>
-            <button class="mat-subtab-btn" id="mat-btn-dev" onclick="app.setMaterialSubtab('dev')">development.md (开发清单)</button>
-            <button class="mat-subtab-btn" id="mat-btn-tests" onclick="app.setMaterialSubtab('tests')">tests.md (测试用例)</button>
-            <button class="mat-subtab-btn" id="mat-btn-acceptance" onclick="app.setMaterialSubtab('acceptance')">acceptance.md (验收标准)</button>
-            <button class="mat-subtab-btn" id="mat-btn-worker" onclick="app.setMaterialSubtab('worker')">Worker 独立提示词</button>
-          </div>
-          <div class="markdown-body" id="mat-rendered-content" style="min-height: 240px; padding: 12px 16px;">
-            <!-- Rendered rich markdown HTML -->
           </div>
         </div>
       </div>
@@ -392,8 +340,8 @@
           <p style="font-weight: 600; margin-bottom: 6px; color: #dc2626;">确认后将一并清理以下全部内容：</p>
           <ul style="padding-left: 18px; margin: 0; line-height: 1.6;">
             <li>永久删除系统内<strong>所有开发任务</strong>与执行记录；</li>
-            <li>物理删除所有任务的<strong>方案文档与材料包</strong>（manifest, task.md, dev.md, tests.md, acceptance.md 等）；</li>
-            <li>物理删除 <code>data/tasks</code> 下所有<strong>磁盘目录与文件</strong>；</li>
+            <li>物理删除所有任务的<strong>节点材料、共同资源、修订、草稿与运行产物</strong>；</li>
+            <li>物理删除实例数据目录 <code>tasks</code> 下所有<strong>磁盘目录与文件</strong>（不删除外部业务项目及源目录）；</li>
             <li>立即停止当前所有正在执行的后台回路。</li>
           </ul>
         </div>

@@ -1,7 +1,7 @@
 /**
  * CBWorkBench SVG 工作流编排视图组件
  * 严格支持三种节点类型：start、end、task
- * 任务节点执行方式：agent、command、manual
+ * 任务节点执行方式：agent、manual
  * 成功连线（蓝色实线）与失败连线（灰色虚线）
  */
 
@@ -87,10 +87,15 @@ export class WorkflowView {
                 ${this.workflows
                   .map(
                     (w) =>
-                      `<option value="${w.id}" ${w.id === wf.id ? 'selected' : ''}>${escapeHtml(w.name)}${w.isDefault ? ' [默认]' : ''}${w.isReferenced ? ' (引用锁定)' : ''}</option>`
+                      `<option value="${escapeHtml(w.id)}" ${w.id === wf.id ? 'selected' : ''}>${escapeHtml(w.name)}${w.isDefault ? ' [默认]' : ''}${w.isReferenced ? ' (引用锁定)' : ''}</option>`
                   )
                   .join('')}
               </select>
+              ${
+                wf.definition_sha256
+                  ? `<span class="badge badge-secondary" title="工作流定义摘要 (definition_sha256): ${wf.definition_sha256}">SHA: ${wf.definition_sha256.slice(0, 8)}</span>`
+                  : ''
+              }
               ${
                 isLocked
                   ? `<span class="badge" style="background:#fef3c7; color:#92400e; border:1px solid #fcd34d;">🔒 任务引用中 (只读锁定)</span>`
@@ -316,9 +321,9 @@ export class WorkflowView {
       }
 
       // Task node card
-      const modeLabel = node.execution_mode === 'agent' ? 'Agent' : node.execution_mode === 'command' ? '命令' : '人工';
-      const modeBadgeColor = node.execution_mode === 'agent' ? '#2563eb' : node.execution_mode === 'command' ? '#0d9488' : '#7c3aed';
-      const modeBadgeBg = node.execution_mode === 'agent' ? '#eff6ff' : node.execution_mode === 'command' ? '#f0fdfa' : '#f5f3ff';
+      const modeLabel = node.execution_mode === 'manual' ? '人工' : 'Agent';
+      const modeBadgeColor = node.execution_mode === 'manual' ? '#7c3aed' : '#2563eb';
+      const modeBadgeBg = node.execution_mode === 'manual' ? '#f5f3ff' : '#eff6ff';
 
       return `
         <g class="svg-node svg-node-task ${isSelected ? 'selected' : ''}" onclick="app.workflowView.selectNode('${node.id}')" cursor="pointer">
@@ -336,7 +341,7 @@ export class WorkflowView {
           <text x="${pos.x + 10}" y="${pos.y + 46}" font-size="13" font-weight="bold" fill="#1e293b">${escapeHtml(node.name || node.id)}</text>
           
           <!-- Detail subtext -->
-          <text x="${pos.x + 10}" y="${pos.y + 66}" font-size="11" fill="#64748b">${escapeHtml(node.execution_mode === 'agent' ? formatExecutor(node.executor) : node.execution_mode === 'command' ? (node.command || '独立测试') : '人工审核')}</text>
+          <text x="${pos.x + 10}" y="${pos.y + 66}" font-size="11" fill="#64748b">${escapeHtml(node.execution_mode === 'manual' ? '人工审核' : formatExecutor(node.executor))}</text>
         </g>
       `;
     });
@@ -391,27 +396,19 @@ export class WorkflowView {
           !isStart && !isEnd
             ? `
           <div class="form-group">
+            <label class="form-label">${node.execution_mode === 'manual' ? '人工核验提示词' : '节点提示词'}</label>
+            <textarea class="input-textarea" rows="6" placeholder="填写本节点的职责、执行要求和完成条件" onchange="app.workflowView.updateCurrentNodeField('prompt', this.value)" ${isLocked ? 'disabled' : ''}>${escapeHtml(node.prompt || node.description || '')}</textarea>
+            <small class="form-hint">生成任务材料时以此为基础，执行时保留这些要求。</small>
+          </div>
+
+          <div class="form-group">
             <label class="form-label">最大执行次数 (0 或留空为不限制)</label>
             <input type="number" min="0" max="100" class="input-text" value="${node.max_executions || 0}" onchange="app.workflowView.updateCurrentNodeField('max_executions', parseInt(this.value, 10))" ${isLocked ? 'disabled' : ''} />
             <small class="form-hint">设置为 0 或留空表示节点不做次数限制。</small>
           </div>
 
           ${
-            node.execution_mode === 'command'
-              ? `
-            <div class="form-group">
-              <label class="form-label">测试/执行命令 (留空则执行测试清单)</label>
-              <input type="text" class="input-text" placeholder="npm test 或留空" value="${escapeHtml(node.command || '')}" onchange="app.workflowView.updateCurrentNodeField('command', this.value)" ${isLocked ? 'disabled' : ''} />
-            </div>
-          `
-              : node.execution_mode === 'manual'
-              ? `
-            <div class="form-group">
-              <label class="form-label">人工核验说明</label>
-              <textarea class="input-textarea" rows="3" onchange="app.workflowView.updateCurrentNodeField('prompt', this.value)" ${isLocked ? 'disabled' : ''}>${escapeHtml(node.prompt || '')}</textarea>
-            </div>
-          `
-              : `
+            node.execution_mode !== 'manual' ? `
             <div class="form-group">
               <label class="form-label">执行器 (Executor)</label>
               <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('executor', this.value)" ${isLocked ? 'disabled' : ''}>
@@ -420,12 +417,7 @@ export class WorkflowView {
                 <option value="antigravity" ${node.executor === 'antigravity' ? 'selected' : ''}>Antigravity</option>
               </select>
             </div>
-
-            <div class="form-group">
-              <label class="form-label">节点提示词模板 (Prompt)</label>
-              <textarea class="input-textarea" rows="4" onchange="app.workflowView.updateCurrentNodeField('prompt', this.value)" ${isLocked ? 'disabled' : ''}>${escapeHtml(node.prompt || '')}</textarea>
-            </div>
-          `
+          ` : ''
           }
         `
             : ''

@@ -17,7 +17,9 @@ export async function refreshExecution(taskId,task) {
     panel=document.createElement('div');panel.id='execution-live-panel';panel.className='card';
     const status=document.createElement('p');status.id='execution-live-status';panel.append(status);
     const logs=document.createElement('pre');logs.id='execution-live-logs';logs.style.cssText='max-height:400px;overflow:auto;white-space:pre-wrap';panel.append(logs);
-    document.getElementById('gate2-card').after(panel);
+    const anchor = document.getElementById('gate2-launch-card') || document.querySelector('.task-summary-card');
+    if (anchor) anchor.after(panel);
+    else document.getElementById('view-task-details')?.prepend(panel);
   }
   const run=data.run;
   if(!run){source?.close();currentRun=null;panel.hidden=true;return;}
@@ -28,8 +30,8 @@ export async function refreshExecution(taskId,task) {
   if(!cleanup){cleanup=document.createElement('button');cleanup.id='execution-cleanup';cleanup.className='btn btn-sm btn-secondary';cleanup.textContent='重试清理';panel.append(cleanup);}
   cleanup.hidden=run.stopReason!=='CLEANUP_FAILED' || run.cleanupConfirmed;
   cleanup.onclick=async()=>{const result=await fetch('/api/runs/'+encodeURIComponent(run.runId)+'/cleanup',{method:'POST'}).then(r=>r.json());alert(result.message);};
-  const executor=run.kind==='reviewer'?task?.reviewer_executor:task?.worker_executor;
-  const model=run.kind==='reviewer'?task?.reviewer_model:task?.worker_model;
+  const executor=run.adapterId || run.executor || '';
+  const model=run.modelName || run.model || '';
   document.getElementById('execution-live-status').textContent+=' · '+(executor || '')+' · '+(model==='default'?'沿用CLI配置':model || '')+(run.toolName?' · '+run.toolName:'');
   if(currentRun===run.runId) return;
   source?.close();currentRun=run.runId;

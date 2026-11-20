@@ -11,11 +11,12 @@ import { TaskDetail } from './components/taskDetail.js';
 import { RuntimeView } from './components/runtimeView.js';
 import { WorkflowView } from './components/workflowView.js';
 import { populateModelPicker, updateModelPicker, getModelValue } from './components/modelPicker.js';
-import { escapeHtml, copyToClipboard, toggleDrawer } from './utils.js';
+import { escapeHtml, copyToClipboard, toggleDrawer, renderMarkdown } from './utils.js';
 
 export class App {
   constructor() {
     this.workflowView = new WorkflowView(this);
+    this.resourceCache = new Map();
     this.router = new Router({
       onTaskList: (push) => this.showTaskList(push),
       onTaskDetail: (id, push) => this.showTaskDetails(id, push),
@@ -28,8 +29,7 @@ export class App {
   }
 
   async init() {
-    // 加载全局状态与工作流
-    await this.fetchSystemStatus();
+    // 加载执行器与工作流
     await this.fetchExecutors();
     await this.workflowView.init();
 
@@ -148,7 +148,6 @@ export class App {
 
   async refreshTaskList() {
     await this.fetchTasks();
-    await this.fetchSystemStatus();
   }
 
   setFilter(filter) {
@@ -167,9 +166,9 @@ export class App {
         return;
       }
       store.setState({ currentTaskDetail: data });
-      const { availableWorkers, availableReviewers, activeDetailTab, currentMaterialSubtab } = store.getState();
-      refreshExecution(taskId,data.task).catch(error=>console.error('读取执行记录失败',error));
-      TaskDetail.render(data, availableWorkers, availableReviewers, activeDetailTab, currentMaterialSubtab);
+      const { availableAdapters, activeDetailTab, currentMaterialSubtab, currentResourcePath } = store.getState();
+      refreshExecution(taskId, data.task).catch((error) => console.error('读取执行记录失败', error));
+      TaskDetail.render(data, availableAdapters, activeDetailTab, currentMaterialSubtab, currentResourcePath);
     } catch (e) {
       console.error('Error fetching task detail:', e);
     }
@@ -187,21 +186,87 @@ export class App {
   }
 
   setMaterialSubtab(subtab) {
-    store.setState({ currentMaterialSubtab: subtab });
-    const tabs = ['task', 'dev', 'tests', 'acceptance', 'worker'];
-    tabs.forEach((t) => {
-      const btn = document.getElementById(`mat-btn-${t}`);
-      if (btn) btn.classList.toggle('active', t === subtab);
-    });
+    store.setState({ currentMaterialSubtab: subtab, currentResourcePath: null });
     const currentDetail = store.getState().currentTaskDetail;
     if (currentDetail) {
-      TaskDetail.renderCurrentMaterial({
-        task_md: currentDetail.latestRevision?.task_md,
-        development_md: currentDetail.latestRevision?.development_md,
-        tests_md: currentDetail.latestRevision?.tests_md,
-        acceptance_md: currentDetail.latestRevision?.acceptance_md,
-        workerPrompts: currentDetail.workerPrompts,
-      }, subtab);
+      TaskDetail.renderMaterialsTabs(
+        {
+          task: currentDetail.task,
+          latestRevision: currentDetail.latestRevision,
+          manifest: currentDetail.manifest,
+          packageFiles: currentDetail.packageFiles || [],
+        },
+        subtab,
+        null
+      );
+    }
+  }
+
+  selectMaterialResource(resourcePath) {
+    store.setState({ currentResourcePath: resourcePath });
+    const currentDetail = store.getState().currentTaskDetail;
+    if (currentDetail) {
+      TaskDetail.renderMaterialsTabs(
+        {
+          task: currentDetail.task,
+          latestRevision: currentDetail.latestRevision,
+          manifest: currentDetail.manifest,
+          packageFiles: currentDetail.packageFiles || [],
+        },
+        store.getState().currentMaterialSubtab,
+        resourcePath
+      );
+    }
+  }
+
+  invalidateTaskCache(taskId) {
+    for (const key of this.resourceCache.keys()) {
+      if (key.startsWith(`${taskId}:`)) {
+        this.resourceCache.delete(key);
+      }
+    }
+  }
+
+  async loadMaterialResource(taskId, revision, resourcePath) {
+    const contentEl = document.getElementById('mat-rendered-content');
+    if (!contentEl) return;
+
+    const cacheKey = `${taskId}:r${revision}:${resourcePath}`;
+    let res = this.resourceCache.get(cacheKey);
+    if (!res) {
+      contentEl.innerHTML = '<div style="color: var(--text-muted); padding: 16px;">正在读取材料文件...</div>';
+      try {
+        const fetched = await api.getRevisionResource(taskId, revision, resourcePath, 0, 262144);
+        if (!fetched.success || !fetched.resource) {
+          contentEl.innerHTML = `<div class="alert alert-blocked">读取文件失败: ${escapeHtml(fetched.message || '未知错误')}</div>`;
+          return;
+        }
+        res = fetched.resource;
+        if (this.resourceCache.size >= 30) {
+          const oldestKey = this.resourceCache.keys().next().value;
+          this.resourceCache.delete(oldestKey);
+        }
+        this.resourceCache.set(cacheKey, res);
+      } catch (e) {
+        contentEl.innerHTML = `<div class="alert alert-blocked">读取文件异常: ${escapeHtml(e.message)}</div>`;
+        return;
+      }
+    }
+
+    const headerHtml = `<div style="font-size:12px; color:var(--text-muted); margin-bottom:10px; padding-bottom:6px; border-bottom:1px solid var(--surface-border);">
+      <code>${escapeHtml(res.path)}</code> · ${res.total_bytes} bytes · SHA: <code>${escapeHtml(res.sha256.slice(0, 12))}</code>
+      ${res.has_more ? ` · <span style="color:#d97706;">已展示前 ${res.bytes_read} 字节（大文件已截断）</span>` : ''}
+    </div>`;
+
+    if (res.encoding === 'base64') {
+      contentEl.innerHTML = `${headerHtml}<p style="color: var(--text-muted);">二进制资源 (${res.total_bytes} 字节)，SHA-256: <code>${escapeHtml(res.sha256)}</code></p>`;
+      return;
+    }
+
+    if (res.path.endsWith('.json')) {
+      contentEl.innerHTML = `${headerHtml}<pre class="code-block" style="white-space: pre-wrap;">${escapeHtml(res.content)}</pre>`;
+    } else {
+      contentEl.innerHTML = `${headerHtml}${renderMarkdown(res.content)}`;
     }
   }
 
@@ -213,24 +278,13 @@ export class App {
 
     const inputCwd = document.getElementById('input-confirmed-cwd');
     const confirmedCwd = inputCwd ? inputCwd.value.trim() : undefined;
-
-    const workerSelect = document.getElementById('select-worker-executor');
-    const reviewerSelect = document.getElementById('select-reviewer-executor');
-
-    const workerExecutor = workerSelect?.value;
-    const workerModel = getModelValue('select-worker-model');
-    const reviewerExecutor = reviewerSelect?.value;
-    const reviewerModel = getModelValue('select-reviewer-model');
-    if (!workerModel || !reviewerModel) { alert('请填写模型名称。'); return; }
+    const timeoutInput = document.getElementById('execution-timeout-minutes');
+    const timeoutMs = timeoutInput ? Number(timeoutInput.value) * 60000 : 3600000;
 
     try {
       const data = await api.confirmStartTask(currentTaskId, {
-        execution_timeout_ms: Number(document.getElementById('execution-timeout-minutes').value) * 60000,
+        execution_timeout_ms: timeoutMs,
         confirmed_cwd: confirmedCwd,
-        worker_executor: workerExecutor,
-        worker_model: workerModel,
-        reviewer_executor: reviewerExecutor,
-        reviewer_model: reviewerModel,
       });
 
       if (data.success) {
@@ -263,13 +317,14 @@ export class App {
       event.preventDefault();
     }
     const confirmed = confirm(
-      `确定要删除任务「${taskTitle || taskId}」吗？\n\n⚠️ 此操作将一并删除该任务相关的方案文档、Worker 提示词和数据库记录，且无法恢复！`
+      `确定要删除任务「${taskTitle || taskId}」吗？\n\n⚠️ 此操作将一并删除该任务相关的全部节点材料、历史修订、运行产物和数据库记录，且无法恢复！`
     );
     if (!confirmed) return;
 
     try {
       const data = await api.deleteTask(taskId);
       if (data.success) {
+        this.invalidateTaskCache(taskId);
         await this.fetchTasks();
       } else {
         alert('删除任务失败：' + (data.message || '未知错误'));
@@ -284,13 +339,14 @@ export class App {
     if (!currentTaskId) return;
     const taskTitle = document.getElementById('detail-task-title')?.textContent || currentTaskId;
     const confirmed = confirm(
-      `确定要删除任务「${taskTitle}」吗？\n\n⚠️ 此操作将一并删除该任务相关的方案文档、Worker 提示词和数据库记录，且无法恢复！`
+      `确定要删除任务「${taskTitle}」吗？\n\n⚠️ 此操作将一并删除该任务相关的全部节点材料、历史修订、运行产物和数据库记录，且无法恢复！`
     );
     if (!confirmed) return;
 
     try {
       const data = await api.deleteTask(currentTaskId);
       if (data.success) {
+        this.invalidateTaskCache(currentTaskId);
         alert(data.message || '任务已成功删除');
         this.showTaskList();
       } else {
@@ -340,10 +396,12 @@ export class App {
       const data = await api.clearAllTasks();
       this.closeClearAllModal();
       if (data.success) {
+        this.resourceCache.clear();
         alert(data.message || '所有任务已成功清空');
         await this.fetchTasks();
       } else {
         alert('清空失败：' + (data.message || '未知错误'));
+        await this.fetchTasks();
       }
     } catch (e) {
       alert('请求失败：' + e.message);
@@ -582,76 +640,78 @@ export class App {
 
   // --- System Metadata & Helpers ---
 
-  async fetchSystemStatus() {
-    try {
-      const data = await api.getSystemStatus();
-      if (data.success && data.status) {
-        const s = data.status;
-        const pillNode = document.getElementById('pill-node');
-        const pillWb = document.getElementById('pill-wb');
-        const pillCodex = document.getElementById('pill-codex');
-
-        if (pillNode) pillNode.textContent = `Node ${s.nodeVersion} SQLite`;
-        if (pillWb) pillWb.textContent = `Worker: ${s.workerModel==='default'?'沿用CLI配置':s.workerModel}`;
-        if (pillCodex) pillCodex.textContent = `Reviewer: ${s.verifierModel==='default'?'沿用CLI配置':s.verifierModel}`;
-      }
-    } catch (e) {
-      console.warn('Failed to fetch system status:', e);
-    }
-  }
-
   async fetchExecutors() {
     try {
       const data = await api.getExecutors();
       if (data.success) {
-        const availableWorkers = data.workers || [];
-        const availableReviewers = data.reviewers || [];
-        store.setState({ availableWorkers, availableReviewers });
-        this.populateExecutorSelects();
+        const availableAdapters = data.agents || data.workers || [];
+        store.setState({ availableAdapters, availableWorkers: availableAdapters, availableReviewers: availableAdapters });
       }
     } catch (e) {
       console.warn('Failed to fetch executors:', e);
     }
   }
 
-  populateExecutorSelects(selectedWorker, selectedWorkerModel, selectedReviewer, selectedReviewerModel) {
-    const { availableWorkers, availableReviewers } = store.getState();
-    const workerSelect = document.getElementById('select-worker-executor');
-    const reviewerSelect = document.getElementById('select-reviewer-executor');
-
-    if (workerSelect && availableWorkers.length > 0) {
-      workerSelect.innerHTML = availableWorkers
-        .map((w) => `<option value="${w.id}">${escapeHtml(w.name)}</option>`)
-        .join('');
-      if (selectedWorker) workerSelect.value = selectedWorker;
-      this.handleWorkerExecutorChange(selectedWorkerModel);
-    }
-
-    if (reviewerSelect && availableReviewers.length > 0) {
-      reviewerSelect.innerHTML = availableReviewers
-        .map((r) => `<option value="${r.id}">${escapeHtml(r.name)}</option>`)
-        .join('');
-      if (selectedReviewer) reviewerSelect.value = selectedReviewer;
-      this.handleReviewerExecutorChange(selectedReviewerModel);
+  selectTaskWorkflowNode(nodeId) {
+    TaskDetail.selectedNodeId = nodeId;
+    const { currentTaskDetail, availableAdapters } = store.getState();
+    if (currentTaskDetail) {
+      TaskDetail.renderTaskWorkflow(currentTaskDetail, availableAdapters);
     }
   }
 
-  handleWorkerExecutorChange(preferredModel) {
-    const { availableWorkers } = store.getState();
-    const workerSelect = document.getElementById('select-worker-executor');
-    if (!workerSelect) return;
-
-    const worker = availableWorkers.find((w) => w.id === workerSelect.value);
-    populateModelPicker('select-worker-model', worker, preferredModel);
+  handleTaskNodeExecutorChange(nodeId, newExecutor) {
+    const { availableAdapters } = store.getState();
+    const adapter = (availableAdapters || []).find((a) => a.id === newExecutor);
+    populateModelPicker('task-node-model-select', adapter, adapter?.defaultModel || 'default');
+    this.saveTaskNodeModel(nodeId);
   }
 
-  handleReviewerExecutorChange(preferredModel) {
-    const { availableReviewers } = store.getState();
-    const reviewerSelect = document.getElementById('select-reviewer-executor');
-    if (!reviewerSelect) return;
+  handleTaskNodeModelSelectionChange(nodeId) {
+    updateModelPicker('task-node-model-select');
+  }
 
-    const reviewer = availableReviewers.find((r) => r.id === reviewerSelect.value);
-    populateModelPicker('select-reviewer-model', reviewer, preferredModel);
+  async saveTaskNodeModel(nodeId) {
+    const { currentTaskId, currentTaskDetail, availableAdapters } = store.getState();
+    if (!currentTaskId || !currentTaskDetail) return;
+    if (currentTaskDetail.task?.status !== 'pending_confirm') {
+      alert('任务已开始执行，节点模型与配置已冻结。');
+      return;
+    }
+
+    const executorSelect = document.getElementById('task-node-executor-select');
+    const executor = executorSelect?.value;
+    const model = getModelValue('task-node-model-select');
+    const feedbackEl = document.getElementById('task-node-save-feedback');
+
+    try {
+      const res = await api.updateTaskWorkflowNode(currentTaskId, nodeId, { executor, model });
+      if (res.success) {
+        if (feedbackEl) {
+          feedbackEl.textContent = '✓ 已保存';
+          setTimeout(() => {
+            const el = document.getElementById('task-node-save-feedback');
+            if (el) el.textContent = '';
+          }, 2000);
+        }
+        if (currentTaskDetail.taskWorkflow) {
+          try {
+            const nodes = JSON.parse(currentTaskDetail.taskWorkflow.nodes_json);
+            const target = nodes.find((n) => n.id === nodeId);
+            if (target) {
+              if (executor) target.executor = executor;
+              if (model) target.model = model;
+              currentTaskDetail.taskWorkflow.nodes_json = JSON.stringify(nodes);
+            }
+          } catch {}
+        }
+        TaskDetail.renderTaskWorkflow(currentTaskDetail, availableAdapters);
+      } else {
+        alert('保存模型失败：' + res.message);
+      }
+    } catch (e) {
+      alert('请求异常：' + e.message);
+    }
   }
 
   handleModelSelectionChange(id) { updateModelPicker(id); }

@@ -28,6 +28,8 @@ export function formatStatus(status) {
     human_review: '最终人工审核',
     completed: '已完成',
     cancelled: '已取消',
+    deleting: '清理删除中',
+    cleanup_failed: '清理失败待重试',
   };
   return map[status] || status;
 }

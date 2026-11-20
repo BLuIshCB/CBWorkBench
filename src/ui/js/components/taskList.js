@@ -33,8 +33,6 @@ export const TaskList = {
         const cwdDisplay = t.confirmed_cwd || t.target_cwd;
         const commitText = t.git_commit ? `Git: ${t.git_commit}` : 'No Git';
         const roundText = t.current_round > 0 ? `第 ${t.current_round} 轮` : '尚未开始';
-        const workerExecutor = formatExecutor(t.worker_executor);
-        const workerText = `${workerExecutor}:${t.worker_model || 'deepseek-v4-flash'}`;
         const wfText = t.workflow_id ? `${t.workflow_id}` : 'default';
         const nodeText = t.current_node_id ? `节点: ${t.current_node_id}` : '就绪';
         const updatedTime = formatTime(t.updated_at);
@@ -54,7 +52,6 @@ export const TaskList = {
           <div class="task-card-meta">
             <div>工作流：<code>${escapeHtml(wfText)}</code> <span style="color: var(--primary); margin-left: 4px; font-size: 11px;">[${escapeHtml(nodeText)}]</span></div>
             <div>路径：<code>${escapeHtml(cwdDisplay)}</code></div>
-            <div>模型：<code style="color: #2563eb;">${escapeHtml(workerText)}</code></div>
           </div>
           <div class="task-card-footer">
             <span>${roundText}</span>
