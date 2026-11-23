@@ -313,9 +313,10 @@ export class TaskFileStore {
     const nodeDirRel = path.posix.join('nodes', params.nodeId);
     const revNodeDir = path.join(revDir, 'nodes', params.nodeId);
 
-    if (fs.existsSync(path.join(revNodeDir, 'work.md'))) {
-      copyFrozenToAttempt(path.posix.join(nodeDirRel, 'work.md'), 'material/work.md');
-      allowedMaterialFiles.push(path.posix.join(nodeDirRel, 'work.md'), 'material/work.md');
+    const nodeDocName = `${params.nodeId}.md`;
+    if (fs.existsSync(path.join(revNodeDir, nodeDocName))) {
+      copyFrozenToAttempt(path.posix.join(nodeDirRel, nodeDocName), `material/${nodeDocName}`);
+      allowedMaterialFiles.push(path.posix.join(nodeDirRel, nodeDocName), `material/${nodeDocName}`);
     }
     if (fs.existsSync(path.join(revNodeDir, 'prompt.md'))) {
       copyFrozenToAttempt(path.posix.join(nodeDirRel, 'prompt.md'), 'material/prompt.md');
@@ -381,7 +382,7 @@ export class TaskFileStore {
         logs_dir: logsDir,
         temp_dir: tempDir,
       },
-      work_file: 'material/work.md',
+      work_file: `material/${params.nodeId}.md`,
       prompt_file: fs.existsSync(path.join(materialDir, 'prompt.md')) ? 'material/prompt.md' : null,
       requirements_file: 'shared/requirements.md',
       development_file: 'shared/development.md',

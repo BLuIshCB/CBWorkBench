@@ -290,7 +290,7 @@ export function createWorkbenchMcpServer(): McpServer {
     'workbench_submit_task',
     '提交极简任务包到开发工作台。服务端直接校验 package_root 目录完整性与各节点材料，落盘归档并将任务置为待人工确认启动状态 (pending_confirm)。',
     {
-      package_root: z.string().describe('任务包本地绝对路径（必须包含 manifest.json、requirements.md、development.md 以及 nodes/<node_id>/work.md）'),
+      package_root: z.string().describe('任务包本地绝对路径（必须包含 manifest.json、requirements.md、development.md 以及 nodes/<node_id>/<node_id>.md）'),
       task_id: z.string().optional().describe('可选。若传入则作为现有任务的新修订版本提交；若省略则自动创建新任务'),
       budget_max_rounds: z.number().int().positive().max(100).optional().describe('可选。最大执行轮次上限'),
       execution_timeout_ms: executionTimeoutSchema.optional().describe('可选。单节点执行超时毫秒数'),

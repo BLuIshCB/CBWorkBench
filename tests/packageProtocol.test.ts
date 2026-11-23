@@ -118,7 +118,7 @@ function buildMinimalPackageDir(dirName: string, opts?: {
       fs.mkdirSync(nd, { recursive: true });
       if (opts?.omitWorkMdFor !== nid) {
         const wContent = opts?.emptyWorkMdFor === nid ? '   ' : `# 任务清单: ${nid}\n完成对应节点的工作。\n`;
-        fs.writeFileSync(path.join(nd, 'work.md'), wContent, 'utf8');
+        fs.writeFileSync(path.join(nd, `${nid}.md`), wContent, 'utf8');
       }
       if (nid === 'check_cmd') {
         fs.writeFileSync(path.join(nd, 'prompt.md'), '自定义提示词：执行项目测试并捕获证据', 'utf8');
@@ -130,19 +130,19 @@ function buildMinimalPackageDir(dirName: string, opts?: {
     if (opts?.extraNodeDir) {
       const extraDir = path.join(nodesDir, opts.extraNodeDir);
       fs.mkdirSync(extraDir, { recursive: true });
-      fs.writeFileSync(path.join(extraDir, 'work.md'), '# Extra\n', 'utf8');
+      fs.writeFileSync(path.join(extraDir, `${opts.extraNodeDir}.md`), '# Extra\n', 'utf8');
     }
 
     if (opts?.controlNodeDir) {
       const cDir = path.join(nodesDir, opts.controlNodeDir);
       fs.mkdirSync(cDir, { recursive: true });
-      fs.writeFileSync(path.join(cDir, 'work.md'), '# Control\n', 'utf8');
+      fs.writeFileSync(path.join(cDir, `${opts.controlNodeDir}.md`), '# Control\n', 'utf8');
     }
 
     if (opts?.caseCollision) {
       const colDir = path.join(nodesDir, 'WRITE_DOCS');
       fs.mkdirSync(colDir, { recursive: true });
-      fs.writeFileSync(path.join(colDir, 'work.md'), '# Collide\n', 'utf8');
+      fs.writeFileSync(path.join(colDir, 'WRITE_DOCS.md'), '# Collide\n', 'utf8');
     }
   }
 
@@ -215,14 +215,14 @@ try {
     (e: any) => e instanceof PackageProtocolError && e.code === 'NODE_COVERAGE_MISMATCH'
   );
 
-  // 10. Directory validation: missing work.md in a node directory
+  // 10. Directory validation: missing <node_id>.md in a node directory
   const noWorkPkg = buildMinimalPackageDir('no-work', { omitWorkMdFor: 'write_docs' });
   assert.throws(
     () => packageService.submitTask({ package_root: noWorkPkg }),
     (e: any) => e instanceof PackageProtocolError && e.code === 'MISSING_FILE'
   );
 
-  // 11. Directory validation: empty work.md in a node directory
+  // 11. Directory validation: empty <node_id>.md in a node directory
   const emptyWorkPkg = buildMinimalPackageDir('empty-work', { emptyWorkMdFor: 'write_docs' });
   assert.throws(
     () => packageService.submitTask({ package_root: emptyWorkPkg }),
@@ -246,7 +246,7 @@ try {
     fs.rmSync(linkDir, { recursive: true, force: true });
     const targetDir = path.join(tmpBase, 'ext-dir');
     fs.mkdirSync(targetDir, { recursive: true });
-    fs.writeFileSync(path.join(targetDir, 'work.md'), '# Work\n', 'utf8');
+    fs.writeFileSync(path.join(targetDir, 'write_docs.md'), '# Work\n', 'utf8');
     fs.symlinkSync(targetDir, linkDir, 'junction');
     symlinkCreated = true;
   } catch {
@@ -304,7 +304,7 @@ try {
   const httpPort = (httpServer.address() as any).port;
   try {
     const resSlice = await fetch(
-      `http://127.0.0.1:${httpPort}/api/tasks/${taskId}/revisions/1/resource?path=${encodeURIComponent('nodes/write_docs/work.md')}`
+      `http://127.0.0.1:${httpPort}/api/tasks/${taskId}/revisions/1/resource?path=${encodeURIComponent('nodes/write_docs/write_docs.md')}`
     ).then((r) => r.json());
     assert.equal(resSlice.success, true);
     assert.ok(resSlice.resource.content.includes('任务清单: write_docs'));
@@ -332,7 +332,7 @@ try {
   assert.equal(taskState?.status, TaskStatus.COMPLETED);
 
   assert.ok(lastSeenPrompts['write_docs'].includes('平台预设提示词：认真编写文档'), 'write_docs should fallback to platform default prompt');
-  assert.ok(lastSeenPrompts['write_docs'].includes('本节点具体工作 (work.md)'), 'Prompt must contain work.md');
+  assert.ok(lastSeenPrompts['write_docs'].includes('本节点具体工作 (write_docs.md)'), 'Prompt must contain write_docs.md');
   assert.ok(lastSeenPrompts['write_docs'].includes('开发文档 (development.md)'), 'Prompt must contain development.md');
   assert.ok(lastSeenPrompts['check_cmd'].includes('自定义提示词：执行项目测试并捕获证据'), 'check_cmd should use custom prompt.md');
   console.log('  ✓ Prompt fallback to workflow default and prompt.md precedence verified');
@@ -349,7 +349,7 @@ try {
   fs.mkdirSync(path.join(noCmdPkg, 'nodes', 'cmd_only'), { recursive: true });
   fs.writeFileSync(path.join(noCmdPkg, 'requirements.md'), '# Req\n', 'utf8');
   fs.writeFileSync(path.join(noCmdPkg, 'development.md'), '# Dev\n', 'utf8');
-  fs.writeFileSync(path.join(noCmdPkg, 'nodes', 'cmd_only', 'work.md'), '# Work\n', 'utf8');
+  fs.writeFileSync(path.join(noCmdPkg, 'nodes', 'cmd_only', 'cmd_only.md'), '# Work\n', 'utf8');
   fs.writeFileSync(
     path.join(noCmdPkg, 'manifest.json'),
     JSON.stringify({ title: 'No Cmd Test', workflow_id: noCmdWfId, target_cwd: process.cwd(), task_key: 'nocmd-test' }),

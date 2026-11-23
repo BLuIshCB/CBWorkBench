@@ -10,7 +10,7 @@ class Store {
       tasks: [],
       currentTaskDetail: null,
       activeDetailTab: 'materials',
-      currentMaterialSubtab: 'manifest',
+      currentMaterialSubtab: 'requirements',
       currentResourcePath: null,
       latestMaterials: null,
       availableAdapters: [],

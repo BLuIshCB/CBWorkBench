@@ -627,10 +627,10 @@ export class WorkflowEngine {
 
         if (currentNode.type === 'task') {
           const revDir = taskFileStore.getRevisionDir(taskId, revisionRecord.revision);
-          const workFilePath = path.join(revDir, 'nodes', currentNode.id, 'work.md');
-          if (!fs.existsSync(workFilePath)) {
+          const nodeDocPath = path.join(revDir, 'nodes', currentNode.id, `${currentNode.id}.md`);
+          if (!fs.existsSync(nodeDocPath)) {
             db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
-              blocked_reason: `任务包修订材料中缺少节点 [${currentNode.id}] 的 work.md`,
+              blocked_reason: `任务包修订材料中缺少节点 [${currentNode.id}] 的 ${currentNode.id}.md`,
             });
             return;
           }
@@ -800,11 +800,11 @@ export class WorkflowEngine {
             // 提示词优先级：优先使用任务包中的 prompt.md；若无或为空，则自动回退至平台工作流模板中该节点的默认提示词
             const effectivePrompt = nodePromptContent || currentNode.prompt?.trim() || '';
 
-            let workMdContent = '';
+            let nodeDocContent = '';
             try {
-              const wPath = path.join(materialized.paths.materialDir, 'work.md');
-              if (fs.existsSync(wPath)) {
-                workMdContent = fs.readFileSync(wPath, 'utf8').trim();
+              const nPath = path.join(materialized.paths.materialDir, `${currentNode.id}.md`);
+              if (fs.existsSync(nPath)) {
+                nodeDocContent = fs.readFileSync(nPath, 'utf8').trim();
               }
             } catch {}
 
@@ -826,7 +826,7 @@ export class WorkflowEngine {
 
             const promptLines = [
               effectivePrompt ? `## 节点执行指令\n${effectivePrompt}` : '',
-              workMdContent ? `## 本节点具体工作 (work.md)\n${workMdContent}` : '',
+              nodeDocContent ? `## 本节点具体工作 (${currentNode.id}.md)\n${nodeDocContent}` : '',
               reqMdContent ? `## 需求文档 (requirements.md)\n${reqMdContent}` : '',
               devMdContent ? `## 开发文档 (development.md)\n${devMdContent}` : '',
               '---',
@@ -889,7 +889,7 @@ export class WorkflowEngine {
                 confirmedCwd,
                 attemptDir: materialized.paths.attemptDir,
                 nodePrompt: effectivePrompt,
-                materialFiles: ['work.md'],
+                materialFiles: [`${currentNode.id}.md`],
                 sharedFiles: ['requirements.md', 'development.md'],
                 boundInputsSummary: '',
                 testRunsSummary: testSummaryText,

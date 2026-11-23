@@ -193,16 +193,7 @@ export class App {
     store.setState({ currentMaterialSubtab: subtab, currentResourcePath: null });
     const currentDetail = store.getState().currentTaskDetail;
     if (currentDetail) {
-      TaskDetail.renderMaterialsTabs(
-        {
-          task: currentDetail.task,
-          latestRevision: currentDetail.latestRevision,
-          manifest: currentDetail.manifest,
-          packageFiles: currentDetail.packageFiles || [],
-        },
-        subtab,
-        null
-      );
+      TaskDetail.renderMaterialsTabs(currentDetail, subtab, null);
     }
   }
 
@@ -211,12 +202,7 @@ export class App {
     const currentDetail = store.getState().currentTaskDetail;
     if (currentDetail) {
       TaskDetail.renderMaterialsTabs(
-        {
-          task: currentDetail.task,
-          latestRevision: currentDetail.latestRevision,
-          manifest: currentDetail.manifest,
-          packageFiles: currentDetail.packageFiles || [],
-        },
+        currentDetail,
         store.getState().currentMaterialSubtab,
         resourcePath
       );
@@ -257,13 +243,14 @@ export class App {
       }
     }
 
-    const headerHtml = `<div style="font-size:12px; color:var(--text-muted); margin-bottom:10px; padding-bottom:6px; border-bottom:1px solid var(--surface-border);">
-      <code>${escapeHtml(res.path)}</code> · ${res.total_bytes} bytes · SHA: <code>${escapeHtml(res.sha256.slice(0, 12))}</code>
-      ${res.has_more ? ` · <span style="color:#d97706;">已展示前 ${res.bytes_read} 字节（大文件已截断）</span>` : ''}
-    </div>`;
+    const headerHtml = res.has_more
+      ? `<div style="font-size:12px; color:#d97706; margin-bottom:10px; padding:6px 10px; background:#fffbeb; border:1px solid #fde68a; border-radius:4px;">
+           ⚠️ 文件内容过长，仅展示前半部分
+         </div>`
+      : '';
 
     if (res.encoding === 'base64') {
-      contentEl.innerHTML = `${headerHtml}<p style="color: var(--text-muted);">二进制资源 (${res.total_bytes} 字节)，SHA-256: <code>${escapeHtml(res.sha256)}</code></p>`;
+      contentEl.innerHTML = `${headerHtml}<p style="color: var(--text-muted);">二进制资源文件</p>`;
       return;
     }
 

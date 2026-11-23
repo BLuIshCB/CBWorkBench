@@ -82,7 +82,6 @@ export const TaskDetail = {
           gitInfoEl.innerHTML = `
             <span style="color: var(--text-muted);">提交默认目录：</span> <code>${escapeHtml(task.target_cwd)}</code>
             ${task.git_commit ? ` | <span style="color: var(--text-muted);">基准 HEAD：</span> <code>${task.git_commit}</code>` : ''}
-            ${latestRevision?.package_digest ? ` | <span style="color: var(--text-muted);">包摘要：</span> <code>${escapeHtml(latestRevision.package_digest.slice(0, 12))}...</code>` : ''}
           `;
         }
       } else {
@@ -138,8 +137,8 @@ export const TaskDetail = {
 
     // 8. Uniform Node Materials Reader (Default Main View)
     this.renderMaterialsTabs(
-      { task, latestRevision, manifest, packageFiles: packageFiles || [] },
-      currentMaterialSubtab || 'manifest',
+      data,
+      currentMaterialSubtab || 'requirements',
       currentResourcePath
     );
   },
@@ -569,17 +568,46 @@ export const TaskDetail = {
     const contentEl = document.getElementById('mat-rendered-content');
     if (!subtabsEl || !navEl || !contentEl) return;
 
-    const { task, latestRevision, manifest, packageFiles } = materialsData;
-    const nodes = Array.isArray(manifest?.nodes) ? manifest.nodes : [];
-    const sharedFiles = packageFiles.filter((f) => f.owner_scope === 'shared');
+    const { task, packageFiles, taskWorkflow } = materialsData;
+    const allFiles = packageFiles || [];
 
+    // 解析任务工作流的任务节点
+    let wfNodes = [];
+    try {
+      wfNodes = JSON.parse(taskWorkflow?.nodes_json || '[]');
+    } catch {}
+    const taskNodes = wfNodes.filter((n) => n.type === 'task');
+
+    // 若工作流节点为空，尝试从材料包的节点归属中推断
+    const discoveredNodeIds = [...new Set(allFiles.filter((f) => f.owner_scope === 'node' && f.owner_node_id).map((f) => f.owner_node_id))];
+
+    const nodeTabs = taskNodes.length > 0
+      ? taskNodes.map((n) => {
+          const rawName = n.name || n.id;
+          const label = rawName.startsWith('节点：') ? rawName : `节点：${rawName}`;
+          return {
+            id: `node:${n.id}`,
+            label,
+            nodeId: n.id,
+          };
+        })
+      : discoveredNodeIds.map((nid) => {
+          const label = nid.startsWith('节点：') ? nid : `节点：${nid}`;
+          return {
+            id: `node:${nid}`,
+            label,
+            nodeId: nid,
+          };
+        });
+
+    // 固定前两主页签为「需求文档」和「开发文档」，随后各节点专属文档页签
     const tabs = [
-      { id: 'manifest', label: 'Manifest 概览' },
-      ...(sharedFiles.length > 0 ? [{ id: 'shared', label: `共同资源 (${sharedFiles.length})` }] : []),
-      ...nodes.map((n) => ({ id: `node:${n.node_id}`, label: `节点: ${n.node_id}` })),
+      { id: 'requirements', label: '需求文档' },
+      { id: 'development', label: '开发文档' },
+      ...nodeTabs,
     ];
 
-    const effectiveSubtab = tabs.some((t) => t.id === activeSubtab) ? activeSubtab : 'manifest';
+    const effectiveSubtab = tabs.some((t) => t.id === activeSubtab) ? activeSubtab : 'requirements';
 
     subtabsEl.innerHTML = tabs
       .map(
@@ -588,59 +616,71 @@ export const TaskDetail = {
       )
       .join('');
 
-    if (effectiveSubtab === 'manifest') {
+    // 1. 需求文档页签
+    if (effectiveSubtab === 'requirements') {
       navEl.style.display = 'none';
-      if (!manifest) {
-        contentEl.innerHTML = '<p style="color: var(--text-muted);">当前任务尚未提交冻结的任务包清单。</p>';
+      const reqFile = allFiles.find(
+        (f) => f.path === 'requirements.md' || f.path === 'shared/requirements.md' || f.path.endsWith('/requirements.md')
+      );
+      if (reqFile) {
+        window.app.loadMaterialResource(task.id, task.revision, reqFile.path);
+      } else {
+        contentEl.innerHTML = '<p style="color: var(--text-muted); padding: 16px;">当前任务包中未找到需求文档 (requirements.md)。</p>';
+      }
+      return;
+    }
+
+    // 2. 开发文档页签
+    if (effectiveSubtab === 'development') {
+      navEl.style.display = 'none';
+      const devFile = allFiles.find(
+        (f) => f.path === 'development.md' || f.path === 'shared/development.md' || f.path.endsWith('/development.md')
+      );
+      if (devFile) {
+        window.app.loadMaterialResource(task.id, task.revision, devFile.path);
+      } else {
+        contentEl.innerHTML = '<p style="color: var(--text-muted); padding: 16px;">当前任务包中未找到开发文档 (development.md)。</p>';
+      }
+      return;
+    }
+
+    // 3. 节点文档页签 (<node_id>.md)
+    if (effectiveSubtab.startsWith('node:')) {
+      const nodeId = effectiveSubtab.slice('node:'.length);
+      const filesForNode = allFiles.filter((f) => f.owner_scope === 'node' && f.owner_node_id === nodeId);
+
+      if (filesForNode.length === 0) {
+        navEl.style.display = 'none';
+        contentEl.innerHTML = '<p style="color: var(--text-muted); padding: 16px;">该节点下暂无文档材料。</p>';
         return;
       }
-      const summaryMd = [
-        `# 任务包概览 (${manifest.protocol_version || 'cb.task-package/2.0'})`,
-        '',
-        `- **任务 ID**: \`${task.id}\``,
-        `- **修订号**: \`r${String(task.revision).padStart(4, '0')}\``,
-        `- **就绪状态**: \`${manifest.readiness}\``,
-        `- **工作流**: \`${manifest.workflow?.id}\` (SHA: \`${manifest.workflow?.definition_sha256 || '--'}\`)`,
-        `- **包摘要 (package_digest)**: \`${latestRevision?.package_digest || '--'}\``,
-        `- **文件总数**: ${packageFiles.length} 个`,
-        '',
-        '## 完整 manifest.json',
-        '```json',
-        JSON.stringify(manifest, null, 2),
-        '```',
-      ].join('\n');
-      contentEl.innerHTML = renderMarkdown(summaryMd);
+
+      // 优先匹配按照节点命名的文档: <node_id>.md，若无则查找非 prompt.md 的 markdown
+      const primaryDoc =
+        filesForNode.find((f) => f.path === `nodes/${nodeId}/${nodeId}.md` || f.path.endsWith(`/${nodeId}.md`)) ||
+        filesForNode.find((f) => f.path.endsWith('.md') && !f.path.endsWith('prompt.md')) ||
+        filesForNode[0];
+
+      const selectedPath =
+        activeResourcePath && filesForNode.some((f) => f.path === activeResourcePath)
+          ? activeResourcePath
+          : primaryDoc.path;
+
+      if (filesForNode.length > 1) {
+        navEl.style.display = 'flex';
+        navEl.innerHTML = filesForNode
+          .map((f) => {
+            const fileName = f.path.split('/').pop();
+            const isActive = f.path === selectedPath;
+            return `<button class="btn btn-sm ${isActive ? 'btn-primary' : 'btn-secondary'}" onclick="app.selectMaterialResource('${escapeHtml(f.path)}')">${escapeHtml(fileName)}</button>`;
+          })
+          .join('');
+      } else {
+        navEl.style.display = 'none';
+      }
+
+      window.app.loadMaterialResource(task.id, task.revision, selectedPath);
       return;
     }
-
-    let filesForTab = [];
-    if (effectiveSubtab === 'shared') {
-      filesForTab = sharedFiles;
-    } else if (effectiveSubtab.startsWith('node:')) {
-      const nodeId = effectiveSubtab.slice('node:'.length);
-      filesForTab = packageFiles.filter((f) => f.owner_scope === 'node' && f.owner_node_id === nodeId);
-    }
-
-    if (filesForTab.length === 0) {
-      navEl.style.display = 'none';
-      contentEl.innerHTML = '<p style="color: var(--text-muted);">该分组下暂无文件。</p>';
-      return;
-    }
-
-    const selectedPath =
-      activeResourcePath && filesForTab.some((f) => f.path === activeResourcePath)
-        ? activeResourcePath
-        : filesForTab[0].path;
-
-    navEl.style.display = 'flex';
-    navEl.innerHTML = filesForTab
-      .map((f) => {
-        const shortLabel = f.path.split('/').slice(-2).join('/');
-        const isActive = f.path === selectedPath;
-        return `<button class="btn btn-sm ${isActive ? 'btn-primary' : 'btn-secondary'}" onclick="app.selectMaterialResource('${escapeHtml(f.path)}')">${escapeHtml(shortLabel)} (${f.size_bytes}B)</button>`;
-      })
-      .join('');
-
-    window.app.loadMaterialResource(task.id, task.revision, selectedPath);
   },
 };

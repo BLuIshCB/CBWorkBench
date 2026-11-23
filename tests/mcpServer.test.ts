@@ -47,7 +47,7 @@ function buildLocalPackage(opts: {
     fs.mkdirSync(nodeResDir, { recursive: true });
 
     fs.writeFileSync(
-      path.join(nodeDir, 'work.md'),
+      path.join(nodeDir, `${n.id}.md`),
       `# Work for ${n.id} (rev ${opts.revision})\n`,
       'utf8'
     );
@@ -169,7 +169,7 @@ try {
     name: 'workbench_get_package',
     arguments: {
       task_id: taskId,
-      resource_path: 'nodes/development/work.md',
+      resource_path: 'nodes/development/development.md',
     },
   });
   const getPkgData = JSON.parse((getPkgRes.content as any)[0].text);
@@ -227,7 +227,7 @@ try {
       node_id: 'development',
       attempt_id: mockAttempt,
       completion_token: mockToken,
-      resource_path: 'material/work.md',
+      resource_path: 'material/development.md',
     },
   });
   const ctxData = JSON.parse((ctxRes.content as any)[0].text);

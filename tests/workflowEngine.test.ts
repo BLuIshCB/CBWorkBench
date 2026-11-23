@@ -46,7 +46,7 @@ function submitV2Package(opts: { taskKey: string; wfId: string; wfSha: string; n
       if (n.type !== 'task') continue;
       const nodeDir = path.join(pkgRoot, 'nodes', n.id);
       fs.mkdirSync(nodeDir, { recursive: true });
-      fs.writeFileSync(path.join(nodeDir, 'work.md'), `# ${n.name}\n`, 'utf8');
+      fs.writeFileSync(path.join(nodeDir, `${n.id}.md`), `# ${n.name}\n`, 'utf8');
       if (n.id !== 'development') {
         fs.writeFileSync(path.join(nodeDir, 'prompt.md'), `Execute ${n.id}\n`, 'utf8');
       }
@@ -156,7 +156,7 @@ assert.strictEqual(humanReviewTask?.current_round, 1);
 
 const devRound = db.getRounds(loopTaskId).find((r) => r.worker_id === 'development');
 assert.ok(devRound?.input_prompt?.includes('保留编排时的开发约束。'), '无 prompt.md 时回退使用工作流编排提示词');
-assert.ok(devRound?.input_prompt?.includes('# 开发实现'), 'work.md 必须传入执行器');
+assert.ok(devRound?.input_prompt?.includes('# 开发实现'), '<node_id>.md 必须传入执行器');
 
 const reworkRes = await workflowEngine.submitHumanDecision(loopTaskId, 'reject', 'Need more polish');
 assert.strictEqual(reworkRes.success, true);

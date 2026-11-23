@@ -126,7 +126,7 @@ export interface ValidationIssue {
 /**
  * 校验极简任务包目录结构完整性与各节点材料契约。
  * 根目录必须包含：manifest.json, requirements.md, development.md
- * nodes/ 目录必须严格且仅覆盖工作流中的所有 task 节点，且每个节点下必须有非空的 work.md (prompt.md 可选)。
+ * nodes/ 目录必须严格且仅覆盖工作流中的所有 task 节点，且每个节点下必须有非空的 <node_id>.md (prompt.md 可选)。
  */
 export function validateTaskPackageDirectory(
   packageRoot: string,
@@ -340,31 +340,31 @@ export function validateTaskPackageDirectory(
 
     coveredTaskIds.add(entryName);
 
-    // 校验每个节点下的必需材料: work.md (必需且非空), prompt.md (可选)
-    const workFileRel = path.posix.join('nodes', entryName, 'work.md');
-    const workFilePath = path.join(entryPath, 'work.md');
-    if (!fs.existsSync(workFilePath)) {
+    // 校验每个节点下的必需材料: <node_id>.md (必需且非空), prompt.md (可选)
+    const nodeDocRel = path.posix.join('nodes', entryName, `${entryName}.md`);
+    const nodeDocPath = path.join(entryPath, `${entryName}.md`);
+    if (!fs.existsSync(nodeDocPath)) {
       issues.push({
         code: 'MISSING_FILE',
-        message: `任务节点 [${entryName}] 缺少必需工作清单: ${workFileRel}`,
-        details: [{ node_id: entryName, path: workFileRel }],
+        message: `任务节点 [${entryName}] 缺少必需工作清单: ${nodeDocRel}`,
+        details: [{ node_id: entryName, path: nodeDocRel }],
       });
     } else {
       try {
-        const buf = readRegularFileSafely(packageRoot, workFileRel);
-        validateUtf8NoBom(buf, 'text/markdown', workFileRel);
+        const buf = readRegularFileSafely(packageRoot, nodeDocRel);
+        validateUtf8NoBom(buf, 'text/markdown', nodeDocRel);
         if (buf.toString('utf8').trim().length === 0) {
           issues.push({
             code: 'INVALID_MANIFEST_SCHEMA',
-            message: `任务节点 [${entryName}] 的 ${workFileRel} 不能为空`,
-            details: [{ node_id: entryName, path: workFileRel }],
+            message: `任务节点 [${entryName}] 的 ${nodeDocRel} 不能为空`,
+            details: [{ node_id: entryName, path: nodeDocRel }],
           });
         }
       } catch (err: any) {
         issues.push({
           code: (err instanceof PackageProtocolError || err instanceof PathSecurityError) ? err.code : 'INVALID_UTF8',
-          message: `读取 ${workFileRel} 失败: ${err?.message || err}`,
-          details: [{ node_id: entryName, path: workFileRel }],
+          message: `读取 ${nodeDocRel} 失败: ${err?.message || err}`,
+          details: [{ node_id: entryName, path: nodeDocRel }],
         });
       }
     }
@@ -419,7 +419,7 @@ export function buildPackageProtocolSpec(instanceInfo: {
       requirements: 'requirements.md',
       development: 'development.md',
       node_dir_pattern: 'nodes/<node_id>',
-      node_required_files: ['work.md'],
+      node_required_files: ['<node_id>.md'],
       node_optional_files: ['prompt.md'],
       revision_dir_pattern: 'tasks/<task_id>/revisions/r0001',
       run_dir_pattern: 'tasks/<task_id>/runs/r0001/<node_id>/<attempt_id>',
@@ -447,7 +447,13 @@ export function buildPackageProtocolSpec(instanceInfo: {
         workflow_id: 'default',
         target_cwd: 'D:/CODE/PROJECT',
         task_key: 'example-task',
+        budget_max_rounds: 10,
+        execution_timeout_ms: 3600000,
       },
+      requirements_md: '# 需求文档：[任务标题]\n\n## 1. 业务目标与背景\n\n## 2. 核心功能范围 (In Scope)\n- [REQ-01] ...\n\n## 3. 排除范围 (Out of Scope)\n\n## 4. 验收标准与测试基线 (Acceptance Criteria)\n- [ ] ...\n',
+      development_md: '# 开发文档：[任务技术方案]\n\n## 1. 架构方案与模块设计\n\n## 2. 工程纪律与编码标准\n- 遵循单分支开发策略 (main)，所有改动就地生效。\n- 开发阶段不考虑向后兼容，废弃项直接删除。\n- 严格基于 TDD (红-绿-重构) 推进。\n\n## 3. 变更文件范围\n\n## 4. 自动化验证命令\n',
+      node_md: '# 节点工作文档：[节点名称] ([node_id])\n\n## 1. 节点目标与职责\n\n## 2. 具体工作项与执行清单\n- [ ] 步骤 1：...\n\n## 3. 交付物与完成条件\n',
+      prompt_md: '你是专门负责 [节点名称] 的执行 Agent。\n请严格对照 nodes/[node_id]/[node_id].md 清单开展工作，参考 shared/ 下的需求与开发文档。\n',
       submit_task: {
         package_root: 'D:/CODE/PROJECT/.cb-flow/task-01',
       },

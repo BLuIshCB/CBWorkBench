@@ -79,7 +79,7 @@ function createTask() {
       if (n.type !== 'task') continue;
       const nodeDir = path.join(pkgRoot, 'nodes', n.id);
       fs.mkdirSync(nodeDir, { recursive: true });
-      fs.writeFileSync(path.join(nodeDir, 'work.md'), `# ${n.name}\n`, 'utf8');
+      fs.writeFileSync(path.join(nodeDir, `${n.id}.md`), `# ${n.name}\n`, 'utf8');
       fs.writeFileSync(path.join(nodeDir, 'prompt.md'), `Run ${n.id}\n`, 'utf8');
     }
     const manifest = {
