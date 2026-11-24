@@ -103,18 +103,37 @@ flowchart TD
 
 ## 阶段四：任务包冻结、用户审阅与工作台 MCP 上传
 
-1. **任务包生成与物理冻结**：
-   - 沿用用户已选工作流，生成前核对 `definition_sha256`、完整节点及材料契约未变化。
-   - 遵循 [任务包与无上下文提示词规范](references/task-package.md)，将符合 `cb.task-package/2.0` 的材料生成到当前项目的 `.cb-flow/<task-key>/rNN/`：
-     - `manifest.json`：关联工作流 ID 与 `definition_sha256`、所有任务节点绑定、共同资源、输入输出契约及文件原始字节大小与 SHA-256。
-     - `shared/resources/*`：共同需求背景与冻结验收基线。
-     - `nodes/<dir_name>/node.md`：对应节点的职责范围、输入、工作步骤、完成条件与阻塞处理。
-     - `nodes/<dir_name>/prompt.md`：根据节点已配置提示词生成的独立操作指令，按开发、测试验证、只读审查或人工等实际职责补充任务要求。
-   - 测试命令由执行该节点的 Agent 根据项目和任务材料自行确定并运行，工作流不提供 `command` 配置。`result_rule = "verification"` 的节点不修改业务代码，必须生成 `outputs/test_report.json`，格式见任务包规范；输入绑定使用当前代码代次，确保返工后重新测试。
-     - `nodes/<dir_name>/resources/*`：按节点职责附带的工单清单、测试用例、验收清单、JSON Schema 等普通资源。
-2. **三道硬门禁守护**：
+1. **统一任务包结构（唯一当前协议，不兼容历史版本）**：
+   - 沿用用户已选工作流，生成前核对完整节点定义未变化。
+   - 彻底废除 1.0/2.0 双版本区分与一切历史兼容字段；统一按当前标准规范在当前项目 `.cb-flow/<task-key>/rNN/` 下组织：
+     - **标准极简目录布局**：
+       ```text
+       rNN/
+         manifest.json              # 任务元数据清单 (title, workflow_id, target_cwd, 可选 task_key/budget/timeout)
+         requirements.md            # 必须且非空：需求清单（全局需求说明、验收基线与边界约束）
+         development.md             # 必须且非空：开发清单（架构方案、Tracer-Bullet 工单 DAG、验证命令）
+         nodes/
+           <node_id>/               # 严格且仅覆盖工作流中的所有 task 节点
+             <node_id>.md           # 必须且非空：必须以节点 ID 命名（如 development.md, task.md），严禁命名为 node.md！
+             prompt.md              # 可选：给该节点的独立提示词（缺省沿用工作流模板预设）
+       ```
+     - **强制全局双基线清单**：
+       - `requirements.md`：必须位于根目录，对应 Web 端【需求文档】主页签；
+       - `development.md`：必须位于根目录，对应 Web 端【开发文档】主页签；
+       - 严禁使用 `development-items.md`、`dev.md`、`dev-plan.md`、`task-items.md` 等别名。
+     - **节点工作文档严格命名**：
+       - 每个 task 节点根目录下的核心文档必须以节点 ID 命名（即 `nodes/<node_id>/<node_id>.md`），严禁使用 `node.md`，否则工作流执行引擎将直接阻断拦截。
+     - 测试命令由执行该节点的 Agent 根据项目和任务材料自行确定并运行，工作流不提供 `command` 配置。`result_rule = "verification"` 的节点不修改业务代码，必须生成 `outputs/test_report.json`，格式见任务包规范。
+2. **打包前自检硬门禁（Pre-Flight Verification / 门禁 0）**：
+   在向用户发起上传授权前，**必须执行确定性本地校验**：
+   - [ ] 检查根目录 `requirements.md` 存在且非空；
+   - [ ] 检查根目录 `development.md` 存在且非空；
+   - [ ] 检查 `nodes/` 目录下所有 task 节点的 `<node_id>.md` 存在且非空（文件名与节点 ID 1:1 严格一致，严禁 `node.md`）；
+   - [ ] 检查 `manifest.json` 符合极简定义，无冗余未定义字段；
+   - **自检未全部通过前，严禁进入门禁 1 向用户申请上传！**
+3. **三道硬门禁守护**：
    - **门禁 1（对话授权）**：向用户展示本地任务包路径、工单 DAG、各节点材料分配与阻塞项，**请求用户明确同意上传该版本到工作台**；未获授权绝不上传。
-   - **门禁 2（Web 手动启动）**：通过工作台 MCP 工具 `workbench_stage_package`（`source.mode = "local_path"`）与 `workbench_finalize_package` 上传冻结，返回任务链接或 ID。提示用户在 Web 端手动点击启动，严禁自动调用启动接口。
+   - **门禁 2（Web 手动启动）**：通过工作台 MCP 单一提交工具 `workbench_submit_task`（传入 `package_root` 本地绝对路径，可选 `task_id`）上传归档，状态置为 `pending_confirm`，返回任务链接或 ID。提示用户在 Web 端手动点击确认启动，严禁自动调用启动接口（除非用户在对话中明确指令立即启动/推送）。
    - **门禁 3（人工审核）**：若所选工作流包含人工节点，由用户在 Web 端核验并决定通过或退回；实际执行顺序和返工路径遵循所选工作流。
 
 ---
