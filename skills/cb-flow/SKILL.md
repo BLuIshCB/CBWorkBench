@@ -1,6 +1,6 @@
 ---
 name: cb-flow
-description: 为开发工作台准备或修订任务包：先询问用户采用哪个工作流，再按该工作流各节点的提示词、职责与流转设计方案和 Markdown 材料；展示完整材料并经用户同意后通过工作台 MCP 上传，不启动任务。
+description: 为 CBWorkBench 准备或修订任务包。确认用户选择的工作流，按节点职责生成需求文档和每个节点的 prompt.md。展示材料并获授权后提交，等待用户在工作台手动启动。
 ---
 
 # cb-flow
@@ -84,7 +84,9 @@ flowchart TD
 
 ## 阶段三：Worker 提示词编排与审查规范注入 (`implement` / `/code-review`)
 
-为每个任务节点生成 `nodes/<dir_name>/prompt.md`，保留编排时填写的提示词要求并补充本次任务内容。以下 `implement` 与 `/code-review` 纪律只用于承担开发修改的 Agent 节点；只读验收节点使用审查约束，人工节点使用核验指引，其他节点按实际职责设计，不能全部套用开发流程：
+按[任务包与节点模板](references/task-package.md)为每个任务节点生成非空的 `nodes/<节点ID>/prompt.md`。以工作流已有要求为基础，写清本次职责、步骤、证据和完成条件。工作台会在运行时提供本次 MCP 完成命令。按照实际失败连线，在可能退回上游的自动节点提示词中写明需要交接的问题、修改要求与复验条件。人工节点使用人工核验模板。
+
+以下开发步骤用于承担代码修改的节点：
 
 1. **全新会话隔离与上下文即丢**：
    - 明确声明 Worker 在全新独立窗口中执行对应 Ticket，不预设上一张票的会话记忆；当前票交付后其上下文即可丢弃。
@@ -103,38 +105,10 @@ flowchart TD
 
 ## 阶段四：任务包冻结、用户审阅与工作台 MCP 上传
 
-1. **统一任务包结构（唯一当前协议，不兼容历史版本）**：
-   - 沿用用户已选工作流，生成前核对完整节点定义未变化。
-   - 彻底废除 1.0/2.0 双版本区分与一切历史兼容字段；统一按当前标准规范在当前项目 `.cb-flow/<task-key>/rNN/` 下组织：
-     - **标准极简目录布局**：
-       ```text
-       rNN/
-         manifest.json              # 任务元数据清单 (title, workflow_id, target_cwd, 可选 task_key/budget/timeout)
-         requirements.md            # 必须且非空：需求清单（全局需求说明、验收基线与边界约束）
-         development.md             # 必须且非空：开发清单（架构方案、Tracer-Bullet 工单 DAG、验证命令）
-         nodes/
-           <node_id>/               # 严格且仅覆盖工作流中的所有 task 节点
-             <node_id>.md           # 必须且非空：必须以节点 ID 命名（如 development.md, task.md），严禁命名为 node.md！
-             prompt.md              # 可选：给该节点的独立提示词（缺省沿用工作流模板预设）
-       ```
-     - **强制全局双基线清单**：
-       - `requirements.md`：必须位于根目录，对应 Web 端【需求文档】主页签；
-       - `development.md`：必须位于根目录，对应 Web 端【开发文档】主页签；
-       - 严禁使用 `development-items.md`、`dev.md`、`dev-plan.md`、`task-items.md` 等别名。
-     - **节点工作文档严格命名**：
-       - 每个 task 节点根目录下的核心文档必须以节点 ID 命名（即 `nodes/<node_id>/<node_id>.md`），严禁使用 `node.md`，否则工作流执行引擎将直接阻断拦截。
-     - 测试命令由执行该节点的 Agent 根据项目和任务材料自行确定并运行，工作流不提供 `command` 配置。`result_rule = "verification"` 的节点不修改业务代码，必须生成 `outputs/test_report.json`，格式见任务包规范。
-2. **打包前自检硬门禁（Pre-Flight Verification / 门禁 0）**：
-   在向用户发起上传授权前，**必须执行确定性本地校验**：
-   - [ ] 检查根目录 `requirements.md` 存在且非空；
-   - [ ] 检查根目录 `development.md` 存在且非空；
-   - [ ] 检查 `nodes/` 目录下所有 task 节点的 `<node_id>.md` 存在且非空（文件名与节点 ID 1:1 严格一致，严禁 `node.md`）；
-   - [ ] 检查 `manifest.json` 符合极简定义，无冗余未定义字段；
-   - **自检未全部通过前，严禁进入门禁 1 向用户申请上传！**
-3. **三道硬门禁守护**：
-   - **门禁 1（对话授权）**：向用户展示本地任务包路径、工单 DAG、各节点材料分配与阻塞项，**请求用户明确同意上传该版本到工作台**；未获授权绝不上传。
-   - **门禁 2（Web 手动启动）**：通过工作台 MCP 单一提交工具 `workbench_submit_task`（传入 `package_root` 本地绝对路径，可选 `task_id`）上传归档，状态置为 `pending_confirm`，返回任务链接或 ID。提示用户在 Web 端手动点击确认启动，严禁自动调用启动接口（除非用户在对话中明确指令立即启动/推送）。
-   - **门禁 3（人工审核）**：若所选工作流包含人工节点，由用户在 Web 端核验并决定通过或退回；实际执行顺序和返工路径遵循所选工作流。
+1. 核对所选工作流的定义与实时材料契约，按[任务包与节点模板](references/task-package.md)在 `.cb-flow/<task-key>/rNN/` 组装冻结材料。返工文档由运行节点按次提交，任务包阶段只准备初始材料。
+2. 展示材料前检查 `manifest.json` 字段、非空的 `requirements.md` 和各任务节点的非空 `prompt.md`。节点目录与所选工作流一一对应。开发文档、节点同名说明和节点附件按需填写。
+3. 向用户展示本地路径、完整材料和待确认事项，取得该版本的上传授权后调用 `workbench_submit_task`。传入绝对 `package_root`，修订已有任务时同时传入 `task_id`。
+4. 以 MCP 返回的任务 ID 或链接结束交付，提示用户在 Web 端确认启动。若工作流包含人工节点，由用户在页面提交通过或退回意见。
 
 ---
 

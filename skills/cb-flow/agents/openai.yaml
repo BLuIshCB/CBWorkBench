@@ -1,4 +1,4 @@
 interface:
   display_name: "cb-flow"
-  short_description: "先询问采用哪个工作流，再按节点提示词设计方案与任务材料"
-  default_prompt: "使用 $cb-flow，先询问我采用哪个工作流，待我选择后读取各节点提示词并逐节点设计方案和 Markdown 任务材料；展示完整材料并经我同意后再通过 MCP 上传，等待我在工作台手动启动。"
+  short_description: "按选定工作流编写需求和各节点提示词，确认后提交任务包"
+  default_prompt: "使用 $cb-flow，先确认我选用的工作流，再生成需求文档和各节点的 prompt.md。展示材料并经我同意后提交任务包，等待我在工作台手动启动。"
