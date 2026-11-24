@@ -45,6 +45,8 @@ export const api = {
   getTaskDetail: (taskId) => request(`/api/tasks/${encodeURIComponent(taskId)}`),
   getRevisionResource: (taskId, revision, resourcePath, offset = 0, limit = 262144) =>
     request(`/api/tasks/${encodeURIComponent(taskId)}/revisions/${encodeURIComponent(revision)}/resource?path=${encodeURIComponent(resourcePath)}&offset=${offset}&limit=${limit}`),
+  getReworkResource: (taskId, revision, nodeId, sequence) =>
+    request(`/api/tasks/${encodeURIComponent(taskId)}/revisions/${revision}/rework/${sequence}?node=${encodeURIComponent(nodeId)}`),
   confirmStartTask: (taskId, body) => request(`/api/tasks/${encodeURIComponent(taskId)}/confirm-start`, {
     method: 'POST',
     body: JSON.stringify(body),

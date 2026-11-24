@@ -111,7 +111,8 @@ export function renderMarkdown(md) {
   text = text.replace(/\*([^\*\n]+)\*/g, '<em>$1</em>');
 
   // 8. 链接
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color: #58a6ff;">$1</a>');
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) =>
+    /^https?:\/\//i.test(href) ? `<a href="${href}" target="_blank" rel="noopener" style="color: #58a6ff;">${label}</a>` : label);
 
   // 9. Markdown 表格转换
   text = text.replace(/((?:^\|.+?\|\s*$\n?)+)/gm, (tableMatch) => {

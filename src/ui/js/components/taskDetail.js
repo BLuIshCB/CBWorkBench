@@ -454,9 +454,9 @@ export const TaskDetail = {
             <label class="form-label" style="font-weight: 600; color: #1e293b;">
               📋 节点提示词 (Prompt)
             </label>
-            <div class="node-prompt-box">${escapeHtml(node.prompt || node.description || '(该节点未配置独立提示词)')}</div>
+            <button type="button" class="btn btn-sm btn-secondary" onclick="app.openSelectedNodeMaterials()">查看节点文档</button>
             <small class="form-hint" style="color: var(--text-muted); font-size: 11px;">
-              该提示词在执行时连同隔离任务材料共同注入 CLI 上下文。
+              查看冻结的 prompt.md 和本节点收到的返工记录。
             </small>
           </div>
 
@@ -526,7 +526,7 @@ export const TaskDetail = {
                   <div style="padding: 8px 10px; border: 1px solid var(--surface-border); border-radius: 6px; background: #ffffff; font-size: 11px;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
                       <span><strong>#${nr.execution_index}</strong> (第 ${nr.round_number} 轮)</span>
-                      <span class="badge ${nr.status === 'passed' ? 'badge-completed' : nr.status === 'failed' ? 'badge-blocked' : 'badge-running'}">${nr.status}</span>
+                      <span class="badge ${nr.status === 'passed' ? 'badge-completed' : nr.status === 'failed' ? 'badge-blocked' : 'badge-running'}">${nr.status === 'running' && nr.request_id ? '结果已提交，等待 CLI 退出' : nr.status}</span>
                     </div>
                     <div style="display: flex; gap: 12px; color: var(--text-muted); font-size: 11px; margin-bottom: 2px;">
                       <span>⏱️ 耗时: <b style="color: #0f172a;">${durationStr}</b></span>
@@ -564,123 +564,84 @@ export const TaskDetail = {
 
   renderMaterialsTabs(materialsData, activeSubtab, activeResourcePath) {
     const subtabsEl = document.getElementById('material-subtabs');
+    const nodesEl = document.getElementById('material-node-nav');
     const navEl = document.getElementById('material-resource-nav');
     const contentEl = document.getElementById('mat-rendered-content');
-    if (!subtabsEl || !navEl || !contentEl) return;
+    if (!subtabsEl || !nodesEl || !navEl || !contentEl) return;
 
-    const { task, packageFiles, taskWorkflow } = materialsData;
-    const allFiles = packageFiles || [];
-
-    // 解析任务工作流的任务节点
-    let wfNodes = [];
+    const { task, packageFiles = [], taskWorkflow, reworkDocuments = [] } = materialsData;
+    let nodes = [];
     try {
-      wfNodes = JSON.parse(taskWorkflow?.nodes_json || '[]');
+      nodes = JSON.parse(taskWorkflow?.nodes_json || '[]').filter(node => node.type === 'task');
     } catch {}
-    const taskNodes = wfNodes.filter((n) => n.type === 'task');
-
-    // 若工作流节点为空，尝试从材料包的节点归属中推断
-    const discoveredNodeIds = [...new Set(allFiles.filter((f) => f.owner_scope === 'node' && f.owner_node_id).map((f) => f.owner_node_id))];
-
-    const nodeTabs = taskNodes.length > 0
-      ? taskNodes.map((n) => {
-          const rawName = n.name || n.id;
-          const label = rawName.startsWith('节点：') ? rawName : `节点：${rawName}`;
-          return {
-            id: `node:${n.id}`,
-            label,
-            nodeId: n.id,
-          };
-        })
-      : discoveredNodeIds.map((nid) => {
-          const label = nid.startsWith('节点：') ? nid : `节点：${nid}`;
-          return {
-            id: `node:${nid}`,
-            label,
-            nodeId: nid,
-          };
-        });
-
-    // 固定前两主页签为「需求文档」和「开发文档」，随后各节点专属文档页签
-    const tabs = [
-      { id: 'requirements', label: '需求文档' },
-      { id: 'development', label: '开发文档' },
-      ...nodeTabs,
-    ];
-
-    const effectiveSubtab = tabs.some((t) => t.id === activeSubtab) ? activeSubtab : 'requirements';
-
-    subtabsEl.innerHTML = tabs
-      .map(
-        (t) =>
-          `<button class="mat-subtab-btn ${t.id === effectiveSubtab ? 'active' : ''}" onclick="app.setMaterialSubtab('${escapeHtml(t.id)}')">${escapeHtml(t.label)}</button>`
-      )
-      .join('');
-
-    // 1. 需求文档页签
-    if (effectiveSubtab === 'requirements') {
-      navEl.style.display = 'none';
-      const reqFile = allFiles.find(
-        (f) => f.path === 'requirements.md' || f.path === 'shared/requirements.md' || f.path.endsWith('/requirements.md')
-      );
-      if (reqFile) {
-        window.app.loadMaterialResource(task.id, task.revision, reqFile.path);
-      } else {
-        contentEl.innerHTML = '<p style="color: var(--text-muted); padding: 16px;">当前任务包中未找到需求文档 (requirements.md)。</p>';
+    if (!nodes.length) {
+      const ids = new Set(packageFiles.filter(file => file.owner_node_id).map(file => file.owner_node_id));
+      nodes = [...ids].map(id => ({ id, name: id }));
+    }
+    const viewingNodes = activeSubtab !== 'requirements';
+    const node = !viewingNodes ? null
+      : nodes.find(item => activeSubtab === `node:${item.id}`) || nodes[0];
+    const tabButton = (value, label, selected) =>
+      `<button type="button" data-value="${escapeHtml(value)}" class="mat-subtab-btn ${selected ? 'active' : ''}" aria-pressed="${selected}">${escapeHtml(label)}</button>`;
+    const bindButtons = (element, select) => {
+      for (const button of element.querySelectorAll('button[data-value]')) {
+        button.addEventListener('click', () => select(button.dataset.value));
       }
+    };
+
+    subtabsEl.innerHTML = tabButton('requirements', '需求文档', !viewingNodes)
+      + tabButton(nodes.length ? `node:${node?.id || nodes[0].id}` : 'nodes', '节点文档', viewingNodes);
+    bindButtons(subtabsEl, value => window.app.setMaterialSubtab(value));
+
+    nodesEl.hidden = !node;
+    nodesEl.innerHTML = node ? nodes.map(item => tabButton(`node:${item.id}`, item.name || item.id, node.id === item.id)).join('') : '';
+    bindButtons(nodesEl, value => window.app.setMaterialSubtab(value));
+
+    if (viewingNodes && !node) {
+      navEl.hidden = true;
+      window.app.activeMaterialRequest = null;
+      contentEl.innerHTML = '<p class="material-empty">暂无节点文档。</p>';
       return;
     }
 
-    // 2. 开发文档页签
-    if (effectiveSubtab === 'development') {
-      navEl.style.display = 'none';
-      const devFile = allFiles.find(
-        (f) => f.path === 'development.md' || f.path === 'shared/development.md' || f.path.endsWith('/development.md')
-      );
-      if (devFile) {
-        window.app.loadMaterialResource(task.id, task.revision, devFile.path);
-      } else {
-        contentEl.innerHTML = '<p style="color: var(--text-muted); padding: 16px;">当前任务包中未找到开发文档 (development.md)。</p>';
-      }
+    const requiredPath = node ? `nodes/${node.id}/prompt.md` : 'requirements.md';
+    const frozenFiles = node
+      ? packageFiles.filter(file => file.owner_scope === 'node' && file.owner_node_id === node.id)
+      : packageFiles.filter(file => file.owner_scope === 'shared' && file.path !== 'manifest.json');
+    const primary = frozenFiles.find(file => file.path === requiredPath || (!node && /^(shared\/)(resources\/)?requirements\.md$/.test(file.path)));
+    const attachments = frozenFiles.filter(file => file !== primary);
+    const runtimeFiles = node ? reworkDocuments.filter(file => file.target_node_id === node.id).map(file => ({
+      ...file,
+      path: `rework:${file.sequence}`,
+      name: `rework-prompt-${String(file.sequence).padStart(2, '0')}.md`,
+    })) : [];
+    const candidates = [...(primary ? [primary] : []), ...attachments, ...runtimeFiles];
+    const selected = candidates.find(file => file.path === activeResourcePath) || candidates[0];
+    const fileButton = (file, kind, label = file.path.split('/').pop()) =>
+      `<button type="button" data-value="${escapeHtml(file.path)}" class="material-file material-file-${kind} ${file === selected ? 'active' : ''}" aria-pressed="${file === selected}">${escapeHtml(label)}</button>`;
+    const group = (name, body) => `<div class="material-file-group"><span>${name}</span><div>${body}</div></div>`;
+    const runtimeGroup = node ? group('返工记录 · 运行时生成', runtimeFiles.length
+      ? runtimeFiles.map(file => fileButton(file, 'runtime', file.name)).join('')
+      : '<span class="material-empty">暂无返工文档</span>') : '';
+    navEl.hidden = false;
+    navEl.innerHTML = group('必需', primary ? fileButton(primary, 'required') : `<span class="material-empty">缺少 ${escapeHtml(requiredPath.split('/').pop())}</span>`)
+      + (attachments.length ? group('选填', attachments.map(file => fileButton(file, 'optional')).join('')) : '')
+      + runtimeGroup;
+    bindButtons(navEl, value => window.app.selectMaterialResource(value));
+
+    if (!selected) {
+      window.app.activeMaterialRequest = null;
+      contentEl.innerHTML = '<p class="material-empty">暂无可读材料。</p>';
       return;
     }
-
-    // 3. 节点文档页签 (<node_id>.md)
-    if (effectiveSubtab.startsWith('node:')) {
-      const nodeId = effectiveSubtab.slice('node:'.length);
-      const filesForNode = allFiles.filter((f) => f.owner_scope === 'node' && f.owner_node_id === nodeId);
-
-      if (filesForNode.length === 0) {
-        navEl.style.display = 'none';
-        contentEl.innerHTML = '<p style="color: var(--text-muted); padding: 16px;">该节点下暂无文档材料。</p>';
-        return;
-      }
-
-      // 优先匹配按照节点命名的文档: <node_id>.md，若无则查找非 prompt.md 的 markdown
-      const primaryDoc =
-        filesForNode.find((f) => f.path === `nodes/${nodeId}/${nodeId}.md` || f.path.endsWith(`/${nodeId}.md`)) ||
-        filesForNode.find((f) => f.path.endsWith('.md') && !f.path.endsWith('prompt.md')) ||
-        filesForNode[0];
-
-      const selectedPath =
-        activeResourcePath && filesForNode.some((f) => f.path === activeResourcePath)
-          ? activeResourcePath
-          : primaryDoc.path;
-
-      if (filesForNode.length > 1) {
-        navEl.style.display = 'flex';
-        navEl.innerHTML = filesForNode
-          .map((f) => {
-            const fileName = f.path.split('/').pop();
-            const isActive = f.path === selectedPath;
-            return `<button class="btn btn-sm ${isActive ? 'btn-primary' : 'btn-secondary'}" onclick="app.selectMaterialResource('${escapeHtml(f.path)}')">${escapeHtml(fileName)}</button>`;
-          })
-          .join('');
-      } else {
-        navEl.style.display = 'none';
-      }
-
-      window.app.loadMaterialResource(task.id, task.revision, selectedPath);
-      return;
+    if (selected.sequence !== undefined) {
+      const source = nodes.find(item => item.id === selected.source_node_id);
+      const sourceRun = materialsData.workflowNodeRuns?.find(run => run.run_id === selected.source_run_id);
+      window.app.loadMaterialResource(task.id, task.revision, selected.path, {
+        ...selected, sourceName: source?.name || selected.source_node_id, executionIndex: sourceRun?.execution_index,
+      });
+    } else {
+      window.app.loadMaterialResource(task.id, task.revision, selected.path);
     }
   },
 };

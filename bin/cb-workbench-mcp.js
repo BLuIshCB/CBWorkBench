@@ -54,7 +54,7 @@ if (hasSqlite) {
     }
 
     const { startMcpServer } = await import('../src/server/mcpServer.ts');
-    await startMcpServer();
+    await startMcpServer(process.argv.includes('--mcp-advance'));
   } catch (err) {
     console.error('[CBWorkBench MCP] Fatal error starting MCP server:', err?.message || err);
     process.exit(1);

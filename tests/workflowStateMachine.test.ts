@@ -10,8 +10,13 @@ import { packageService } from '../src/services/packageService.ts';
 import { adapterRegistry } from '../src/adapters/registry.ts';
 import { MANDATORY_CLI_POLICY } from '../src/adapters/types.ts';
 import { TaskStatus } from '../src/config/constants.ts';
+import { createHttpServer } from '../src/server/httpServer.ts';
 import { computeWorkflowDefinitionSha256, type WorkflowNode } from '../src/services/workflowDefinition.ts';
-import { runVerificationAgent } from './fixtures/verificationAgent.ts';
+import { passedAcceptanceFixture, readFixtureRuntime, reportFixtureCompletion, runVerificationAgent } from './fixtures/verificationAgent.ts';
+
+const developmentPrompts: string[] = [];
+let waitToExit: Promise<void> | undefined;
+let checkOmittedDocument = false;
 
 console.log('[Test] Running workflowStateMachine.test.ts...');
 
@@ -37,53 +42,41 @@ adapterRegistry.register({
     if (verification) return verification;
     if (context.kind === 'reviewer') {
       acceptanceCallCount++;
-      if (acceptanceDecision === 'needs_changes') {
-        return {
-          ok: true,
-          output: JSON.stringify({
-            decision: 'needs_changes',
-            revision: 1,
-            summary: 'Need bugfix on round ' + acceptanceCallCount,
-            criteriaResults: [{ id: 'C1', passed: false, evidence: 'Bug found' }],
-            issues: [{ id: 'ISSUE-1', description: 'Bug in logic' }],
-            manualChecksPending: [],
-          }),
-          durationMs: 5,
-          modelUsed: 'default',
-        };
-      }
-      return {
-        ok: true,
-        output: JSON.stringify({
-          decision: 'passed',
-          revision: 1,
-          summary: 'All checks passed',
-          criteriaResults: [{ id: 'C1', passed: true, evidence: 'Verified' }],
-          issues: [],
-          manualChecksPending: [],
-        }),
-        durationMs: 5,
-        modelUsed: 'default',
+      const needsChanges = acceptanceDecision === 'needs_changes';
+      const summary = needsChanges ? 'Need bugfix on round ' + acceptanceCallCount : 'All checks passed';
+      const report = {
+        outcome: needsChanges ? 'failed' as const : 'passed' as const,
+        summary,
+        acceptance: needsChanges ? {
+          decision: 'needs_changes', summary,
+          criteriaResults: [{ id: 'C1', passed: false, evidence: 'Bug found' }],
+          issues: [{ id: 'ISSUE-1', description: 'Bug in logic' }], manualChecksPending: [],
+        } : passedAcceptanceFixture,
+        rework: needsChanges ? [summary, '复验条件 ' + acceptanceCallCount] : [],
       };
+      if (needsChanges && checkOmittedDocument) {
+        const runtime = readFixtureRuntime(context);
+        const file = path.join(runtime.paths.outputs_dir, 'rework', 'omitted.md');
+        fs.writeFileSync(file, '此文档未声明', 'utf8');
+        await assert.rejects(reportFixtureCompletion(context, report), /omitted\.md/);
+        assert.equal(db.getLatestNodeRun(runtime.task_id, 'acceptance')?.request_id, null);
+        fs.unlinkSync(file);
+        checkOmittedDocument = false;
+      }
+      await reportFixtureCompletion(context, report);
     } else {
       devCallCount++;
       if (devFailWithCrash) {
         return {
-          ok: false,
-          output: 'Process exited with signal SIGSEGV',
-          error: 'Process crashed with segmentation fault',
-          errorCode: 'EXECUTION',
-          durationMs: 5,
-          modelUsed: 'default',
+          ok: false, output: 'Process exited with signal SIGSEGV', error: 'Process crashed with segmentation fault',
+          errorCode: 'EXECUTION', durationMs: 5, modelUsed: 'default',
         };
       }
-      return {
-        ok: true,
-        output: 'Developer finished implementation for round ' + devCallCount,
-        durationMs: 5,
-        modelUsed: 'default',
-      };
+      developmentPrompts.push(context.prompt);
+      await reportFixtureCompletion(context);
+      if (waitToExit) await waitToExit;
     }
+    return { ok: true, output: '任意最终回复', durationMs: 5, modelUsed: 'default' };
   },
 });
 
@@ -145,11 +138,19 @@ acceptanceDecision = 'passed';
 devFailWithCrash = false;
 
 const task1 = createFixtureTask();
+let releaseCli: () => void;
+waitToExit = new Promise<void>(resolve => { releaseCli = resolve; });
 const start1 = await workflowEngine.confirmAndStartTask(task1, undefined, {
   workerExecutor: 'sm-fixture',
   reviewerExecutor: 'sm-fixture',
 });
 assert.strictEqual(start1.success, true);
+
+await waitFor(() => Boolean(db.getLatestNodeRun(task1, 'development')?.request_id));
+assert.equal(db.getTaskWorkflow(task1)?.current_node_id, 'development');
+assert.equal(db.getNodeRuns(task1, 'test').length, 0);
+releaseCli!();
+waitToExit = undefined;
 
 await waitFor(() => db.getTask(task1)?.status === TaskStatus.HUMAN_REVIEW);
 assert.strictEqual(devCallCount, 1);
@@ -171,6 +172,7 @@ console.log('  ✓ Test 1: Full happy path completed to end node with unified re
 devCallCount = 0;
 acceptanceCallCount = 0;
 acceptanceDecision = 'needs_changes';
+checkOmittedDocument = true;
 
 const task2 = createFixtureTask();
 await workflowEngine.confirmAndStartTask(task2, undefined, {
@@ -186,6 +188,22 @@ assert.strictEqual(devCallCount, 2);
 assert.strictEqual(acceptanceCallCount, 2);
 
 const wfRecord2 = db.getTaskWorkflow(task2);
+assert.deepEqual(db.listReworkDocuments(task2, 1).map(file => file.sequence), [1, 2]);
+assert.ok(developmentPrompts.at(-1)?.includes('rework-prompt-01.md'));
+assert.ok(developmentPrompts.at(-1)?.includes('复验条件 1'));
+assert.equal(db.getPendingReworkDocuments(task2, 1, 'development').length, 0);
+const materialsServer = createHttpServer();
+await new Promise<void>(resolve => materialsServer.listen(0, '127.0.0.1', resolve));
+try {
+  const base = `http://127.0.0.1:${(materialsServer.address() as { port: number }).port}/api/tasks/${task2}`;
+  const detail = await (await fetch(base)).json();
+  assert.deepEqual(detail.reworkDocuments.map(file => file.sequence), [1, 2]);
+  assert.equal(detail.workflowNodeRuns[0].completion_token, undefined);
+  const document = await (await fetch(base + '/revisions/1/rework/2?node=development')).json();
+  assert.deepEqual(document.resource, { path: 'rework-prompt-02.md', content: '复验条件 1', encoding: 'utf-8' });
+} finally {
+  await new Promise<void>(resolve => materialsServer.close(() => resolve()));
+}
 assert.strictEqual(wfRecord2?.code_generation, 2);
 assert.strictEqual(wfRecord2?.tests_passed_generation, 2);
 assert.strictEqual(wfRecord2?.acceptance_passed_generation, 2);
@@ -206,6 +224,8 @@ await waitFor(() => devCallCount >= 4, 15000);
 assert(devCallCount >= 4);
 acceptanceDecision = 'passed';
 await waitFor(() => db.getTask(task3)?.status === TaskStatus.HUMAN_REVIEW, 10000);
+assert.deepEqual(db.listReworkDocuments(task3, 1).slice(0, 6).map(file => file.sequence), [1, 2, 3, 4, 5, 6]);
+assert.ok(!developmentPrompts.at(-1)?.includes('Need bugfix on round 1'), '只有最新退回批次进入本次提示词');
 console.log('  ✓ Test 3: Unlimited node executions when max_executions=0');
 
 // Test 4: Running fault pauses into BLOCKED
@@ -222,6 +242,7 @@ await waitFor(() => db.getTask(task4)?.status === TaskStatus.BLOCKED);
 const task4Record = db.getTask(task4);
 assert.strictEqual(task4Record?.status, TaskStatus.BLOCKED);
 assert.strictEqual(devCallCount, 1);
+assert.equal(db.getLatestNodeRun(task4, 'development')?.reported_outcome, 'failed', 'CLI 崩溃时通过 MCP 补报');
 console.log('  ✓ Test 4: Running fault pauses into BLOCKED');
 
 for (const tid of [task1, task2, task3, task4]) {

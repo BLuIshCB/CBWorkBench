@@ -197,6 +197,12 @@ export class App {
     }
   }
 
+  openSelectedNodeMaterials() {
+    this.setDetailTab('materials');
+    this.setMaterialSubtab(`node:${TaskDetail.selectedNodeId}`);
+    document.getElementById('dtab-materials')?.scrollIntoView({ block: 'start' });
+  }
+
   selectMaterialResource(resourcePath) {
     store.setState({ currentResourcePath: resourcePath });
     const currentDetail = store.getState().currentTaskDetail;
@@ -217,16 +223,20 @@ export class App {
     }
   }
 
-  async loadMaterialResource(taskId, revision, resourcePath) {
+  async loadMaterialResource(taskId, revision, resourcePath, rework) {
     const contentEl = document.getElementById('mat-rendered-content');
     if (!contentEl) return;
 
-    const cacheKey = `${taskId}:r${revision}:${resourcePath}`;
+    const cacheKey = `${taskId}:r${revision}:${rework ? rework.target_node_id + ':' : ''}${resourcePath}`;
+    this.activeMaterialRequest = cacheKey;
     let res = this.resourceCache.get(cacheKey);
     if (!res) {
       contentEl.innerHTML = '<div style="color: var(--text-muted); padding: 16px;">正在读取材料文件...</div>';
       try {
-        const fetched = await api.getRevisionResource(taskId, revision, resourcePath, 0, 262144);
+        const fetched = rework
+          ? await api.getReworkResource(taskId, revision, rework.target_node_id, rework.sequence)
+          : await api.getRevisionResource(taskId, revision, resourcePath, 0, 262144);
+        if (this.activeMaterialRequest !== cacheKey) return;
         if (!fetched.success || !fetched.resource) {
           contentEl.innerHTML = `<div class="alert alert-blocked">读取文件失败: ${escapeHtml(fetched.message || '未知错误')}</div>`;
           return;
@@ -238,16 +248,20 @@ export class App {
         }
         this.resourceCache.set(cacheKey, res);
       } catch (e) {
+        if (this.activeMaterialRequest !== cacheKey) return;
         contentEl.innerHTML = `<div class="alert alert-blocked">读取文件异常: ${escapeHtml(e.message)}</div>`;
         return;
       }
     }
 
-    const headerHtml = res.has_more
+    const reworkMeta = rework
+      ? `<div class="material-rework-meta">来源 ${escapeHtml(rework.sourceName)}${rework.executionIndex ? ` · 第 ${rework.executionIndex} 次执行` : ''} · ${escapeHtml(new Date(rework.created_at).toLocaleString())}</div>`
+      : '';
+    const headerHtml = reworkMeta + (res.has_more
       ? `<div style="font-size:12px; color:#d97706; margin-bottom:10px; padding:6px 10px; background:#fffbeb; border:1px solid #fde68a; border-radius:4px;">
            ⚠️ 文件内容过长，仅展示前半部分
          </div>`
-      : '';
+      : '');
 
     if (res.encoding === 'base64') {
       contentEl.innerHTML = `${headerHtml}<p style="color: var(--text-muted);">二进制资源文件</p>`;

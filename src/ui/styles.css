@@ -985,6 +985,76 @@ body {
   transition: all 0.2s ease;
 }
 
+.material-node-nav,
+.material-resource-nav {
+  margin-bottom: 12px;
+}
+
+.material-node-nav:not([hidden]) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.material-resource-nav:not([hidden]) {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  background: var(--surface-bg, #f8fafc);
+  border: 1px solid var(--surface-border);
+  border-radius: 6px;
+}
+
+.material-file-group {
+  display: grid;
+  grid-template-columns: minmax(7.5rem, max-content) 1fr;
+  align-items: start;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.material-file-group > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.material-file {
+  border: 1px solid var(--surface-border);
+  border-radius: 5px;
+  background: #f1f5f9;
+  color: #334155;
+  padding: 4px 8px;
+  overflow-wrap: anywhere;
+  text-align: left;
+  cursor: pointer;
+}
+
+.material-file-required {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  color: #1e40af;
+}
+
+.material-file-runtime {
+  background: #ecfdf5;
+  border-color: #6ee7b7;
+  color: #065f46;
+}
+
+.material-file.active {
+  box-shadow: inset 0 0 0 1px currentColor;
+  font-weight: 600;
+}
+
+.material-empty,
+.material-rework-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .mat-subtab-btn:hover {
   color: var(--text-main);
   background: #f1f5f9;

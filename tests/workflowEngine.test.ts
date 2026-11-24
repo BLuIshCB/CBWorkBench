@@ -10,7 +10,7 @@ import { computeWorkflowDefinitionSha256, type WorkflowNode } from '../src/servi
 import { TaskStatus, VERIFIER_DEFAULT_MODEL } from '../src/config/constants.ts';
 import { adapterRegistry } from '../src/adapters/registry.ts';
 import { MANDATORY_CLI_POLICY } from '../src/adapters/types.ts';
-import { runVerificationAgent } from './fixtures/verificationAgent.ts';
+import { passedAcceptanceFixture, reportFixtureCompletion, runVerificationAgent } from './fixtures/verificationAgent.ts';
 
 process.env.CB_MOCK_WORKBUDDY = 'true';
 process.env.CB_MOCK_CODEX = 'true';
@@ -21,7 +21,12 @@ adapterRegistry.register({
   id: 'engine-fixture', name: 'Engine fixture', description: 'Offline node execution',
   defaultModel: 'default', supportedModels: ['default'], connectionType: 'fixture', executionPolicy: MANDATORY_CLI_POLICY,
   async healthCheck() { return { healthy: true }; }, async abort() {},
-  async execute(context) { return await runVerificationAgent(context) || { ok: true, output: context.prompt, durationMs: 0, modelUsed: 'default' }; },
+  async execute(context) {
+    const verification = await runVerificationAgent(context);
+    if (verification) return verification;
+    await reportFixtureCompletion(context, { acceptance: context.kind === 'reviewer' ? passedAcceptanceFixture : undefined });
+    return { ok: true, output: '', durationMs: 0, modelUsed: 'default' };
+  },
 });
 
 function createCustomWorkflow(wfId: string) {
@@ -47,9 +52,7 @@ function submitV2Package(opts: { taskKey: string; wfId: string; wfSha: string; n
       const nodeDir = path.join(pkgRoot, 'nodes', n.id);
       fs.mkdirSync(nodeDir, { recursive: true });
       fs.writeFileSync(path.join(nodeDir, `${n.id}.md`), `# ${n.name}\n`, 'utf8');
-      if (n.id !== 'development') {
-        fs.writeFileSync(path.join(nodeDir, 'prompt.md'), `Execute ${n.id}\n`, 'utf8');
-      }
+      fs.writeFileSync(path.join(nodeDir, 'prompt.md'), `Execute ${n.id}\n`, 'utf8');
     }
     const manifest = {
       title: opts.taskKey,
@@ -132,7 +135,7 @@ assert.ok(approvedTask?.completed_at);
 const loopTaskId = submitV2Package({ taskKey: 'loop-task-v2', wfId: wfInfo.wfId, wfSha: wfInfo.sha, nodes: wfInfo.nodes, budgetMaxRounds: 1 });
 const startRes = await workflowEngine.confirmAndStartTask(loopTaskId, undefined, {
   workerExecutor: 'engine-fixture',
-  reviewerExecutor: 'codex',
+  reviewerExecutor: 'engine-fixture',
 });
 assert.strictEqual(startRes.success, true);
 
@@ -155,11 +158,12 @@ assert.strictEqual(humanReviewTask?.status, TaskStatus.HUMAN_REVIEW);
 assert.strictEqual(humanReviewTask?.current_round, 1);
 
 const devRound = db.getRounds(loopTaskId).find((r) => r.worker_id === 'development');
-assert.ok(devRound?.input_prompt?.includes('保留编排时的开发约束。'), '无 prompt.md 时回退使用工作流编排提示词');
-assert.ok(devRound?.input_prompt?.includes('# 开发实现'), '<node_id>.md 必须传入执行器');
+assert.ok(devRound?.input_prompt?.includes('Execute development'), '使用冻结的 prompt.md');
+assert.ok(devRound?.input_prompt?.includes('# 开发实现'), '已提供的节点说明传入执行器');
 
 const reworkRes = await workflowEngine.submitHumanDecision(loopTaskId, 'reject', 'Need more polish');
 assert.strictEqual(reworkRes.success, true);
+assert.deepEqual(db.getPendingReworkDocuments(loopTaskId, 1, 'development').map(file => file.content), ['Need more polish']);
 
 pollCount = 0;
 while (pollCount < 30) {

@@ -135,6 +135,7 @@ try {
   // 7. MCP advance report registration and idempotency
   // First set task to running so report is accepted
   testDb.updateTaskStatus('task-wf-1', TaskStatus.RUNNING);
+  testDb.updateTaskWorkflow('task-wf-1', { current_run_id: run1.run_id });
 
   const report1 = testDb.registerAdvanceReport(
     'task-wf-1',

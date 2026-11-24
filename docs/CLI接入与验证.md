@@ -1,6 +1,6 @@
 # 原生 CLI 对话接入
 
-工作台通过独立子进程调用 WorkBuddy、Codex 和 Antigravity，不经过 MCP/Desktop Bridge，不需要启动对应桌面客户端。三家共用 `IAgentAdapter.execute({ prompt, cwd, model, timeoutMs, taskId })`，不区分开发者或验收者能力。
+工作台通过独立子进程调用 WorkBuddy、Codex 和 Antigravity，无须启动对应桌面客户端。自动节点在 CLI 内执行 `complete-node` 调用工作台 MCP，收到回执后结束，工作台确认退出再切换节点。
 
 ## 本机使用
 
@@ -81,7 +81,7 @@ WorkBuddyAdapter / CodexAdapter / AntigravityAdapter
 NativeCliAdapter → CliRunner → 原生 CLI 进程
 ```
 
-Adapter 只处理厂商参数和输出协议。`CliRunner` 负责 UTF-8 管道、退出码、超时、取消、输出上限和进程回收。工作流需要验收时，由 `AcceptanceService` 构造验收提示词、解析和校验返回的业务 JSON，厂商 Adapter 不知道“验收者”角色。
+Adapter 处理厂商参数和日志输出。`CliRunner` 负责 UTF-8 管道、退出码、超时、取消、输出上限和进程回收。节点判定来自 MCP 回执，测试和验收分别读取节点输出的测试报告与验收报告。普通对话和探测仍检查厂商响应格式。
 
 按当前要求不设置沙箱，使用 CLI 的跳过交互审批参数：
 

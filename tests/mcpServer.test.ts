@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createWorkbenchMcpServer } from '../src/server/mcpServer.ts';
@@ -235,6 +237,7 @@ try {
   assert.ok(ctxData.resource.content.includes('Work for development'));
 
   // Simulate worker creating outputs and calling advance
+  db.updateTaskWorkflow(taskId, { current_node_id: 'development', current_run_id: mockAttempt });
   const outPath = path.join(runDir, 'outputs');
   fs.writeFileSync(path.join(outPath, 'dev_notes.md'), 'Dev done', 'utf8');
 
@@ -245,13 +248,30 @@ try {
       node_id: 'development',
       attempt_id: mockAttempt,
       completion_token: mockToken,
-      request_id: 'req-mcp-1',
+      request_id: `complete-${mockAttempt}`,
       outcome: 'passed',
       summary: 'MCP Agent 开发完成并通过',
     },
   });
   const advanceData = JSON.parse((advanceRes.content as any)[0].text);
   assert.strictEqual(advanceData.success, true);
+  const completionExe = process.env.CB_COMPLETION_TEST_EXE;
+  const completed = await promisify(execFile)(completionExe || process.execPath, [
+    ...(completionExe ? [] : [path.resolve('bin/cb-workbench.js')]),
+    'complete-node', '--context', path.join(runDir, 'context.json'),
+    '--outcome', 'passed', '--summary', 'MCP Agent 开发完成并通过',
+  ], { timeout: 30000, windowsHide: true });
+  assert.match(completed.stdout, /MCP 已受理节点结果/);
+  assert.equal(db.getTaskWorkflow(taskId)?.current_node_id, 'development');
+  const conflict = await client.callTool({
+    name: 'workbench_advance_workflow',
+    arguments: {
+      task_id: taskId, node_id: 'development', attempt_id: mockAttempt,
+      completion_token: 'invalid-token', request_id: `complete-${mockAttempt}`,
+      outcome: 'passed', summary: 'MCP Agent 开发完成并通过',
+    },
+  });
+  assert.equal(conflict.isError, true);
 
   // Stop task before revising (running task cannot be revised)
   db.updateTaskStatus(taskId, TaskStatus.CANCELLED);

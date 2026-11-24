@@ -112,7 +112,7 @@ function isInsideRealRoot(rootReal: string, targetReal: string): boolean {
  * Safely reads a regular file inside `rootDir` by walking every segment,
  * rejecting symlinks, Windows junctions/reparse points, and root escapes.
  */
-export function readRegularFileSafely(rootDir: string, relPath: string): Buffer {
+export function readRegularFileSafely(rootDir: string, relPath: string, maxBytes?: number): Buffer {
   const check = validatePackageRelativePath(relPath);
   if (!check.valid || !check.segments) {
     throw new PathSecurityError('INVALID_RESOURCE_PATH', `非法包内路径 [${relPath}]: ${check.reason}`, relPath);
@@ -151,6 +151,9 @@ export function readRegularFileSafely(rootDir: string, relPath: string): Buffer 
     if (isLast && !st.isFile()) {
       throw new PathSecurityError('INVALID_RESOURCE_PATH', `仅允许读取普通文件: ${relPath}`, relPath);
     }
+    if (isLast && maxBytes !== undefined && st.size > maxBytes) {
+      throw new PathSecurityError('SIZE_LIMIT_EXCEEDED', `文件超过 ${maxBytes} 字节: ${relPath}`, relPath);
+    }
   }
 
   const targetReal = fs.realpathSync(curr);
@@ -158,7 +161,11 @@ export function readRegularFileSafely(rootDir: string, relPath: string): Buffer 
     throw new PathSecurityError('PATH_ESCAPE', `文件路径解析后越界包根目录: ${relPath}`, relPath);
   }
 
-  return fs.readFileSync(curr);
+  const content = fs.readFileSync(curr);
+  if (maxBytes !== undefined && content.length > maxBytes) {
+    throw new PathSecurityError('SIZE_LIMIT_EXCEEDED', `文件超过 ${maxBytes} 字节: ${relPath}`, relPath);
+  }
+  return content;
 }
 
 export function isTextMediaType(mediaType: string, relPath: string): boolean {

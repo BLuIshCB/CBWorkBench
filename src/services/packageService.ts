@@ -131,7 +131,8 @@ export class PackageService {
       if (!existingTask) {
         throw new PackageProtocolError('TASK_NOT_FOUND', `未找到要修订的任务: ${taskId}`);
       }
-      if (workflowEngine.getActiveTaskId() === taskId) {
+      if (workflowEngine.getActiveTaskId() === taskId ||
+          [TaskStatus.RUNNING, TaskStatus.QUEUED].some(status => status === existingTask.status)) {
         throw new PackageProtocolError('TASK_RUNNING', `任务 ${taskId} 正在运行中，禁止替换材料`);
       }
       targetRevision = existingTask.revision + 1;
@@ -173,13 +174,17 @@ export class PackageService {
         target_cwd: manifest.target_cwd,
         budget_max_rounds: budgetMaxRounds,
         execution_timeout_ms: executionTimeoutMs,
+        current_round: 0,
+        current_stage: null,
+        active_worker_id: null,
+        completed_at: null,
+        blocked_reason: null,
+        stop_requested: 0,
       });
-      const startNode = wfDef.nodes.find((n) => n.type === 'start');
-      db.updateTaskWorkflow(taskId, {
-        workflow_id: wfDef.id,
-        workflow_sha256: wfSha,
-        nodes_json: JSON.stringify(wfDef.nodes),
-        current_node_id: startNode?.on_success || null,
+      db.initTaskWorkflow(taskId, {
+        workflowId: wfDef.id,
+        workflowSha256: wfSha,
+        nodesOverride: wfDef.nodes,
         revision: targetRevision,
       });
     }
@@ -319,7 +324,7 @@ export class PackageService {
     let mappedAttemptRel: string | null = null;
     if (reqPath === 'context.json') {
       mappedAttemptRel = 'context.json';
-    } else if (reqPath === context.rework_feedback_file) {
+    } else if (reqPath === context.rework_feedback_file || context.rework_prompt_files?.includes(reqPath)) {
       mappedAttemptRel = reqPath;
     } else if ((context.allowed_material_files as string[]).includes(reqPath)) {
       if (reqPath.startsWith(nodePrefix)) {

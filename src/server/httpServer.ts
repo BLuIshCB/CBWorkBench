@@ -14,6 +14,7 @@ import { runtimeService } from '../services/runtimeService.ts';
 import { packageService } from '../services/packageService.ts';
 import { taskCleanupService } from '../services/taskCleanupService.ts';
 import { PackageProtocolError } from '../services/packageProtocol.ts';
+import { reworkFileName } from '../services/nodeCompletion.ts';
 import {
   DATA_DIR,
   DATA_DIR_SOURCE,
@@ -378,6 +379,22 @@ export function createHttpServer(): http.Server {
         return;
       }
 
+      const reworkMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_-]+)\/revisions\/(\d+)\/rework\/(\d+)$/);
+      if (reworkMatch && method === 'GET') {
+        const [, taskId, revision, sequence] = reworkMatch;
+        const nodeId = url.searchParams.get('node') || '';
+        const document = taskCleanupService.isTaskDeleting(taskId)
+          ? undefined : db.getReworkDocument(taskId, Number(revision), nodeId, Number(sequence));
+        if (!document) {
+          sendJson(res, 404, { success: false, message: '未找到返工文档' });
+          return;
+        }
+        sendJson(res, 200, { success: true, resource: {
+          path: reworkFileName(document.sequence), content: document.content, encoding: 'utf-8',
+        } });
+        return;
+      }
+
       // Task detail
       const taskDetailMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)$/);
       if (taskDetailMatch && method === 'GET') {
@@ -415,7 +432,8 @@ export function createHttpServer(): http.Server {
         if (!taskWorkflow) {
           taskWorkflow = db.initTaskWorkflow(taskId, { revision: task.revision });
         }
-        const workflowNodeRuns = db.getNodeRuns(taskId);
+        const workflowNodeRuns = db.getNodeRuns(taskId).map(({ completion_token, ...run }) => run);
+        const reworkDocuments = db.listReworkDocuments(taskId, task.revision);
         const nodeExecutionCounts: Record<string, number> = {};
         if (taskWorkflow) {
           try {
@@ -440,6 +458,7 @@ export function createHttpServer(): http.Server {
           diffSnapshot,
           taskWorkflow,
           workflowNodeRuns,
+          reworkDocuments,
           nodeExecutionCounts,
         });
         return;

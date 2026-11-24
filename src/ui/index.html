@@ -171,7 +171,7 @@
 
       <!-- Tab Navigation for Detail Content -->
       <div class="detail-tabs">
-        <button class="dtab-btn active" onclick="app.setDetailTab('materials')">冻结任务材料阅读</button>
+        <button class="dtab-btn active" onclick="app.setDetailTab('materials')">冻结材料</button>
         <button class="dtab-btn" onclick="app.setDetailTab('workspace')">工作区基准与代码状态</button>
       </div>
 
@@ -181,7 +181,8 @@
           <div class="material-subtabs" id="material-subtabs" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid var(--surface-border); padding-bottom: 10px;">
             <!-- Dynamic tabs injected by TaskDetail -->
           </div>
-          <div id="material-resource-nav" style="display: none; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; padding: 8px 10px; background: #f8fafc; border: 1px solid var(--surface-border); border-radius: 6px;">
+          <div id="material-node-nav" class="material-node-nav" hidden aria-label="任务节点"></div>
+          <div id="material-resource-nav" class="material-resource-nav" hidden aria-label="材料文件">
             <!-- Dynamic file selector pills -->
           </div>
           <div class="markdown-body" id="mat-rendered-content" style="min-height: 240px; padding: 12px 16px;">

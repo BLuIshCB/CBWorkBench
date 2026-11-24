@@ -23,6 +23,26 @@ const reviewSchema = z.object({
   manualChecksPending: z.array(z.object({ id: nonEmpty, description: nonEmpty })),
 });
 
+export function parseReviewEvidence(raw: unknown, revision: number, nodeIds: string[]) {
+  const parsed = reviewSchema.parse(raw);
+  if (parsed.revision !== undefined && parsed.revision !== revision) {
+    throw new Error('Reviewer returned a different revision.');
+  }
+  if (nodeIds.length && parsed.issues.some(issue => issue.targetWorkerId && !nodeIds.includes(issue.targetWorkerId))) {
+    throw new Error('Reviewer returned an unknown node ID.');
+  }
+  if (new Set(parsed.criteriaResults.map(criterion => criterion.id)).size !== parsed.criteriaResults.length) {
+    throw new Error('Reviewer returned duplicate criterion IDs.');
+  }
+  if (parsed.decision === 'passed' &&
+      (!parsed.criteriaResults.length || parsed.criteriaResults.some(criterion => !criterion.passed) || parsed.issues.length)) {
+    throw new Error('Passed verdict contradicts acceptance evidence.');
+  }
+  return { ...parsed, revision };
+}
+
+export const reviewEvidenceExample = '{"decision":"passed|needs_changes|blocked","revision":1,"summary":"verdict","criteriaResults":[{"id":"criterion-id","passed":true,"evidence":"file:line or executed check"}],"issues":[{"id":"issue-id","description":"problem","evidence":"file:line"}],"manualChecksPending":[{"id":"check-id","description":"required human verification"}]}';
+
 /** 将结构化验收输出解析与契约校验从厂商 Adapter 中独立出来。 */
 export class AcceptanceService {
   async execute(adapter: IAgentAdapter, context: ReviewerExecutionContext): Promise<ReviewerExecutionResult> {
@@ -100,29 +120,7 @@ export class AcceptanceService {
           throw new Error('未找到有效的 JSON 判定内容');
         }
       }
-      const parsed = reviewSchema.parse(parsedJson);
-      if (parsed.revision !== undefined && parsed.revision !== context.revision) {
-        throw new Error('Reviewer returned a different revision.');
-      }
-      if (
-        parsed.issues.some(
-          (issue) =>
-            issue.targetWorkerId &&
-            (context.definedNodeIds?.length ?? 0) > 0 &&
-            !context.definedNodeIds.includes(issue.targetWorkerId)
-        )
-      ) {
-        throw new Error('Reviewer returned an unknown node ID.');
-      }
-      if (new Set(parsed.criteriaResults.map((c) => c.id)).size !== parsed.criteriaResults.length) {
-        throw new Error('Reviewer returned duplicate criterion IDs.');
-      }
-      if (
-        parsed.decision === 'passed' &&
-        (!parsed.criteriaResults.length || parsed.criteriaResults.some((c) => !c.passed) || parsed.issues.length)
-      ) {
-        throw new Error('Passed verdict contradicts acceptance evidence.');
-      }
+      const parsed = parseReviewEvidence(parsedJson, context.revision, context.definedNodeIds || []);
       return { ...parsed, ...base };
     } catch (error: any) {
       return {

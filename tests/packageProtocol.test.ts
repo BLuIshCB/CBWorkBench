@@ -11,7 +11,7 @@ import { adapterRegistry } from '../src/adapters/registry.ts';
 import { MANDATORY_CLI_POLICY } from '../src/adapters/types.ts';
 import { computeWorkflowDefinitionSha256, type WorkflowNode } from '../src/services/workflowDefinition.ts';
 import { TaskStatus } from '../src/config/constants.ts';
-import { runVerificationAgent } from './fixtures/verificationAgent.ts';
+import { reportFixtureCompletion, runVerificationAgent } from './fixtures/verificationAgent.ts';
 import { taskCleanupService } from '../src/services/taskCleanupService.ts';
 import { createHttpServer } from '../src/server/httpServer.ts';
 
@@ -53,6 +53,7 @@ adapterRegistry.register({
       const verification = await runVerificationAgent(ctx, verificationExitCode);
       if (verification) return verification;
     }
+    await reportFixtureCompletion(ctx);
     return { ok: true, output: 'docs written ok', durationMs: 5, modelUsed: 'default' };
   },
 });
@@ -65,16 +66,15 @@ function buildMinimalPackageDir(dirName: string, opts?: {
   omitRequirements?: boolean;
   emptyRequirements?: boolean;
   omitDevelopment?: boolean;
-  emptyDevelopment?: boolean;
   omitNodesDir?: boolean;
   omitWorkMdFor?: string;
-  emptyWorkMdFor?: string;
   bomOnRequirements?: boolean;
   extraNodeDir?: string;
   omitNodeDir?: string;
   controlNodeDir?: string;
   caseCollision?: boolean;
-  customPromptForWriteDocs?: boolean;
+  omitPromptFor?: string;
+  emptyPromptFor?: string;
   targetCwdOverride?: string;
   wfIdOverride?: string;
   longChineseText?: boolean;
@@ -103,8 +103,7 @@ function buildMinimalPackageDir(dirName: string, opts?: {
   }
 
   if (!opts?.omitDevelopment) {
-    const devContent = opts?.emptyDevelopment ? '   ' : '# 开发指南\n遵循单分支开发策略。\n';
-    fs.writeFileSync(path.join(pkgRoot, 'development.md'), devContent, 'utf8');
+    fs.writeFileSync(path.join(pkgRoot, 'development.md'), '# 开发指南\n遵循单分支开发策略。\n', 'utf8');
   }
 
   if (!opts?.omitNodesDir) {
@@ -117,13 +116,12 @@ function buildMinimalPackageDir(dirName: string, opts?: {
       const nd = path.join(nodesDir, nid);
       fs.mkdirSync(nd, { recursive: true });
       if (opts?.omitWorkMdFor !== nid) {
-        const wContent = opts?.emptyWorkMdFor === nid ? '   ' : `# 任务清单: ${nid}\n完成对应节点的工作。\n`;
-        fs.writeFileSync(path.join(nd, `${nid}.md`), wContent, 'utf8');
+        fs.writeFileSync(path.join(nd, `${nid}.md`), `# 任务清单: ${nid}\n完成对应节点的工作。\n`, 'utf8');
       }
-      if (nid === 'check_cmd') {
-        fs.writeFileSync(path.join(nd, 'prompt.md'), '自定义提示词：执行项目测试并捕获证据', 'utf8');
-      } else if (opts?.customPromptForWriteDocs) {
-        fs.writeFileSync(path.join(nd, 'prompt.md'), '自定义提示词：请编写完整的技术交付文档', 'utf8');
+      if (opts?.omitPromptFor !== nid) {
+        const prompt = nid === 'check_cmd' ? '自定义提示词：执行项目测试并捕获证据'
+          : '自定义提示词：请编写完整的技术交付文档';
+        fs.writeFileSync(path.join(nd, 'prompt.md'), opts?.emptyPromptFor === nid ? '  ' : prompt, 'utf8');
       }
     }
 
@@ -180,12 +178,11 @@ try {
     (e: any) => e instanceof PackageProtocolError && e.code === 'BOM_NOT_ALLOWED'
   );
 
-  // 5. Directory validation: missing development.md
+  // 5. Optional development.md
   const noDevPkg = buildMinimalPackageDir('no-dev', { omitDevelopment: true });
-  assert.throws(
-    () => packageService.submitTask({ package_root: noDevPkg }),
-    (e: any) => e instanceof PackageProtocolError && e.code === 'MISSING_FILE'
-  );
+  const noDevTask = packageService.submitTask({ package_root: noDevPkg });
+  createdTaskIds.push(noDevTask.task_id);
+  assert.ok(!db.getPackageFiles(noDevTask.task_id, 1).some(file => file.path === 'development.md'));
 
   // 6. Directory validation: missing nodes/ dir
   const noNodesPkg = buildMinimalPackageDir('no-nodes', { omitNodesDir: true });
@@ -215,15 +212,17 @@ try {
     (e: any) => e instanceof PackageProtocolError && e.code === 'NODE_COVERAGE_MISMATCH'
   );
 
-  // 10. Directory validation: missing <node_id>.md in a node directory
+  // 10. Optional node work document and required prompt
   const noWorkPkg = buildMinimalPackageDir('no-work', { omitWorkMdFor: 'write_docs' });
+  createdTaskIds.push(packageService.submitTask({ package_root: noWorkPkg }).task_id);
+  const noPromptPkg = buildMinimalPackageDir('no-prompt', { omitPromptFor: 'write_docs' });
   assert.throws(
-    () => packageService.submitTask({ package_root: noWorkPkg }),
-    (e: any) => e instanceof PackageProtocolError && e.code === 'MISSING_FILE'
+    () => packageService.submitTask({ package_root: noPromptPkg }),
+    (e: any) => e instanceof PackageProtocolError && e.code === 'MISSING_FILE' && e.message.includes('prompt.md')
   );
 
-  // 11. Directory validation: empty <node_id>.md in a node directory
-  const emptyWorkPkg = buildMinimalPackageDir('empty-work', { emptyWorkMdFor: 'write_docs' });
+  // 11. Blank prompt is rejected
+  const emptyWorkPkg = buildMinimalPackageDir('empty-prompt', { emptyPromptFor: 'write_docs' });
   assert.throws(
     () => packageService.submitTask({ package_root: emptyWorkPkg }),
     (e: any) => e instanceof PackageProtocolError && e.code === 'INVALID_MANIFEST_SCHEMA'
@@ -313,10 +312,7 @@ try {
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
   }
 
-  // 15. Execute workflow -> verify prompt fallback and custom prompt
-  // In goodPkg:
-  // - write_docs had NO prompt.md -> should fallback to currentNode.prompt ("平台预设提示词：认真编写文档")
-  // - check_cmd HAD prompt.md -> should use custom prompt ("自定义提示词：执行项目测试并捕获证据")
+  // 15. Execute workflow using frozen prompts.
   lastSeenPrompts = {};
   const startRes = await workflowEngine.confirmAndStartTask(taskId, undefined, {
     workerExecutor: 'pkg-fixture',
@@ -331,11 +327,11 @@ try {
   const taskState = db.getTask(taskId);
   assert.equal(taskState?.status, TaskStatus.COMPLETED);
 
-  assert.ok(lastSeenPrompts['write_docs'].includes('平台预设提示词：认真编写文档'), 'write_docs should fallback to platform default prompt');
+  assert.ok(lastSeenPrompts['write_docs'].includes('自定义提示词：请编写完整的技术交付文档'));
   assert.ok(lastSeenPrompts['write_docs'].includes('本节点具体工作 (write_docs.md)'), 'Prompt must contain write_docs.md');
   assert.ok(lastSeenPrompts['write_docs'].includes('开发文档 (development.md)'), 'Prompt must contain development.md');
   assert.ok(lastSeenPrompts['check_cmd'].includes('自定义提示词：执行项目测试并捕获证据'), 'check_cmd should use custom prompt.md');
-  console.log('  ✓ Prompt fallback to workflow default and prompt.md precedence verified');
+  console.log('  ✓ Frozen prompt.md used in both nodes');
 
   // 16. Missing execution evidence blocks verification node
   const noCmdWfId = `nocmd-wf-${Date.now()}`;
@@ -350,6 +346,7 @@ try {
   fs.writeFileSync(path.join(noCmdPkg, 'requirements.md'), '# Req\n', 'utf8');
   fs.writeFileSync(path.join(noCmdPkg, 'development.md'), '# Dev\n', 'utf8');
   fs.writeFileSync(path.join(noCmdPkg, 'nodes', 'cmd_only', 'cmd_only.md'), '# Work\n', 'utf8');
+  fs.writeFileSync(path.join(noCmdPkg, 'nodes', 'cmd_only', 'prompt.md'), '执行测试\n', 'utf8');
   fs.writeFileSync(
     path.join(noCmdPkg, 'manifest.json'),
     JSON.stringify({ title: 'No Cmd Test', workflow_id: noCmdWfId, target_cwd: process.cwd(), task_key: 'nocmd-test' }),

@@ -64,8 +64,14 @@ export abstract class NativeCliAdapter implements IAgentAdapter {
             if(Buffer.byteLength(line)>1048576) throw Object.assign(new Error('协议行超过1MiB'),{errorCode:'OUTPUT_LIMIT'});
             if(!line.trim())continue;
             if(this.id==='workbuddy')continue;
-            let event;try{event=JSON.parse(line);}catch{throw Object.assign(new Error('CLI JSONL 损坏'),{errorCode:'PROTOCOL'});}
-            if(!event || typeof event!=='object')throw Object.assign(new Error('CLI 协议事件不是对象'),{errorCode:'PROTOCOL'});
+            let event;try{event=JSON.parse(line);}catch{
+              if (context.completionByMcp) continue;
+              throw Object.assign(new Error('CLI JSONL 损坏'),{errorCode:'PROTOCOL'});
+            }
+            if(!event || typeof event!=='object') {
+              if (context.completionByMcp) continue;
+              throw Object.assign(new Error('CLI 协议事件不是对象'),{errorCode:'PROTOCOL'});
+            }
             if(this.id==='codex' && ['item.started','item.completed'].includes(event.type) && event.item?.type==='command_execution') {
               ExecutionService.event(runId,'progress',{text:event.type==='item.started'?'工具开始':'工具结束',toolName:'command_execution'});
             }
@@ -74,7 +80,7 @@ export abstract class NativeCliAdapter implements IAgentAdapter {
         },
         timeoutMs: context.timeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS,
       });
-      if (!result.timedOut && !result.cancelled && result.errorCode!=='OUTPUT_LIMIT' && /^(?:Error:\s*)?(?:authentication required|authentication failed|not authenticated|please (?:use \/login|log\s?in|sign in)|未登录|请(?:先)?登录)/im.test(`${result.stdout}\n${result.stderr}`)) {
+      if ((!context.completionByMcp || result.errorCode || result.exitCode !== 0) && !result.timedOut && !result.cancelled && result.errorCode!=='OUTPUT_LIMIT' && /^(?:Error:\s*)?(?:authentication required|authentication failed|not authenticated|please (?:use \/login|log\s?in|sign in)|未登录|请(?:先)?登录)/im.test(`${result.stdout}\n${result.stderr}`)) {
         await ExecutionService.finish(runId,'AUTH_REQUIRED',result.exitCode,true);
         return { ...base, runId, stopReason:'AUTH_REQUIRED', cleanupConfirmed:true, ok: false, output: result.stdout, error: `${this.name} 无法恢复登录态，请使用相同 CLI 配置完成登录后重试。`,
           errorCode: 'AUTH_REQUIRED', durationMs: result.durationMs };
@@ -89,8 +95,14 @@ export abstract class NativeCliAdapter implements IAgentAdapter {
           errorCode: result.errorCode || 'EXECUTION', timedOut: result.timedOut, durationMs: result.durationMs };
       }
       try {
-        const output = this.parseOutput(result.stdout);
-        if (typeof output !== 'string' || !output.trim()) throw new Error('CLI 返回空响应');
+        let output: string;
+        try {
+          output = this.parseOutput(result.stdout);
+          if (typeof output !== 'string' || !output.trim()) throw new Error('CLI 返回空响应');
+        } catch (error) {
+          if (!context.completionByMcp) throw error;
+          output = result.stdout;
+        }
         await ExecutionService.finish(runId,null,result.exitCode,true);
         return { ...base, runId, cleanupConfirmed:true, ok: true, output, durationMs: result.durationMs };
       } catch (error) {

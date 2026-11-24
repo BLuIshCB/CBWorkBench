@@ -3,6 +3,18 @@ import { execFile } from 'node:child_process';
 import { parseCliRuntimeArgs, resolveResidentServerForDataDir } from './config/dataDir.ts';
 
 async function main() {
+  if (process.argv[2] === 'complete-node') {
+    const { completeNode } = await import('./cli/completeNode.ts');
+    await completeNode(process.argv.slice(3));
+    return;
+  }
+  if (process.argv[2] === '--mcp-advance') {
+    process.env.MCP_MODE = 'true';
+    console.log = (...args) => console.error(...args);
+    const { startMcpServer } = await import('./server/mcpServer.ts');
+    await startMcpServer(true);
+    return;
+  }
   let cliArgs;
   try {
     cliArgs = parseCliRuntimeArgs(process.argv.slice(2));
@@ -27,6 +39,7 @@ async function main() {
   --portable                 启用便携模式，使用 EXE 所在目录/data
   --no-open                  启动后不自动在默认浏览器中打开页面
   --help, -h                 显示此帮助信息
+  complete-node              通过 MCP 提交当前节点执行结果
 `);
     process.exit(0);
   }
@@ -57,4 +70,7 @@ async function main() {
   }
 }
 
-main();
+main().catch(error => {
+  console.error(`[CBWorkBench] ${error.message}`);
+  process.exitCode = 1;
+});

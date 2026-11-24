@@ -160,7 +160,7 @@ export function buildUniformNodeMaterialContract(node: WorkflowNode): UniformNod
 
   return {
     node_dir: `nodes/${dirName}`,
-    node_ref: `nodes/${dirName}/node.md`,
+    node_ref: `nodes/${dirName}/${dirName}.md`,
     prompt_ref: `nodes/${dirName}/prompt.md`,
     resources_dir: `nodes/${dirName}/resources`,
     instruction_usage: instructionUsage,

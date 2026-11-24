@@ -27,6 +27,7 @@ import { packageService } from '../services/packageService.ts';
 import { taskCleanupService } from '../services/taskCleanupService.ts';
 import { executionTimeoutSchema } from '../services/executionPolicy.ts';
 import { encodeNodeDirName, PathSecurityError } from '../utils/pathSecurity.ts';
+import { advanceInputShape, reportNodeCompletion } from '../services/nodeCompletion.ts';
 
 function okJson(payload: Record<string, unknown>) {
   return {
@@ -132,11 +133,27 @@ async function verifyInstanceBindingIfConfigured(): Promise<string | null> {
   return active ? active.url : null;
 }
 
-export function createWorkbenchMcpServer(): McpServer {
+export function createWorkbenchMcpServer(advanceOnly = false): McpServer {
   const server = new McpServer({
     name: 'cb-workbench-mcp',
     version: '0.2.0',
   });
+
+  server.tool('workbench_advance_workflow',
+    '登记当前自动节点的执行结果。工作台在 CLI 正常退出后按工作流连线切换节点。',
+    advanceInputShape, async (args) => {
+      try {
+        const res = reportNodeCompletion(args);
+        if (!res.success) throw new PackageProtocolError('ADVANCE_REJECTED', res.message);
+        return okJson({
+          success: true, taskId: args.task_id, nodeId: args.node_id, attemptId: args.attempt_id,
+          requestId: args.request_id, duplicate: res.duplicate || false, message: res.message,
+        });
+      } catch (error) {
+        return errJson(error);
+      }
+    });
+  if (advanceOnly) return server;
 
   // 1. workbench_get_package_protocol
   server.tool(
@@ -290,7 +307,7 @@ export function createWorkbenchMcpServer(): McpServer {
     'workbench_submit_task',
     '提交极简任务包到开发工作台。服务端直接校验 package_root 目录完整性与各节点材料，落盘归档并将任务置为待人工确认启动状态 (pending_confirm)。',
     {
-      package_root: z.string().describe('任务包本地绝对路径（必须包含 manifest.json、requirements.md、development.md 以及 nodes/<node_id>/<node_id>.md）'),
+      package_root: z.string().describe('任务包本地绝对路径（必须包含 manifest.json、requirements.md 和各节点的 nodes/<node_id>/prompt.md）'),
       task_id: z.string().optional().describe('可选。若传入则作为现有任务的新修订版本提交；若省略则自动创建新任务'),
       budget_max_rounds: z.number().int().positive().max(100).optional().describe('可选。最大执行轮次上限'),
       execution_timeout_ms: executionTimeoutSchema.optional().describe('可选。单节点执行超时毫秒数'),
@@ -426,7 +443,7 @@ export function createWorkbenchMcpServer(): McpServer {
           throw new PackageProtocolError('TASK_NOT_FOUND', `未找到任务: ${args.task_id}`);
         }
 
-        const nodeRuns = db.getNodeRuns(args.task_id);
+        const nodeRuns = db.getNodeRuns(args.task_id).map(({ completion_token, ...run }) => run);
         const testRuns = db.getTestRuns(args.task_id, args.round_number);
         const acceptanceRuns = db.getAcceptanceRuns(args.task_id);
         const latestAcceptance = acceptanceRuns[acceptanceRuns.length - 1];
@@ -502,55 +519,11 @@ export function createWorkbenchMcpServer(): McpServer {
     }
   );
 
-  // 12. workbench_advance_workflow
-  server.tool(
-    'workbench_advance_workflow',
-    '当前正在运行的 Agent 报告本节点执行完成或失败并请求推进。后台结合连线配置统一推进，调用方无需也不得指定下一节点。',
-    {
-      task_id: z.string().describe('任务唯一标识'),
-      node_id: z.string().describe('当前节点 ID'),
-      attempt_id: z.string().describe('本次节点执行唯一 ID (run_id)'),
-      completion_token: z.string().describe('本次节点执行分配的安全凭据'),
-      request_id: z.string().describe('本次报告调用的唯一幂等请求 ID'),
-      outcome: z.enum(['passed', 'failed']).describe('本次节点业务判定结果：passed (成功) 或 failed (失败)'),
-      summary: z.string().describe('本次节点完成摘要或失败原因说明'),
-    },
-    async (args) => {
-      try {
-        const res = db.registerAdvanceReport(
-          args.task_id,
-          args.node_id,
-          args.attempt_id,
-          args.completion_token,
-          args.request_id,
-          args.outcome,
-          args.summary
-        );
-
-        if (!res.success) {
-          throw new PackageProtocolError('ADVANCE_REJECTED', `报告推进失败: ${res.message}`);
-        }
-
-        return okJson({
-          success: true,
-          taskId: args.task_id,
-          nodeId: args.node_id,
-          attemptId: args.attempt_id,
-          requestId: args.request_id,
-          duplicate: res.duplicate || false,
-          message: res.message,
-        });
-      } catch (err) {
-        return errJson(err);
-      }
-    }
-  );
-
   return server;
 }
 
-export async function startMcpServer(): Promise<void> {
-  const server = createWorkbenchMcpServer();
+export async function startMcpServer(advanceOnly = false): Promise<void> {
+  const server = createWorkbenchMcpServer(advanceOnly);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logger.info(`[WorkbenchMCP] Workbench stdio MCP server connected. instance=${INSTANCE_ID}, dataDir=${DATA_DIR}`);

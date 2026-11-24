@@ -60,6 +60,25 @@ export interface WorkflowNodeRunRecord {
   finished_at: number | null;
 }
 
+export interface ReworkDocument {
+  task_id: string;
+  revision: number;
+  target_node_id: string;
+  sequence: number;
+  source_node_id: string;
+  source_run_id: string;
+  source_path: string;
+  sha256: string;
+  created_at: number;
+  content: string;
+}
+
+export interface ReworkSourceFile {
+  path: string;
+  sha256: string;
+  content: string;
+}
+
 export interface TaskRecord {
   id: string;
   task_key: string;
@@ -430,6 +449,29 @@ export class WorkbenchDatabase {
       CREATE INDEX IF NOT EXISTS idx_wf_node_runs_task ON workflow_node_runs(task_id);
       CREATE INDEX IF NOT EXISTS idx_wf_node_runs_token ON workflow_node_runs(completion_token);
       CREATE INDEX IF NOT EXISTS idx_wf_node_runs_req ON workflow_node_runs(request_id);
+
+      CREATE TABLE IF NOT EXISTS workflow_completion_receipts (
+        run_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS workflow_rework_documents (
+        task_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        target_node_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        source_node_id TEXT NOT NULL,
+        source_run_id TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        pending INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (task_id, revision, target_node_id, sequence),
+        UNIQUE (source_run_id, source_path)
+      );
     `);
 
     try {
@@ -1250,11 +1292,59 @@ export class WorkbenchDatabase {
     return row ?? null;
   }
 
-  getNodeRunCount(taskId: string, nodeId: string): number {
+  getNodeRunCount(taskId: string, nodeId: string, revision?: number): number {
     const row = this.db
-      .prepare('SELECT COUNT(*) as count FROM workflow_node_runs WHERE task_id = ? AND node_id = ?')
-      .get(taskId, nodeId) as { count: number } | undefined;
+      .prepare('SELECT COUNT(*) as count FROM workflow_node_runs WHERE task_id = ? AND node_id = ? AND (? IS NULL OR revision = ?)')
+      .get(taskId, nodeId, revision ?? null, revision ?? null) as { count: number } | undefined;
     return row?.count ?? 0;
+  }
+
+  hasExecutedNode(taskId: string, revision: number, nodeId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM workflow_node_runs
+      WHERE task_id = ? AND revision = ? AND node_id = ? AND status IN ('passed', 'failed') LIMIT 1`
+    ).get(taskId, revision, nodeId));
+  }
+
+  appendReworkDocuments(run: WorkflowNodeRunRecord, targetNodeId: string, files: ReworkSourceFile[]): void {
+    if (!files.length) return;
+    const { task_id, revision, node_id, run_id } = run;
+    const last = this.db.prepare(`SELECT COALESCE(MAX(sequence), 0) AS sequence FROM workflow_rework_documents
+      WHERE task_id = ? AND revision = ? AND target_node_id = ?`).get(task_id, revision, targetNodeId) as { sequence: number };
+    const insert = this.db.prepare(`INSERT INTO workflow_rework_documents
+      (task_id, revision, target_node_id, sequence, source_node_id, source_run_id, source_path, sha256, created_at, content)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const now = Date.now();
+    files.forEach((file, index) => insert.run(task_id, revision, targetNodeId, last.sequence + index + 1,
+      node_id, run_id, file.path, file.sha256, now, file.content));
+  }
+
+  consumeReworkDocuments(taskId: string, revision: number, nodeId: string): void {
+    this.db.prepare(`UPDATE workflow_rework_documents SET pending = 0
+      WHERE task_id = ? AND revision = ? AND target_node_id = ? AND pending = 1`).run(taskId, revision, nodeId);
+  }
+
+  getPendingReworkDocuments(taskId: string, revision: number, nodeId: string): ReworkDocument[] {
+    return this.db.prepare(`SELECT * FROM workflow_rework_documents
+      WHERE task_id = ? AND revision = ? AND target_node_id = ? AND pending = 1 ORDER BY sequence`
+    ).all(taskId, revision, nodeId) as unknown as ReworkDocument[];
+  }
+
+  listReworkDocuments(taskId: string, revision: number): Omit<ReworkDocument, 'content'>[] {
+    return this.db.prepare(`SELECT task_id, revision, target_node_id, sequence, source_node_id, source_run_id,
+      source_path, sha256, created_at FROM workflow_rework_documents
+      WHERE task_id = ? AND revision = ? ORDER BY target_node_id, sequence`
+    ).all(taskId, revision) as unknown as Omit<ReworkDocument, 'content'>[];
+  }
+
+  getReworkDocument(taskId: string, revision: number, nodeId: string, sequence: number): ReworkDocument | undefined {
+    return this.db.prepare(`SELECT * FROM workflow_rework_documents
+      WHERE task_id = ? AND revision = ? AND target_node_id = ? AND sequence = ?`
+    ).get(taskId, revision, nodeId, sequence) as unknown as ReworkDocument | undefined;
+  }
+
+  getAdvancePayload(runId: string): string | undefined {
+    return this.db.prepare('SELECT payload_json FROM workflow_completion_receipts WHERE run_id = ?')
+      .get(runId)?.payload_json as string | undefined;
   }
 
   registerAdvanceReport(
@@ -1264,22 +1354,11 @@ export class WorkbenchDatabase {
     completionToken: string,
     requestId: string,
     outcome: 'passed' | 'failed',
-    summary: string
+    summary: string,
+    fingerprint = JSON.stringify([outcome, summary]),
+    prepare: (run: WorkflowNodeRunRecord, workflow: TaskWorkflowRecord) => string = () => '{}',
   ): { success: boolean; message: string; duplicate?: boolean; run?: WorkflowNodeRunRecord } {
     return this.transaction(() => {
-      const existingReq = this.db
-        .prepare('SELECT * FROM workflow_node_runs WHERE request_id = ?')
-        .get(requestId) as unknown as WorkflowNodeRunRecord | undefined;
-
-      if (existingReq) {
-        return {
-          success: true,
-          duplicate: true,
-          message: '请求已接收（幂等处理）',
-          run: existingReq,
-        };
-      }
-
       const run = this.getNodeRunByRunId(attemptId);
       if (!run) {
         return { success: false, message: `未找到执行记录: ${attemptId}` };
@@ -1290,14 +1369,29 @@ export class WorkbenchDatabase {
       if (run.completion_token !== completionToken) {
         return { success: false, message: '完成凭据 (completion_token) 不正确' };
       }
-      if (run.request_id && run.request_id !== requestId) {
-        return { success: false, message: '本次执行已绑定其他请求标识，不得重复报告' };
+      const task = this.getTask(taskId);
+      const workflow = this.getTaskWorkflow(taskId);
+      if (!task || !workflow || task.revision !== run.revision || workflow.revision !== run.revision) {
+        return { success: false, message: '本次执行的任务修订已失效' };
+      }
+      if (run.request_id) {
+        const receipt = this.db.prepare('SELECT fingerprint FROM workflow_completion_receipts WHERE run_id = ?').get(attemptId);
+        if (run.request_id === requestId && receipt?.fingerprint === fingerprint) {
+          return { success: true, duplicate: true, message: '报告已接收（幂等处理）', run };
+        }
+        return { success: false, message: '本次执行已提交不同报告' };
+      }
+      if (task.status !== TaskStatus.RUNNING || task.stop_requested || run.status !== 'running' ||
+          workflow.current_node_id !== nodeId || workflow.current_run_id !== attemptId) {
+        return { success: false, message: '当前执行已停止或不再是活动节点' };
+      }
+      if (this.db.prepare('SELECT 1 FROM workflow_node_runs WHERE request_id = ? LIMIT 1').get(requestId)) {
+        return { success: false, message: '请求标识已用于其他执行' };
       }
 
-      const task = this.getTask(taskId);
-      if (!task || task.status !== TaskStatus.RUNNING) {
-        return { success: false, message: `任务当前状态不可推进: ${task?.status}` };
-      }
+      const payload = prepare(run, workflow);
+      this.db.prepare(`INSERT INTO workflow_completion_receipts (run_id, task_id, fingerprint, payload_json)
+        VALUES (?, ?, ?, ?)`).run(attemptId, taskId, fingerprint, payload);
 
       this.db.prepare(`
         UPDATE workflow_node_runs
@@ -1321,6 +1415,8 @@ export class WorkbenchDatabase {
     if (!task) return false;
 
     return this.transaction(() => {
+      this.db.prepare('DELETE FROM workflow_completion_receipts WHERE task_id = ?').run(taskId);
+      this.db.prepare('DELETE FROM workflow_rework_documents WHERE task_id = ?').run(taskId);
       this.db.prepare('DELETE FROM execution_events WHERE run_id IN (SELECT run_id FROM execution_runs WHERE task_id=?)').run(taskId);
       this.db.prepare('DELETE FROM execution_runs WHERE task_id=?').run(taskId);
       this.db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
@@ -1342,6 +1438,7 @@ export class WorkbenchDatabase {
       const deletedCount = row ? Number(row.count) : 0;
       this.db.exec('DELETE FROM execution_events WHERE run_id IN (SELECT run_id FROM execution_runs WHERE task_id IS NOT NULL); DELETE FROM execution_runs WHERE task_id IS NOT NULL; DELETE FROM tasks;');
       this.db.exec('DELETE FROM task_workflows;');
+      this.db.exec('DELETE FROM workflow_completion_receipts; DELETE FROM workflow_rework_documents;');
       this.db.exec('DELETE FROM workflow_node_runs;');
       this.db.exec('DELETE FROM task_revisions;');
       this.db.exec('DELETE FROM task_package_files;');

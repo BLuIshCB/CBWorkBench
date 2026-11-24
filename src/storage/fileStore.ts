@@ -1,7 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { TASKS_DATA_DIR } from '../config/constants.ts';
+import { DATA_DIR, TASKS_DATA_DIR } from '../config/constants.ts';
+import type { ReworkDocument } from './db.ts';
+import { reworkFileName } from '../services/nodeCompletion.ts';
 import {
   encodeNodeDirName,
   readRegularFileSafely,
@@ -157,7 +159,7 @@ export class TaskFileStore {
     // 1. 复制顶层文件
     const manifestBuf = copyFileSafely('manifest.json', 'shared');
     copyFileSafely('requirements.md', 'shared');
-    copyFileSafely('development.md', 'shared');
+    if (fs.existsSync(path.join(packageRoot, 'development.md'))) copyFileSafely('development.md', 'shared');
 
     // 2. 递归复制 nodes/ 下的文件
     const nodesDir = path.join(packageRoot, 'nodes');
@@ -264,7 +266,8 @@ export class TaskFileStore {
     executionIndex: number;
     codeGeneration: number;
     targetCwd: string;
-    reworkFeedback?: string;
+    reworkDocuments?: ReworkDocument[];
+    reworkTarget?: string;
     completionToken: string;
   }): { paths: MaterializedAttemptPaths; context: Record<string, unknown> } {
     const revDir = this.getRevisionDir(params.taskId, params.revision);
@@ -314,7 +317,7 @@ export class TaskFileStore {
     const revNodeDir = path.join(revDir, 'nodes', params.nodeId);
 
     const nodeDocName = `${params.nodeId}.md`;
-    if (fs.existsSync(path.join(revNodeDir, nodeDocName))) {
+    if (nodeDocName.toLowerCase() !== 'prompt.md' && fs.existsSync(path.join(revNodeDir, nodeDocName))) {
       copyFrozenToAttempt(path.posix.join(nodeDirRel, nodeDocName), `material/${nodeDocName}`);
       allowedMaterialFiles.push(path.posix.join(nodeDirRel, nodeDocName), `material/${nodeDocName}`);
     }
@@ -341,14 +344,18 @@ export class TaskFileStore {
       scanNodeResources(revNodeResDir, path.posix.join(nodeDirRel, 'resources'));
     }
 
-    // 3. 处理返工反馈
-    let reworkFeedbackPath: string | null = null;
-    if (params.reworkFeedback && params.reworkFeedback.trim()) {
-      reworkFeedbackPath = 'inputs/rework-feedback.md';
-      const fbAbs = path.join(inputsDir, 'rework-feedback.md');
-      fs.writeFileSync(fbAbs, params.reworkFeedback, 'utf8');
-      setFileReadOnly(fbAbs);
-    }
+    const reworkPaths = (params.reworkDocuments || []).map(document => {
+      const name = reworkFileName(document.sequence);
+      const buffer = Buffer.from(document.content, 'utf8');
+      if (computeBufferSha256(buffer) !== document.sha256) {
+        throw new PackageProtocolError('REWORK_FILE_CHANGED', `已归档的返工文档校验失败: ${name}`);
+      }
+      const destination = path.join(inputsDir, name);
+      fs.writeFileSync(destination, buffer);
+      setFileReadOnly(destination);
+      return `inputs/${name}`;
+    });
+    if (params.reworkTarget) fs.mkdirSync(path.join(outputsDir, 'rework'), { recursive: true });
 
     const context: Record<string, unknown> = {
       schema_version: 'cb.node-context/1.0',
@@ -382,20 +389,22 @@ export class TaskFileStore {
         logs_dir: logsDir,
         temp_dir: tempDir,
       },
-      work_file: `material/${params.nodeId}.md`,
+      work_file: nodeDocName.toLowerCase() !== 'prompt.md' && allowedMaterialFiles.includes(`material/${nodeDocName}`) ? `material/${nodeDocName}` : null,
       prompt_file: fs.existsSync(path.join(materialDir, 'prompt.md')) ? 'material/prompt.md' : null,
       requirements_file: 'shared/requirements.md',
-      development_file: 'shared/development.md',
+      development_file: allowedSharedFiles.includes('shared/development.md') ? 'shared/development.md' : null,
       allowed_material_files: allowedMaterialFiles,
       allowed_shared_files: allowedSharedFiles,
-      rework_feedback_file: reworkFeedbackPath,
-      rework_feedback: params.reworkFeedback || null,
+      rework_prompt_files: reworkPaths,
       completion_protocol: {
         tool: 'workbench_advance_workflow',
         task_id: params.taskId,
         node_id: params.nodeId,
         attempt_id: params.attemptId,
         completion_token: params.completionToken,
+        request_id: `complete-${params.attemptId}`,
+        data_dir: DATA_DIR,
+        rework_target_node_id: params.reworkTarget || null,
         result_file: 'outputs/result.json',
       },
     };

@@ -20,6 +20,7 @@ export interface AgentExecutionContext {
   kind?: 'worker' | 'reviewer' | 'probe';
   taskId?: string;
   prompt: string;
+  completionByMcp?: boolean;
   cwd: string;
   model?: string;
   signal?: AbortSignal;

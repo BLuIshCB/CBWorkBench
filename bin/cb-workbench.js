@@ -17,7 +17,15 @@ try {
   hasSqlite = false;
 }
 
-if (hasSqlite) {
+if (hasSqlite && process.argv[2] === 'complete-node') {
+  try {
+    const { completeNode } = await import('../src/cli/completeNode.ts');
+    await completeNode(process.argv.slice(3));
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+} else if (hasSqlite) {
   const { parseCliRuntimeArgs } = await import('../src/config/dataDir.ts');
   let cliArgs;
   try {

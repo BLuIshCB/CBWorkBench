@@ -13,7 +13,7 @@ import { TestRunner } from '../src/services/testRunner.ts';
 import { CliRunner } from '../src/services/cliRunner.ts';
 import { executionTimeoutSchema, resolveExecutionTimeout } from '../src/services/executionPolicy.ts';
 import { computeWorkflowDefinitionSha256, type WorkflowNode } from '../src/services/workflowDefinition.ts';
-import { runVerificationAgent } from './fixtures/verificationAgent.ts';
+import { passedAcceptanceFixture, reportFixtureCompletion, runVerificationAgent } from './fixtures/verificationAgent.ts';
 
 const calls: AgentExecutionContext[] = [];
 let waitForCancellation: 'worker' | 'reviewer' | null = null;
@@ -38,19 +38,10 @@ adapterRegistry.register({
     }
     const verification = await runVerificationAgent(context);
     if (verification) return verification;
+    await reportFixtureCompletion(context, { acceptance: context.kind === 'reviewer' ? passedAcceptanceFixture : undefined });
     return {
       ok: true,
-      output:
-        context.kind === 'reviewer'
-          ? JSON.stringify({
-              decision: 'passed',
-              revision: 1,
-              summary: 'fixture evidence',
-              criteriaResults: [{ id: 'fixture', passed: true, evidence: 'Offline adapter contract verified' }],
-              issues: [],
-              manualChecksPending: [],
-            })
-          : 'development fixture',
+      output: '自由格式最终回复',
       durationMs: 0,
       modelUsed: 'default',
     };
