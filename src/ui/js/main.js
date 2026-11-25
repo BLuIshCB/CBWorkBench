@@ -25,18 +25,56 @@ export class App {
     });
 
     this.pollInterval = null;
+    this.initHeartbeat();
     this.init();
   }
 
   async init() {
-    // 加载执行器与工作流
-    await this.fetchExecutors();
-    await this.workflowView.init();
+    try {
+      // 加载执行器与工作流
+      await this.fetchExecutors();
+      await this.workflowView.init();
+    } catch (err) {
+      console.error('[CBWorkBench] 初始元数据加载失败:', err);
+    }
 
     this.router.handleRoute();
 
     // 启动智能轮询
     this.startPolling();
+  }
+
+  initHeartbeat() {
+    const clientId = 'ui-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const sendPing = () => {
+      fetch('/api/system/ui-heartbeat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId, action: 'ping' }),
+      }).catch(() => {});
+    };
+
+    // 立即上报首个心跳确立活跃状态
+    sendPing();
+    const heartbeatTimer = setInterval(sendPing, 3000);
+
+    // 页面重新可见或获得焦点时立即补发心跳，对抗 Chromium 后台节流 (Timer Throttling)
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        sendPing();
+      }
+    });
+    window.addEventListener('focus', () => {
+      sendPing();
+    });
+
+    // 页面关闭或注销时发送离线通知
+    window.addEventListener('beforeunload', () => {
+      clearInterval(heartbeatTimer);
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon('/api/system/ui-heartbeat?action=close&clientId=' + encodeURIComponent(clientId));
+      }
+    });
   }
 
   // --- Navigation & Routing ---

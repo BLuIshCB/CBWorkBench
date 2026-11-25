@@ -43,6 +43,7 @@ import {
 } from '../services/workflowDefinition.ts';
 import { encodeNodeDirName } from '../utils/pathSecurity.ts';
 import { EMBEDDED_ASSETS } from '../ui/embeddedAssets.ts';
+import { uiActivityTracker } from '../services/uiActivityTracker.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -278,7 +279,33 @@ export function createHttpServer(): http.Server {
           pid: process.pid,
           host: addr?.address || DEFAULT_HOST,
           port: addr?.port || DEFAULT_PORT,
+          has_active_ui: uiActivityTracker.hasActiveUi(),
+          last_browser_opened_at: uiActivityTracker.getLastBrowserOpenedAt(),
         });
+        return;
+      }
+
+      // UI Heartbeat endpoint
+      if (pathname === '/api/system/ui-heartbeat' && method === 'POST') {
+        let body: any = {};
+        try {
+          body = await parseJsonBody(req);
+        } catch {}
+        const clientId = String(body.clientId || url.searchParams.get('clientId') || '');
+        const action = String(body.action || url.searchParams.get('action') || 'ping');
+        if (action === 'close') {
+          uiActivityTracker.removeSession(clientId);
+        } else {
+          uiActivityTracker.recordHeartbeat(clientId);
+        }
+        sendJson(res, 200, { success: true, has_active_ui: uiActivityTracker.hasActiveUi() });
+        return;
+      }
+
+      // UI Browser Open notification endpoint
+      if (pathname === '/api/system/ui-open' && method === 'POST') {
+        uiActivityTracker.recordBrowserOpen();
+        sendJson(res, 200, { success: true, last_browser_opened_at: uiActivityTracker.getLastBrowserOpenedAt() });
         return;
       }
 

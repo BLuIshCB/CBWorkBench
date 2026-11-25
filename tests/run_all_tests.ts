@@ -31,6 +31,8 @@ const testSuites = [
   'workflowHttp.test.ts',
   'taskWorkflowView.test.ts',
   'dataDir.test.ts',
+  'uiActivityTracker.test.ts',
+  'interactiveConsole.test.ts',
   'entryExe.test.ts',
   'packageProtocol.test.ts',
   'taskCleanup.test.ts',

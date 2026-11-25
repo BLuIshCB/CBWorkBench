@@ -1,6 +1,32 @@
 process.env.CB_SEA_EXE = 'true';
 import { execFile } from 'node:child_process';
-import { parseCliRuntimeArgs, resolveResidentServerForDataDir } from './config/dataDir.ts';
+import {
+  parseCliRuntimeArgs,
+  resolveResidentServerForDataDir,
+} from './config/dataDir.ts';
+import { openBrowser, startInteractiveConsole } from './services/interactiveConsole.ts';
+
+export { openBrowser, startInteractiveConsole };
+
+function tryActivateExistingWindow(title: string): void {
+  if (process.platform !== 'win32') return;
+  try {
+    const child = execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', `(New-Object -ComObject WScript.Shell).AppActivate("${title}")`],
+      { windowsHide: true, detached: true, stdio: 'ignore' },
+      () => {}
+    );
+    child?.unref?.();
+  } catch {}
+}
+
+async function notifyRemoteBrowserOpened(serverUrl: string): Promise<void> {
+  try {
+    const normalized = serverUrl.replace(/\/+$/, '');
+    await fetch(`${normalized}/api/system/ui-open`, { method: 'POST' });
+  } catch {}
+}
 
 async function main() {
   if (process.argv[2] === 'complete-node') {
@@ -48,22 +74,33 @@ async function main() {
     const { DEFAULT_PORT, DEFAULT_HOST, DATA_DIR, INSTANCE_ID } = await import('./config/constants.ts');
     // 重复点击只打开已验证的后台，避免再次初始化数据库和恢复任务。
     const existing = await resolveResidentServerForDataDir(DATA_DIR, INSTANCE_ID);
-    let url: string;
     if (existing) {
-      url = existing.url;
-      console.log(`[CBWorkBench] 后台已运行，使用现有工作台: ${url}`);
-    } else {
-      const { startServer } = await import('./server/httpServer.ts');
-      const port = cliArgs.port || Number(process.env.CB_PORT) || DEFAULT_PORT;
-      const host = cliArgs.host || process.env.CB_HOST || DEFAULT_HOST;
-      await startServer(port, host);
-      url = `http://${host}:${port}/`;
+      if (existing.has_active_ui) {
+        console.log(`[CBWorkBench] 后台已在运行且工作台网页当前已打开 (${existing.url})，跳过重复打开新网页。`);
+        tryActivateExistingWindow('CBWorkBench');
+      } else if (!cliArgs.noOpen) {
+        console.log(`[CBWorkBench] 后台已在运行，检测到网页未打开，正在启动浏览器访问: ${existing.url}`);
+        openBrowser(existing.url);
+        await notifyRemoteBrowserOpened(existing.url);
+      } else {
+        console.log(`[CBWorkBench] 后台已运行，使用现有工作台: ${existing.url}`);
+      }
+      return;
     }
-    if (!cliArgs.noOpen && process.platform === 'win32') {
-      execFile('rundll32.exe', ['url.dll,FileProtocolHandler', url], { windowsHide: true }, (err) => {
-        if (err) console.error(`[CBWorkBench] 无法自动打开浏览器，请手动访问 ${url}: ${err.message}`);
-      });
+
+    const { startServer } = await import('./server/httpServer.ts');
+    const port = cliArgs.port || Number(process.env.CB_PORT) || DEFAULT_PORT;
+    const host = cliArgs.host || process.env.CB_HOST || DEFAULT_HOST;
+    const server = await startServer(port, host);
+    const url = `http://${host}:${port}/`;
+
+    const { uiActivityTracker } = await import('./services/uiActivityTracker.ts');
+    if (!cliArgs.noOpen) {
+      openBrowser(url);
+      uiActivityTracker.recordBrowserOpen();
     }
+
+    startInteractiveConsole(url, server, uiActivityTracker);
   } catch (err: any) {
     console.error('\n[CBWorkBench] 启动失败:', err?.message || err);
     process.exit(1);

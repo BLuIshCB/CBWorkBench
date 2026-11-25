@@ -29,6 +29,8 @@ export interface ActiveServerInfo {
   port: number;
   url: string;
   started_at: number;
+  has_active_ui?: boolean;
+  last_browser_opened_at?: number;
 }
 
 export interface ResolvedDataDir {
@@ -303,6 +305,8 @@ export async function fetchRemoteInstanceInfo(serverUrl: string, timeoutMs: numb
   pid: number;
   host: string;
   port: number;
+  has_active_ui?: boolean;
+  last_browser_opened_at?: number;
 } | null> {
   const normalized = serverUrl.replace(/\/+$/, '');
   const controller = new AbortController();
@@ -318,6 +322,8 @@ export async function fetchRemoteInstanceInfo(serverUrl: string, timeoutMs: numb
       pid: Number(data.pid),
       host: String(data.host),
       port: Number(data.port),
+      has_active_ui: typeof data.has_active_ui === 'boolean' ? data.has_active_ui : undefined,
+      last_browser_opened_at: typeof data.last_browser_opened_at === 'number' ? data.last_browser_opened_at : undefined,
     };
   } catch {
     return null;
@@ -343,7 +349,11 @@ export async function resolveResidentServerForDataDir(dataDir: string, instanceI
       `后台服务实例与当前数据目录不一致: 后台(${remote.instance_id}, ${remote.data_dir}) != 本地(${instanceId}, ${dataDir})`
     );
   }
-  return info;
+  return {
+    ...info,
+    has_active_ui: remote.has_active_ui,
+    last_browser_opened_at: remote.last_browser_opened_at,
+  };
 }
 
 export async function assertServerMatchesLocalInstance(

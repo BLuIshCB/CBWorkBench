@@ -78,6 +78,31 @@ try {
   assert.strictEqual(instData.success, true);
   assert.strictEqual(instData.instance_id, sysData.status.instanceId);
   assert.strictEqual(instData.data_dir, sysData.status.dataDir);
+  assert.strictEqual(typeof instData.has_active_ui, 'boolean');
+  assert.strictEqual(typeof instData.last_browser_opened_at, 'number');
+
+  // UI Heartbeat & Open APIs
+  const hbRes = await fetch(`${baseUrl}/api/system/ui-heartbeat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clientId: 'http-test-client', action: 'ping' }),
+  });
+  assert.strictEqual(hbRes.status, 200);
+  const hbData = await hbRes.json();
+  assert.strictEqual(hbData.success, true);
+  assert.strictEqual(hbData.has_active_ui, true);
+
+  const uiOpenRes = await fetch(`${baseUrl}/api/system/ui-open`, { method: 'POST' });
+  assert.strictEqual(uiOpenRes.status, 200);
+  const uiOpenData = await uiOpenRes.json();
+  assert.strictEqual(uiOpenData.success, true);
+  assert.ok(uiOpenData.last_browser_opened_at > 0);
+
+  // Close session via beacon query param style
+  const hbCloseRes = await fetch(`${baseUrl}/api/system/ui-heartbeat?action=close&clientId=http-test-client`, {
+    method: 'POST',
+  });
+  assert.strictEqual(hbCloseRes.status, 200);
 
   // 3. List tasks API
   const listRes = await fetch(`${baseUrl}/api/tasks`);
