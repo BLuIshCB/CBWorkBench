@@ -17,6 +17,9 @@ node bin/agent.js verify antigravity
 node bin/agent.js login workbuddy
 node bin/agent.js login codex
 node bin/agent.js login antigravity
+
+# 入口定位诊断：平台、水合状态、每条候选的 path/source/runnable/reason、最终 entry
+node bin/agent.js doctor codex
 ```
 
 任意提示词使用 `node bin/agent.js chat <id> [cwd] [model]`，完整提示词通过 UTF-8 stdin 输入。Node 程序示例：
@@ -68,6 +71,27 @@ WorkBuddy 使用完整 CodeBuddy 引擎加载 WorkBuddy 官方产品配置。复
 ```
 
 Windows 下使用原生 `.exe` 或 Node + 脚本路径，避免通过 `.cmd` 和 shell 拼接提示词。可用 `args` 配置固定的前置参数，`env` 仅对子进程生效。配置、二进制、登录状态和测试产物均不纳入 Git。
+
+## 入口探测与诊断（2026-11-25）
+
+适配器只声明 CLI 名称、依赖命令、显式环境变量与专属安装目录，入口定位由 `src/services/cliDiscovery.ts` 统一完成，按固定顺序降级，前一级命中即返回：
+
+| 级 | 来源 | `discovery.source` |
+|---|---|---|
+| L1 | `CB_AGENT_CLI_CONFIG` / `data/agent-cli.json` | `config` |
+| L2 | 声明里的显式环境变量（`CODEX_CMD_PATH`、`WB_COMMAND` / `WB_CLI_SCRIPT`、`ANTIGRAVITY_CLI_PATH`） | `env` |
+| L3 | 当前进程 PATH（含登录 shell 水合新增段） | `path` / `shell-path` |
+| L4 | 用户目录推导的安装目录（nvm、fnm、volta、asdf、mise、bun、npm、pnpm、yarn 与官方安装器） | `install-dir` |
+| L5 | 裸名，交给执行期 spawn | `fallback` |
+
+- L1/L2 写错时直接报错，不会静默回退到 PATH 里的其他版本。
+- 依赖命令（如 codex 需要 node）单独做一次完整降级查找；缺失时判「已安装但依赖缺失」，不是「未安装」。
+- Windows 只判是否文件，`.cmd` 优先于 `.exe`；命中包装器时优先配对同目录 node 脚本，配不上才在执行期用 `cmd.exe` 包裹。
+- exe 从桌面启动继承的是资源管理器 PATH，启动阶段会异步水合一次登录 shell 的 PATH（10s 上限，失败不影响降级）。
+- 列表接口只做探测，不跑 `--version` 与模型目录：`GET /api/runtime/clis` 冷启动只可能起一次登录 shell 水合（10s 上限，之后走进程内缓存）；带 `?version=1`（或 `?refresh=1`，后者强制重探并清缓存）才获取版本结论与动态模型目录。
+- `POST /api/runtime/refresh-path` 重新水合 PATH；`POST /api/runtime/pick-file` 弹系统文件框；`POST /api/runtime/cli-path` 校验可运行性后原子写入 `agent-cli.json` 并清缓存。浏览器 `<input type="file">` 拿不到绝对路径，因此不使用它。
+
+适配器中心页面的卡片会展示启动入口、探测来源与失败明细；找不到入口时可展开「试过 N 个路径」和「手动指定入口」。手动入口同时回填「可执行文件」与「脚本」两个字段：脚本型 CLI（node + js）只改可执行文件时不会丢掉脚本；`.cmd/.bat/.ps1` 包装器写入时会自动清掉脚本，由探测重新配对。
 
 ## 调用架构与权限
 
