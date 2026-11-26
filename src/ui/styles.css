@@ -1371,6 +1371,66 @@ body {
   border-top: 1px solid var(--surface-border);
 }
 
+/* CLI 探测诊断信息 */
+.cli-entry {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: #334155;
+  word-break: break-all;
+}
+
+.cli-reason {
+  font-size: 12px;
+  line-height: 1.5;
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  padding: 6px 8px;
+  word-break: break-all;
+}
+
+.cli-candidates,
+.cli-manual {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.cli-candidates summary,
+.cli-manual summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.cli-candidates ul {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.cli-candidates li {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.cli-manual-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.cli-manual-row .form-control {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
 /* Prompt Probe Console */
 .probe-card {
   background: var(--surface-color);

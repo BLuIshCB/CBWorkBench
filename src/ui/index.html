@@ -229,7 +229,8 @@
           <h2>🧩 CLI 适配器</h2>
         </div>
         <div class="action-group">
-          <button class="btn btn-secondary" onclick="app.fetchRuntimeClis()">刷新状态</button>
+          <button class="btn btn-secondary" onclick="app.refreshRuntimePath()">重新探测 PATH</button>
+          <button class="btn btn-secondary" onclick="app.fetchRuntimeClis({ refresh: true })">刷新状态</button>
         </div>
       </div>
 

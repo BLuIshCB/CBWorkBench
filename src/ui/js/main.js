@@ -505,18 +505,16 @@ export class App {
 
   // --- Runtime Diagnostics & Probe View ---
 
-  async fetchRuntimeClis() {
+  async fetchRuntimeClis(options = {}) {
+    const opts = typeof options === 'boolean' ? { withVersion: options } : options;
     try {
       const grid = document.getElementById('runtime-cli-grid');
       if (grid && !store.getState().runtimeClis.length) {
         grid.innerHTML = '<div class="loading-state">正在探测已配置的 CLI 工具...</div>';
       }
-      const data = await api.getRuntimeClis();
+      const data = await api.getRuntimeClis(opts);
       if (data.success && Array.isArray(data.clis)) {
-        store.setState({ runtimeClis: data.clis });
-        RuntimeView.renderClis(data.clis);
-        RuntimeView.populateProbeForm(data.clis);
-        this.handleProbeTargetChange();
+        this.applyRuntimeClis(data.clis, { preferServerModels: Boolean(opts.withVersion || opts.refresh) });
       }
     } catch (e) {
       console.warn('Failed to fetch runtime clis:', e);
@@ -524,6 +522,73 @@ export class App {
       if (grid) {
         grid.innerHTML = `<div class="alert alert-blocked">获取 CLI 配置失败: ${escapeHtml(e.message)}</div>`;
       }
+    }
+  }
+
+  /**
+   * 冷启动列表只带静态模型，需要复用初始化时拿到的动态目录；
+   * 显式刷新时服务端结果才是最新的，不能再被本地旧列表覆盖。
+   */
+  applyRuntimeClis(clis, { preferServerModels = false } = {}) {
+    const executors = store.getState().availableAdapters || [];
+    const merged = clis.map((cli) => {
+      const serverModels = Array.isArray(cli.supportedModels) ? cli.supportedModels : [];
+      const catalog = executors.find((adapter) => adapter.id === cli.id);
+      const localModels = Array.isArray(catalog?.supportedModels) ? catalog.supportedModels : [];
+      const models = preferServerModels ? serverModels : (localModels.length ? localModels : serverModels);
+      return models.length ? { ...cli, supportedModels: models } : cli;
+    });
+    store.setState({ runtimeClis: merged });
+    RuntimeView.renderClis(merged);
+    RuntimeView.populateProbeForm(merged);
+    this.handleProbeTargetChange();
+  }
+
+  async refreshRuntimePath() {
+    try {
+      const data = await api.refreshRuntimePath();
+      if (data.success !== false && Array.isArray(data.clis)) {
+        this.applyRuntimeClis(data.clis);
+      }
+      const hydration = data.hydration;
+      if (hydration && hydration.ok === false) {
+        alert(`登录 shell PATH 水合失败：${hydration.failureReason}。已回退到当前 PATH 与已知安装目录。`);
+      }
+    } catch (e) {
+      alert('重新探测 PATH 失败：' + e.message);
+    }
+  }
+
+  async pickCliFile(cliId, target = 'exe') {
+    try {
+      const data = await api.pickRuntimeFile();
+      if (data.path) {
+        const input = document.getElementById(`cli-${target}-input-${cliId}`);
+        if (input) input.value = data.path;
+      } else if (data.success === false) {
+        alert(data.message || '未能取得文件路径，请直接粘贴绝对路径。');
+      }
+    } catch (e) {
+      alert('打开文件选择框失败：' + e.message + '\n请直接粘贴绝对路径。');
+    }
+  }
+
+  async saveCliPath(cliId) {
+    const executable = document.getElementById(`cli-exe-input-${cliId}`)?.value?.trim();
+    const script = document.getElementById(`cli-script-input-${cliId}`)?.value?.trim();
+    if (!executable) {
+      alert('请填写 CLI 入口的绝对路径。');
+      return;
+    }
+    try {
+      const data = await api.setRuntimeCliPath({ cliId, executable, script: script || undefined });
+      if (data.success === false) {
+        alert(data.message || '保存失败');
+        return;
+      }
+      await this.fetchRuntimeClis();
+    } catch (e) {
+      alert('保存失败：' + e.message);
     }
   }
 

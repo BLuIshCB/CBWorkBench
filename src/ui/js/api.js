@@ -66,7 +66,17 @@ export const api = {
   }),
 
   // Runtime & Probe APIs
-  getRuntimeClis: () => request('/api/runtime/clis'),
+  getRuntimeClis: (options = {}) => {
+    const opts = typeof options === 'boolean' ? { withVersion: options } : options;
+    const params = new URLSearchParams();
+    if (opts.refresh) params.set('refresh', '1');
+    else if (opts.withVersion) params.set('version', '1');
+    const query = params.toString();
+    return request(`/api/runtime/clis${query ? `?${query}` : ''}`);
+  },
+  refreshRuntimePath: () => request('/api/runtime/refresh-path', { method: 'POST', body: '{}' }),
+  pickRuntimeFile: () => request('/api/runtime/pick-file', { method: 'POST', body: '{}' }),
+  setRuntimeCliPath: (body) => request('/api/runtime/cli-path', { method: 'POST', body: JSON.stringify(body) }),
   probeCli: (body) => request('/api/runtime/probe', {
     method: 'POST',
     body: JSON.stringify(body),
