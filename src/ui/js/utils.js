@@ -25,7 +25,7 @@ export function formatStatus(status) {
     queued: '排队中',
     running: '执行中',
     blocked: '异常待处理',
-    human_review: '最终人工审核',
+    human_review: '待人工审核',
     completed: '已完成',
     cancelled: '已取消',
     deleting: '清理删除中',

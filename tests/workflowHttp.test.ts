@@ -5,6 +5,7 @@ import { createHttpServer } from '../src/server/httpServer.ts';
 import { db } from '../src/storage/db.ts';
 import { TaskStatus } from '../src/config/constants.ts';
 import { DEFAULT_WORKFLOW_ID, DEFAULT_WORKFLOW_NODES } from '../src/services/workflowDefinition.ts';
+import { WORKFLOW_FILE_MAX_BYTES } from '../src/services/workflowTemplateService.ts';
 
 console.log('[Test] Running workflowHttp.test.ts...');
 
@@ -74,6 +75,24 @@ try {
   assert.match(view.buildNodeConfigHtml({ ...validGraph[1], result_rule: 'verification' }), /id="workflow-node-manual-gate"[^>]+disabled/);
   view.currentWorkflow = { isReferenced: true };
   assert.match(view.buildNodeConfigHtml(validGraph[1]), /id="workflow-node-manual-gate"[^>]+disabled/);
+  view.currentWorkflow = { id: DEFAULT_WORKFLOW_ID };
+  const defaultReview = DEFAULT_WORKFLOW_NODES.find(node => node.id === 'human_review')!;
+  const defaultReviewPanel = view.buildNodeConfigHtml(defaultReview);
+  assert.match(defaultReviewPanel, /id="workflow-node-manual-gate"[^>]+checked[^>]+disabled/);
+  assert.doesNotMatch(defaultReviewPanel, /deleteCurrentNode/);
+
+  for (const change of [{ id: 'human_review', execution_mode: 'agent' }, { id: 'acceptance', on_success: 'end', on_failure: 'human_review' }]) {
+    const invalidDefault = await fetch(`${baseUrl}/api/workflows`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: DEFAULT_WORKFLOW_ID,
+        name: defaultWfRes.workflow.name,
+        nodes: DEFAULT_WORKFLOW_NODES.map(node => node.id === change.id ? { ...node, ...change } : node),
+      }),
+    });
+    assert.equal(invalidDefault.status, 400);
+    assert.match((await invalidDefault.json()).message, /人工确认节点通过后才能结束/);
+  }
 
   const exported = await fetch(`${baseUrl}/api/workflows/default/export`);
   assert.equal(exported.status, 200);
@@ -89,6 +108,80 @@ try {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(file),
   });
+  const existingNodeId = '_' + 'review'.repeat(11);
+  const existingGraph = [
+    { ...validGraph[0], on_success: existingNodeId },
+    { ...validGraph[1], id: existingNodeId },
+    validGraph[2],
+  ];
+  const existingSave = await fetch(`${baseUrl}/api/workflows`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: 'existing-node-id', name: '已有模板', nodes: existingGraph }),
+  });
+  assert.equal(existingSave.status, 200);
+  const existingExport = await fetch(`${baseUrl}/api/workflows/existing-node-id/export`).then(r => r.json());
+  assert.equal(existingExport.nodes[1].id, existingNodeId);
+  const existingImport = await importFile(existingExport);
+  assert.equal(existingImport.status, 201);
+  const existingImportId = (await existingImport.json()).workflow_id;
+  const existingDetail = await fetch(`${baseUrl}/api/workflows/${existingImportId}`).then(r => r.json());
+  assert.equal(existingDetail.workflow.nodes[1].dir_name, existingNodeId);
+  assert.equal(existingDetail.workflow.nodes[1].material_contract.prompt_ref, `nodes/${existingNodeId}/prompt.md`);
+  db.deleteWorkflow(existingImportId);
+  db.deleteWorkflow('existing-node-id');
+
+  const originalAlert = Object.getOwnPropertyDescriptor(globalThis, 'alert');
+  let importNotice = '';
+  Object.defineProperty(globalThis, 'alert', { configurable: true, value: (message: string) => { importNotice = message; } });
+  try {
+    view.render = () => {};
+    await view.selectWorkflow('default');
+    let readOversizedFile = false;
+    await view.importWorkflowFile({
+      value: 'too-large.json',
+      files: [{
+        size: WORKFLOW_FILE_MAX_BYTES + 1,
+        text: async () => { readOversizedFile = true; return JSON.stringify(workflowFile); },
+      }],
+    });
+    assert.equal(readOversizedFile, false);
+    assert.match(importNotice, /不能超过 5 MiB/);
+
+    view.currentNodes[1].description = '待保存的编辑';
+    const fileText = JSON.stringify(workflowFile);
+    await view.importWorkflowFile({ files: [{ size: Buffer.byteLength(fileText), text: async () => fileText }], value: 'workflow.json' });
+    assert.equal(view.currentWorkflow.id, 'default');
+    assert.equal(view.currentNodes[1].description, '待保存的编辑');
+    assert.match(importNotice, /当前编辑已保留/);
+    const newTemplate = view.workflows.find((workflow: { id: string; name: string }) =>
+      workflow.id !== 'default' && workflow.name === workflowFile.name);
+    assert.ok(newTemplate);
+    db.deleteWorkflow(newTemplate.id);
+
+    const longDescription = 'a'.repeat(3 * 1024 * 1024);
+    const largeImport = await importFile({
+      name: '大模板',
+      nodes: [validGraph[0], { ...validGraph[1], description: longDescription }, validGraph[2]],
+    });
+    assert.equal(largeImport.status, 201);
+    const largeId = (await largeImport.json()).workflow_id;
+    try {
+      await view.selectWorkflow(largeId);
+      assert.equal(view.currentNodes[1].material_contract.purpose.length, longDescription.length);
+      view.currentNodes[1].execution_mode = 'manual';
+      await view.saveWorkflow();
+      assert.match(importNotice, /保存成功/);
+      const savedNodes = JSON.parse(db.getWorkflow(largeId)!.nodes_json);
+      assert.equal(savedNodes[1].execution_mode, 'manual');
+      assert.equal(savedNodes[1].material_contract, undefined);
+    } finally {
+      db.deleteWorkflow(largeId);
+    }
+  } finally {
+    if (originalAlert) Object.defineProperty(globalThis, 'alert', originalAlert);
+    else Reflect.deleteProperty(globalThis, 'alert');
+  }
+
   const imported = await importFile(workflowFile);
   assert.equal(imported.status, 201);
   const importedId = (await imported.json()).workflow_id;
@@ -112,6 +205,15 @@ try {
   const missingExport = await fetch(`${baseUrl}/api/workflows/${importedId}/export`);
   assert.equal(missingExport.status, 404);
   assert.equal((await missingExport.json()).code, 'WORKFLOW_NOT_FOUND');
+
+  for (const endpoint of ['/api/workflows/import', '/api/workflows']) {
+    const oversized = await fetch(baseUrl + endpoint, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(workflowFile) + ' '.repeat(WORKFLOW_FILE_MAX_BYTES),
+    });
+    assert.equal(oversized.status, 413);
+    assert.equal((await oversized.json()).code, 'WORKFLOW_FILE_TOO_LARGE');
+  }
 
   const missingMetadata = await fetch(`${baseUrl}/api/workflows`, {
     method: 'POST',
@@ -203,13 +305,27 @@ try {
   // 6. POST /api/tasks/:id/workflow/manual-decision
   // Set task to HUMAN_REVIEW
   db.updateTaskStatus(taskId, TaskStatus.HUMAN_REVIEW);
-  db.updateTaskWorkflow(taskId, { current_node_id: 'human_review' });
+  const reviewRun = 'run-' + taskId;
+  db.createNodeRun({
+    run_id: reviewRun, task_id: taskId, revision: 1, node_id: 'human_review',
+    execution_index: 1, round_number: 1, code_generation: 0, status: 'waiting_manual',
+  });
+  db.updateTaskWorkflow(taskId, { current_node_id: 'human_review', current_run_id: reviewRun });
+
+  const staleDecision = await fetch(`${baseUrl}/api/tasks/${taskId}/human-review`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'approve', attempt_id: 'old-attempt' }),
+  });
+  assert.equal(staleDecision.status, 409);
+  assert.equal((await staleDecision.json()).code, 'STALE_MANUAL_REVIEW');
+  assert.equal(db.getHumanDecisions(taskId).length, 0);
 
   const decisionRes = await fetch(`${baseUrl}/api/tasks/${taskId}/workflow/manual-decision`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       action: 'approve',
+      attempt_id: reviewRun,
       reason: 'HTTP test manual approval',
     }),
   });

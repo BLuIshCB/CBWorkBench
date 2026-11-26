@@ -92,13 +92,13 @@ const smNodes: WorkflowNode[] = [
 const savedWf = db.saveWorkflowDefinition({ id: smWfId, name: 'State Machine Workflow', nodes_json: JSON.stringify(smNodes) });
 const smWfSha = computeWorkflowDefinitionSha256({ id: savedWf.id, name: savedWf.name, description: savedWf.description, nodes: smNodes });
 
-function createFixtureTask(options?: { budget_max_rounds?: number }) {
+function createFixtureTask(options?: { budget_max_rounds?: number; workflowId?: string; nodes?: WorkflowNode[] }) {
   const pkgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-sm-pkg-'));
   try {
     const taskKey = 'sm-' + randomUUID().slice(0, 8);
     fs.writeFileSync(path.join(pkgRoot, 'requirements.md'), '# Requirements\n', 'utf8');
     fs.writeFileSync(path.join(pkgRoot, 'development.md'), '# Development\n', 'utf8');
-    for (const n of smNodes) {
+    for (const n of options?.nodes ?? smNodes) {
       if (n.type !== 'task') continue;
       const nodeDir = path.join(pkgRoot, 'nodes', n.id);
       fs.mkdirSync(nodeDir, { recursive: true });
@@ -107,7 +107,7 @@ function createFixtureTask(options?: { budget_max_rounds?: number }) {
     }
     const manifest = {
       title: 'State Machine Test Task',
-      workflow_id: smWfId,
+      workflow_id: options?.workflowId ?? smWfId,
       target_cwd: process.cwd(),
       task_key: taskKey,
       budget_max_rounds: options?.budget_max_rounds ?? 10,
@@ -163,7 +163,7 @@ assert.strictEqual(nodeRunsTask1.filter((r) => r.node_id === 'acceptance').lengt
 assert.strictEqual(nodeRunsTask1.filter((r) => r.node_id === 'human_review').length, 1);
 assert.ok(nodeRunsTask1[0].result_json, 'Unified result.json must be recorded');
 
-const approveRes = await workflowEngine.submitHumanDecision(task1, 'approve', 'LGTM');
+const approveRes = await workflowEngine.submitHumanDecision(task1, db.getTaskWorkflow(task1)!.current_run_id!, 'approve', 'LGTM');
 assert.strictEqual(approveRes.success, true);
 assert.strictEqual(db.getTask(task1)?.status, TaskStatus.COMPLETED);
 console.log('  ✓ Test 1: Full happy path completed to end node with unified result.json');
@@ -246,9 +246,33 @@ assert.strictEqual(devCallCount, 1);
 assert.equal(db.getLatestNodeRun(task4, 'development')?.reported_outcome, 'failed', 'CLI 崩溃时通过 MCP 补报');
 console.log('  ✓ Test 4: Running fault pauses into BLOCKED');
 
-for (const tid of [task1, task2, task3, task4]) {
+const twoGateWorkflowId = 'two-gates-' + randomUUID();
+const twoGateNodes: WorkflowNode[] = [
+  { id: 'start', name: '开始', description: '进入首先审核。', type: 'start', on_success: 'first' },
+  { id: 'first', name: '初审', description: '审核初始材料。', type: 'task', execution_mode: 'manual', on_success: 'second' },
+  { id: 'second', name: '复审', description: '核对最终材料。', type: 'task', execution_mode: 'manual', on_success: 'end' },
+  { id: 'end', name: '结束', description: '结束审核。', type: 'end' },
+];
+db.saveWorkflowDefinition({ id: twoGateWorkflowId, name: '两道门禁', nodes_json: JSON.stringify(twoGateNodes) });
+const twoGateTask = createFixtureTask({ workflowId: twoGateWorkflowId, nodes: twoGateNodes });
+assert.equal((await workflowEngine.confirmAndStartTask(twoGateTask)).success, true);
+await waitFor(() => db.getTask(twoGateTask)?.status === TaskStatus.HUMAN_REVIEW);
+const firstRunId = db.getTaskWorkflow(twoGateTask)!.current_run_id!;
+assert.equal((await workflowEngine.submitHumanDecision(twoGateTask, firstRunId, 'approve', '')).success, true);
+await waitFor(() => db.getTask(twoGateTask)?.status === TaskStatus.HUMAN_REVIEW);
+const secondRunId = db.getTaskWorkflow(twoGateTask)!.current_run_id!;
+assert.notEqual(secondRunId, firstRunId);
+const stale = await workflowEngine.submitHumanDecision(twoGateTask, firstRunId, 'approve', '');
+assert.equal(stale.code, 'STALE_MANUAL_REVIEW');
+assert.equal(db.getNodeRunByRunId(secondRunId)?.status, 'waiting_manual');
+assert.equal(db.getHumanDecisions(twoGateTask).length, 1);
+assert.equal((await workflowEngine.submitHumanDecision(twoGateTask, secondRunId, 'approve', '')).success, true);
+assert.equal(db.getTask(twoGateTask)?.status, TaskStatus.COMPLETED);
+
+for (const tid of [task1, task2, task3, task4, twoGateTask]) {
   try { db.deleteTask(tid); } catch {}
 }
 try { db.deleteWorkflow(smWfId); } catch {}
+db.deleteWorkflow(twoGateWorkflowId);
 
 console.log('✅ workflowStateMachine.test.ts passed successfully!');

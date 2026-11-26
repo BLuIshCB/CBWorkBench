@@ -56,7 +56,7 @@
         <button class="tab-btn active" data-filter="all" onclick="app.setFilter('all')">全部 (<span id="count-all">0</span>)</button>
         <button class="tab-btn" data-filter="pending_confirm" onclick="app.setFilter('pending_confirm')">待启动确认 (<span id="count-pending">0</span>)</button>
         <button class="tab-btn" data-filter="running" onclick="app.setFilter('running')">执行中 (<span id="count-running">0</span>)</button>
-        <button class="tab-btn" data-filter="human_review" onclick="app.setFilter('human_review')">最终人工审核 (<span id="count-review">0</span>)</button>
+        <button class="tab-btn" data-filter="human_review" onclick="app.setFilter('human_review')">待人工审核 (<span id="count-review">0</span>)</button>
         <button class="tab-btn" data-filter="blocked" onclick="app.setFilter('blocked')">异常待处理 (<span id="count-blocked">0</span>)</button>
         <button class="tab-btn" data-filter="completed" onclick="app.setFilter('completed')">已完成 (<span id="count-completed">0</span>)</button>
       </div>
@@ -130,13 +130,13 @@
         <div class="review-header">
           <span class="gate-icon">⚖️</span>
           <div>
-            <h3>门禁 3：最终人工审核</h3>
-            <p>Reviewer 自动验收已通过！请核对轮次执行与测试证据，给出最终人工审核结论。</p>
+            <h3 id="manual-review-title">待人工审核</h3>
+            <p id="manual-review-directions"></p>
           </div>
         </div>
         <div class="review-actions">
-          <button class="btn btn-success" onclick="app.handleHumanDecision('approve')">审核通过 (完成任务)</button>
-          <button class="btn btn-danger" onclick="app.showRejectModal()">退回修改 (继续循环)</button>
+          <button class="btn btn-success" id="manual-review-approve" onclick="app.handleHumanDecision('approve')">审核通过</button>
+          <button class="btn btn-danger" onclick="app.showRejectModal()">退回</button>
         </div>
       </div>
 
@@ -307,7 +307,7 @@
         <button class="close-btn" onclick="app.closeRejectModal()">×</button>
       </div>
       <div class="modal-body">
-        <p>退回后将再次调用 Worker 修复，并重新通过自动化测试与 Codex 验收方可再次审核。</p>
+        <p id="manual-reject-direction"></p>
         <textarea id="reject-reason-input" class="form-control" rows="5" placeholder="请详细说明退回原因、未达标的事项或业务修改意见..."></textarea>
       </div>
       <div class="modal-footer">

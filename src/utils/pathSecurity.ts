@@ -38,6 +38,16 @@ export function encodeNodeDirName(nodeId: string): string {
   return `n_${slug}--h${hash}`;
 }
 
+/** 模板节点 ID 同时用作材料目录和同名 Markdown 文件的基本名。 */
+export function isWorkflowMaterialNodeId(nodeId: string): boolean {
+  return /^[a-z0-9_-]{1,252}$/.test(nodeId) && nodeId !== 'shared' &&
+    !WINDOWS_RESERVED_NAMES.has(nodeId);
+}
+
+export function workflowMaterialNodeDirName(nodeId: string): string {
+  return isWorkflowMaterialNodeId(nodeId) ? nodeId : encodeNodeDirName(nodeId);
+}
+
 export function validatePackageRelativePath(relPath: string): {
   valid: boolean;
   reason?: string;

@@ -25,7 +25,7 @@ import { PackageProtocolError } from '../services/packageProtocol.ts';
 import { packageService } from '../services/packageService.ts';
 import { taskCleanupService } from '../services/taskCleanupService.ts';
 import { executionTimeoutSchema } from '../services/executionPolicy.ts';
-import { encodeNodeDirName, PathSecurityError } from '../utils/pathSecurity.ts';
+import { workflowMaterialNodeDirName, PathSecurityError } from '../utils/pathSecurity.ts';
 import { advanceInputShape, reportNodeCompletion } from '../services/nodeCompletion.ts';
 import { createWorkflowSchema, createWorkflowTemplate } from '../services/workflowTemplateService.ts';
 
@@ -252,7 +252,7 @@ export function createWorkbenchMcpServer(advanceOnly = false): McpServer {
             ...n,
             ...(n.type === 'task'
               ? {
-                  dir_name: encodeNodeDirName(n.id),
+                  dir_name: workflowMaterialNodeDirName(n.id),
                   material_contract: buildUniformNodeMaterialContract(n),
                 }
               : {}),

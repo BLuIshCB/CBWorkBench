@@ -53,10 +53,12 @@ import {
   computeWorkflowDefinitionSha256,
   type WorkflowNode,
 } from '../services/workflowDefinition.ts';
-import { encodeNodeDirName } from '../utils/pathSecurity.ts';
+import { workflowMaterialNodeDirName } from '../utils/pathSecurity.ts';
 import { EMBEDDED_ASSETS } from '../ui/embeddedAssets.ts';
 import { uiActivityTracker } from '../services/uiActivityTracker.ts';
-import { exportWorkflowTemplate, importWorkflowTemplate } from '../services/workflowTemplateService.ts';
+import {
+  buildWorkflowFile, exportWorkflowTemplate, importWorkflowTemplate, serializeWorkflowFile, WORKFLOW_FILE_MAX_BYTES,
+} from '../services/workflowTemplateService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -130,17 +132,18 @@ function writeCliEntry(cliId: string, executable: string, script?: string): void
   runtimeService.invalidate(cliId);
 }
 
-export async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
+class RequestBodyTooLargeError extends Error {}
+
+export async function parseJsonBody(req: http.IncomingMessage, limit = 5 * 1024 * 1024): Promise<any> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    const limit = 5 * 1024 * 1024;
     let size = 0;
     req.on('data', (chunk: Buffer) => {
       if (size > limit) return;
       size += chunk.length;
       if (size > limit) {
         chunks.length = 0;
-        reject(new Error('Payload too large'));
+        reject(new RequestBodyTooLargeError('Payload too large'));
         return;
       }
       chunks.push(chunk);
@@ -166,6 +169,21 @@ function sendWorkflowTemplateError(res: http.ServerResponse, error: PackageProto
   sendJson(res, error.code === 'WORKFLOW_NOT_FOUND' ? 404 : 400, {
     success: false, code: error.code, message: error.message, details: error.details,
   });
+}
+
+async function readWorkflowRequestBody(req: http.IncomingMessage, res: http.ServerResponse): Promise<any> {
+  try {
+    return await parseJsonBody(req, WORKFLOW_FILE_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      sendJson(res, 413, { success: false, code: 'WORKFLOW_FILE_TOO_LARGE', message: '工作流 JSON 不能超过 5 MiB' });
+    } else {
+      sendWorkflowTemplateError(res, new PackageProtocolError(
+        'INVALID_WORKFLOW', error instanceof Error ? error.message : '工作流请求不是有效的 JSON',
+      ));
+    }
+    return undefined;
+  }
 }
 
 export function sendJson(res: http.ServerResponse, statusCode: number, data: any): void {
@@ -610,16 +628,21 @@ export function createHttpServer(): http.Server {
         return;
       }
 
-      const humanReviewMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/human-review$/);
+      const humanReviewMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/(?:human-review|workflow\/manual-decision)$/);
       if (humanReviewMatch && method === 'POST') {
         const taskId = humanReviewMatch[1];
         const body = await parseJsonBody(req);
-        if (!body.action || !['approve', 'reject'].includes(body.action)) {
+        if (!['approve', 'reject'].includes(body?.action)) {
           sendJson(res, 400, { success: false, message: 'action must be "approve" or "reject"' });
           return;
         }
-        const result = await workflowEngine.submitHumanDecision(taskId, body.action, body.reason || '');
-        sendJson(res, result.success ? 200 : 400, result);
+        if (typeof body.attempt_id !== 'string' || !body.attempt_id.trim() ||
+            (body.reason !== undefined && typeof body.reason !== 'string')) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: '请提供待审核的执行 ID，退回意见须为文本。' });
+          return;
+        }
+        const result = await workflowEngine.submitHumanDecision(taskId, body.attempt_id, body.action, body.reason || '');
+        sendJson(res, result.success ? 200 : result.code === 'STALE_MANUAL_REVIEW' ? 409 : 400, result);
         return;
       }
 
@@ -796,15 +819,8 @@ export function createHttpServer(): http.Server {
       }
 
       if (pathname === '/api/workflows/import' && method === 'POST') {
-        let input: unknown;
-        try {
-          input = await parseJsonBody(req);
-        } catch (error) {
-          sendWorkflowTemplateError(res, new PackageProtocolError(
-            'INVALID_WORKFLOW', error instanceof Error ? error.message : '工作流文件不是有效的 JSON',
-          ));
-          return;
-        }
+        const input = await readWorkflowRequestBody(req, res);
+        if (input === undefined) return;
 
         try {
           sendJson(res, 201, { success: true, workflow_id: importWorkflowTemplate(input) });
@@ -823,7 +839,7 @@ export function createHttpServer(): http.Server {
           return;
         }
         try {
-          const body = JSON.stringify(exportWorkflowTemplate(id), null, 2) + '\n';
+          const body = serializeWorkflowFile(exportWorkflowTemplate(id));
           res.writeHead(200, {
             'Content-Type': 'application/json; charset=utf-8',
             'Content-Disposition': 'attachment; filename="workflow.json"',
@@ -884,7 +900,7 @@ export function createHttpServer(): http.Server {
           ...n,
           ...(n.type === 'task'
             ? {
-                dir_name: encodeNodeDirName(n.id),
+                dir_name: workflowMaterialNodeDirName(n.id),
                 material_contract: buildUniformNodeMaterialContract(n),
               }
             : {}),
@@ -908,8 +924,9 @@ export function createHttpServer(): http.Server {
       }
 
       if (pathname === '/api/workflows' && method === 'POST') {
-        const body = await parseJsonBody(req);
-        if (!body.id || typeof body.id !== 'string') {
+        const body = await readWorkflowRequestBody(req, res);
+        if (body === undefined) return;
+        if (typeof body?.id !== 'string' || !body.id.trim()) {
           sendJson(res, 400, { success: false, message: '工作流 ID (id) 为必填项' });
           return;
         }
@@ -946,11 +963,13 @@ export function createHttpServer(): http.Server {
         }
 
         try {
+          const designNodes = toWorkflowDesignNodes(body.nodes);
+          const file = buildWorkflowFile({ name: body.name, description: body.description, nodes: designNodes });
           const saved = db.saveWorkflowDefinition({
             id: trimmedId,
-            name: body.name.trim(),
-            description: body.description || null,
-            nodes_json: JSON.stringify(toWorkflowDesignNodes(body.nodes)),
+            name: file.name,
+            description: file.description || null,
+            nodes_json: JSON.stringify(designNodes),
             is_default: body.is_default ? 1 : 0,
           });
 
@@ -960,6 +979,10 @@ export function createHttpServer(): http.Server {
             workflow: saved,
           });
         } catch (e: any) {
+          if (e instanceof PackageProtocolError) {
+            sendWorkflowTemplateError(res, e);
+            return;
+          }
           sendJson(res, 400, {
             success: false,
             message: e.message || '保存工作流失败',
@@ -1053,20 +1076,6 @@ export function createHttpServer(): http.Server {
           nodeRuns,
           nodeExecutionCounts,
         });
-        return;
-      }
-
-      // Task Manual Decision API
-      const manualDecisionMatch = pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_\-]+)\/workflow\/manual-decision$/);
-      if (manualDecisionMatch && method === 'POST') {
-        const taskId = manualDecisionMatch[1];
-        const body = await parseJsonBody(req);
-        if (!body.action || !['approve', 'reject'].includes(body.action)) {
-          sendJson(res, 400, { success: false, message: 'action must be "approve" or "reject"' });
-          return;
-        }
-        const result = await workflowEngine.submitHumanDecision(taskId, body.action, body.reason || '');
-        sendJson(res, result.success ? 200 : 400, result);
         return;
       }
 

@@ -96,14 +96,20 @@ console.log('  ✓ Rejects unreachable orphan nodes');
 
 // 8. Reject infinite cycle with no path to end
 const cycleNodes: WorkflowNode[] = [
-  { id: 'start', name: '开始', description: '进入环路。', type: 'start', on_success: 'taskA' },
+  { id: 'start', name: '开始', description: '进入首个任务。', type: 'start', on_success: 'entry' },
+  { id: 'entry', name: '入口', description: '失败时进入环路。', type: 'task', execution_mode: 'agent', on_success: 'end', on_failure: 'taskA' },
   { id: 'taskA', name: 'A', description: '执行 A。', type: 'task', execution_mode: 'agent', on_success: 'taskB', on_failure: 'taskB' },
   { id: 'taskB', name: 'B', description: '执行 B。', type: 'task', execution_mode: 'agent', on_success: 'taskA', on_failure: 'taskA' },
   { id: 'end', name: '结束', description: '完成流程。', type: 'end' },
 ];
 const cycleRes = validateWorkflowNodes(cycleNodes);
 assert.strictEqual(cycleRes.valid, false);
-assert(cycleRes.errors.some((e) => e.includes('无法到达结束节点') || e.includes('结束节点必须至少有一条入线')));
+assert.deepEqual(cycleRes.errors, [
+  '节点 taskA 无法到达结束节点（闭环无出口）',
+  '节点 taskB 无法到达结束节点（闭环无出口）',
+]);
+const cycleWithExit = cycleNodes.map(node => node.id === 'taskB' ? { ...node, on_failure: 'entry' } : node);
+assert.equal(validateWorkflowNodes(cycleWithExit).valid, true);
 console.log('  ✓ Rejects graph where nodes cannot reach end');
 
 console.log('✅ workflowDefinition.test.ts passed successfully!');

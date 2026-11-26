@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createWorkbenchMcpServer } from '../src/server/mcpServer.ts';
-import { TaskStatus } from '../src/config/constants.ts';
+import { DATA_DIR, TaskStatus } from '../src/config/constants.ts';
 import { db } from '../src/storage/db.ts';
 import { taskFileStore } from '../src/storage/fileStore.ts';
 
@@ -74,7 +74,10 @@ function buildLocalPackage(opts: {
   fs.writeFileSync(path.join(opts.dir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
 }
 
-const tmpPkgRoot1 = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-mcp-pkg1-'));
+const draftsDir = path.join(DATA_DIR, 'task-drafts');
+fs.mkdirSync(draftsDir, { recursive: true });
+const draftTaskDir = fs.mkdtempSync(path.join(draftsDir, 'cb-mcp-pkg-'));
+const tmpPkgRoot1 = path.join(draftTaskDir, 'r0001');
 const tmpPkgRoot2 = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-mcp-pkg2-'));
 
 try {
@@ -152,6 +155,23 @@ try {
   assert.equal(invalidWorkflow.error.details[0].field, 'steps[0].on_failure');
   assert.equal(db.listWorkflows().length, workflowCount);
 
+  const wrongType = await client.callTool({
+    name: 'workbench_create_workflow',
+    arguments: { name: '字段错误', steps: [{ name: '开发', description: '完成修改。', execution_mode: 'invalid' }] },
+  });
+  assert.equal(wrongType.isError, true);
+  assert.match((wrongType.content as any)[0].text, /-32602.*Input validation error/);
+
+  const oversized = await client.callTool({
+    name: 'workbench_create_workflow',
+    arguments: { name: '超限流程', steps: [{ name: '开发', description: '字'.repeat(2 * 1024 * 1024) }] },
+  });
+  assert.equal(oversized.isError, true);
+  const oversizedError = JSON.parse((oversized.content as any)[0].text).error;
+  assert.equal(oversizedError.code, 'INVALID_WORKFLOW');
+  assert.match(oversizedError.message, /5 MiB/);
+  assert.equal(db.listWorkflows().length, workflowCount);
+
   // 2. Query protocol capabilities
   const protoRes = await client.callTool({ name: 'workbench_get_package_protocol', arguments: {} });
   const protoData = JSON.parse((protoRes.content as any)[0].text);
@@ -160,6 +180,10 @@ try {
   assert.deepStrictEqual(protoData.supported_source_modes, ['local_path']);
   assert.ok(protoData.instance.instance_id);
   assert.ok(path.isAbsolute(protoData.instance.data_dir));
+  assert.equal(
+    protoData.templates.submit_task.package_root,
+    path.join(protoData.instance.data_dir, 'task-drafts', 'example-task-a1b2c3', 'r0001')
+  );
 
   // 3. Query workflows via MCP
   const listWfRes = await client.callTool({ name: 'workbench_list_workflows', arguments: {} });
@@ -397,6 +421,6 @@ try {
 } finally {
   await client.close();
   await server.close();
-  fs.rmSync(tmpPkgRoot1, { recursive: true, force: true });
+  fs.rmSync(draftTaskDir, { recursive: true, force: true });
   fs.rmSync(tmpPkgRoot2, { recursive: true, force: true });
 }

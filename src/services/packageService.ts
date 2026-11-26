@@ -28,7 +28,7 @@ import {
 } from './packageProtocol.ts';
 import {
   computeBufferSha256,
-  encodeNodeDirName,
+  workflowMaterialNodeDirName,
   readRegularFileSafely,
   validateUtf8NoBom,
 } from '../utils/pathSecurity.ts';
@@ -319,7 +319,7 @@ export class PackageService {
     }
 
     const reqPath = query.resource_path;
-    const nodeDirName = encodeNodeDirName(query.node_id);
+    const nodeDirName = workflowMaterialNodeDirName(query.node_id);
     const nodePrefix = `nodes/${nodeDirName}/`;
 
     let mappedAttemptRel: string | null = null;

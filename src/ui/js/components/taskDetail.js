@@ -8,6 +8,28 @@ import { populateModelPicker, updateModelPicker, getModelValue } from './modelPi
 export const TaskDetail = {
   selectedNodeId: null,
 
+  getPendingReview(data) {
+    const { task, taskWorkflow, workflowNodeRuns } = data || {};
+    if (task?.status !== 'human_review' || !taskWorkflow?.current_run_id) return null;
+    const run = workflowNodeRuns?.find(item => item.run_id === taskWorkflow.current_run_id);
+    if (run?.status !== 'waiting_manual' || run.node_id !== taskWorkflow.current_node_id) return null;
+    let nodes;
+    try {
+      nodes = JSON.parse(taskWorkflow.nodes_json);
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(nodes)) return null;
+    const node = nodes.find(item => item.id === run.node_id);
+    if (node?.execution_mode !== 'manual') return null;
+    return {
+      runId: run.run_id,
+      nodeName: node.name,
+      successTarget: nodes.find(item => item.id === node.on_success),
+      failureTarget: nodes.find(item => item.id === node.on_failure),
+    };
+  },
+
   render(data, availableAdapters, activeDetailTab, currentMaterialSubtab, currentResourcePath) {
     const { task, latestRevision, manifest, packageFiles, rounds, testRuns, acceptanceRuns, taskWorkflow } = data;
 
@@ -89,10 +111,21 @@ export const TaskDetail = {
       }
     }
 
-    // 4. Gate 3 Human Review Banner
+    // 4. 当前人工门禁
     const gate3Card = document.getElementById('gate3-card');
     if (gate3Card) {
-      gate3Card.style.display = task.status === 'human_review' ? 'flex' : 'none';
+      const review = this.getPendingReview(data);
+      gate3Card.style.display = review ? 'flex' : 'none';
+      if (review) {
+        const title = document.getElementById('manual-review-title');
+        const directions = document.getElementById('manual-review-directions');
+        const approve = document.getElementById('manual-review-approve');
+        const next = review.successTarget?.type === 'end' ? '结束流程'
+          : review.successTarget?.name || '暂停任务';
+        if (title) title.textContent = `待人工审核 · ${review.nodeName}`;
+        if (directions) directions.textContent = `通过后：${next}。退回后：${review.failureTarget?.name || '暂停任务'}。`;
+        if (approve) approve.textContent = review.successTarget?.type === 'end' ? '通过并结束流程' : '审核通过';
+      }
     }
 
     // 5. Blocked / Cleanup Failed Alert

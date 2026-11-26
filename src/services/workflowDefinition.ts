@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { encodeNodeDirName } from '../utils/pathSecurity.ts';
+import { workflowMaterialNodeDirName } from '../utils/pathSecurity.ts';
 
 export type WorkflowNodeType = 'start' | 'end' | 'task';
 export type TaskExecutionMode = 'agent' | 'manual';
@@ -46,6 +46,7 @@ export interface UniformNodeMaterialContract {
 }
 
 export const DEFAULT_WORKFLOW_ID = 'default';
+const DEFAULT_MANUAL_REVIEW_NODE_ID = 'human_review';
 export const DEFAULT_MAX_EXECUTIONS = 0; // 0 表示不做次数限制
 
 export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
@@ -85,11 +86,11 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
     execution_mode: 'agent',
     result_rule: 'acceptance',
     max_executions: DEFAULT_MAX_EXECUTIONS,
-    on_success: 'human_review',
+    on_success: DEFAULT_MANUAL_REVIEW_NODE_ID,
     on_failure: 'development',
   },
   {
-    id: 'human_review',
+    id: DEFAULT_MANUAL_REVIEW_NODE_ID,
     name: '人工确认',
     description: '人类工程师复核最终交付结果、运行产物与待办人工核验项，决定通过或退回。',
     type: 'task',
@@ -166,7 +167,7 @@ export function computeWorkflowDefinitionSha256(wf: {
 
 export function buildUniformNodeMaterialContract(node: WorkflowNode): UniformNodeMaterialContract | null {
   if (node.type !== 'task') return null;
-  const dirName = encodeNodeDirName(node.id);
+  const dirName = workflowMaterialNodeDirName(node.id);
   const purpose = node.description?.trim() || '';
   const instructionUsage: UniformNodeMaterialContract['instruction_usage'] =
     node.execution_mode === 'manual' ? 'manual_guide' : 'agent_prompt';
@@ -198,7 +199,7 @@ export function buildUniformNodeMaterialContract(node: WorkflowNode): UniformNod
  * 7. All targets (on_success, on_failure) must reference existing nodes.
  * 8. All nodes must be reachable from 'start'.
  * 9. Every node must have at least one path to 'end' (no dead-end loops without exit).
- * 10. For default delivery workflow (id === 'default'): cannot bypass required testing/acceptance/manual confirmation.
+ * 10. The default workflow includes testing, acceptance and a final manual review before end.
  * 11. New workflow definitions require names and descriptions; existing task snapshots are exempt.
  */
 export function validateWorkflowNodes(
@@ -283,9 +284,14 @@ export function validateWorkflowNodes(
     }
   }
 
-  const incomingCount = new Map<string, number>();
-  for (const node of nodes) {
-    incomingCount.set(node.id, 0);
+  const predecessors = new Map<string, string[]>();
+  const addPredecessor = (target: string, source: string) => {
+    const sources = predecessors.get(target);
+    if (sources) sources.push(source);
+    else predecessors.set(target, [source]);
+  };
+  if (startNode?.on_success && nodeMap.get(startNode.on_success)?.type === 'task') {
+    addPredecessor(startNode.on_success, startNode.id);
   }
 
   for (const node of nodes) {
@@ -315,7 +321,7 @@ export function validateWorkflowNodes(
         } else if (node.on_success === startNode?.id) {
           errors.push(`连线不得返回开始节点 (${node.id} -> ${node.on_success})`);
         } else {
-          incomingCount.set(node.on_success, (incomingCount.get(node.on_success) || 0) + 1);
+          addPredecessor(node.on_success, node.id);
         }
       }
 
@@ -327,17 +333,17 @@ export function validateWorkflowNodes(
         } else if (node.on_failure === endNode?.id) {
           errors.push(`任务节点 ${node.id} 的失败去向不能直接连向结束节点`);
         } else {
-          incomingCount.set(node.on_failure, (incomingCount.get(node.on_failure) || 0) + 1);
+          addPredecessor(node.on_failure, node.id);
         }
       }
     }
   }
 
-  if (startNode && (incomingCount.get(startNode.id) || 0) > 0) {
+  if (startNode && predecessors.has(startNode.id)) {
     errors.push('开始节点不得有任何入线');
   }
 
-  if (endNode && (incomingCount.get(endNode.id) || 0) === 0) {
+  if (endNode && !predecessors.has(endNode.id)) {
     errors.push('结束节点必须至少有一条入线');
   }
 
@@ -347,8 +353,8 @@ export function validateWorkflowNodes(
     const queue: string[] = [startNode.id];
     reachableFromStart.add(startNode.id);
 
-    while (queue.length > 0) {
-      const currId = queue.shift()!;
+    for (let index = 0; index < queue.length; index++) {
+      const currId = queue[index];
       const currNode = nodeMap.get(currId);
       if (!currNode) continue;
 
@@ -372,20 +378,13 @@ export function validateWorkflowNodes(
 
     // Reachability to end analysis
     if (endNode) {
-      const canReachEnd = new Set<string>();
-      canReachEnd.add(endNode.id);
-
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const node of nodes) {
-          if (canReachEnd.has(node.id)) continue;
-          if (
-            (node.on_success && canReachEnd.has(node.on_success)) ||
-            (node.on_failure && canReachEnd.has(node.on_failure))
-          ) {
-            canReachEnd.add(node.id);
-            changed = true;
+      const canReachEnd = new Set([endNode.id]);
+      const reverseQueue = [endNode.id];
+      for (let index = 0; index < reverseQueue.length; index++) {
+        for (const predecessor of predecessors.get(reverseQueue[index]) ?? []) {
+          if (!canReachEnd.has(predecessor)) {
+            canReachEnd.add(predecessor);
+            reverseQueue.push(predecessor);
           }
         }
       }
@@ -405,6 +404,11 @@ export function validateWorkflowNodes(
       if (!nodeMap.has(reqNode)) {
         errors.push(`默认开发交付工作流必须包含必需节点: ${reqNode}`);
       }
+    }
+    const review = nodeMap.get(DEFAULT_MANUAL_REVIEW_NODE_ID);
+    if (review?.type !== 'task' || review.execution_mode !== 'manual' ||
+        review.on_success !== endNode.id || predecessors.get(endNode.id)?.length !== 1) {
+      errors.push('默认开发交付工作流必须由末尾的人工确认节点通过后才能结束');
     }
   }
 

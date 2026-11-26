@@ -8,6 +8,8 @@
 import { api } from '../api.js';
 import { escapeHtml } from '../utils.js';
 
+const WORKFLOW_FILE_MAX_BYTES = 5 * 1024 * 1024;
+
 export class WorkflowView {
   constructor(app) {
     this.app = app;
@@ -22,7 +24,7 @@ export class WorkflowView {
     await this.loadWorkflows();
   }
 
-  async loadWorkflows(preferredId = this.currentWorkflow?.id) {
+  async loadWorkflows(preferredId = this.currentWorkflow?.id, { preserveEdits = false } = {}) {
     try {
       const res = await api.getWorkflows();
       if (res && res.success) {
@@ -30,26 +32,36 @@ export class WorkflowView {
         const workflow = this.workflows.find(w => w.id === preferredId)
           || this.workflows.find(w => w.id === 'default')
           || this.workflows[0];
-        if (workflow) await this.selectWorkflow(workflow.id);
+        if (workflow) return await this.selectWorkflow(workflow.id, { preserveEdits });
       }
     } catch (e) {
       console.error('Failed to load workflows:', e);
     }
   }
 
-  async selectWorkflow(id) {
+  async selectWorkflow(id, { preserveEdits = false } = {}) {
     try {
       const res = await api.getWorkflow(id);
       if (res && res.success) {
+        if (preserveEdits && this.hasUnsavedEdits()) {
+          this.render();
+          return false;
+        }
         this.currentWorkflow = res.workflow;
         this.currentNodes = JSON.parse(JSON.stringify(res.workflow.nodes || []));
         this.selectedNodeId = this.currentNodes[0]?.id || null;
         this.connectPending = null;
         this.render();
+        return true;
       }
     } catch (e) {
       alert(`加载工作流失败: ${e.message}`);
     }
+  }
+
+  hasUnsavedEdits() {
+    return Boolean(this.currentWorkflow) &&
+      JSON.stringify(this.currentNodes) !== JSON.stringify(this.currentWorkflow.nodes || []);
   }
 
   render() {
@@ -155,10 +167,14 @@ export class WorkflowView {
     input.value = '';
     if (!file) return;
     try {
+      if (file.size > WORKFLOW_FILE_MAX_BYTES) {
+        throw new Error('工作流 JSON 不能超过 5 MiB');
+      }
       const workflow = JSON.parse(await file.text());
       const result = await api.importWorkflow(workflow);
       if (!result.success) throw new Error(result.message || '无法导入工作流');
-      await this.loadWorkflows(result.workflow_id);
+      const selected = await this.loadWorkflows(result.workflow_id, { preserveEdits: true });
+      if (selected === false) alert('已导入新工作流。当前编辑已保留，请先保存后再从列表选择新模板。');
     } catch (error) {
       alert(`导入工作流失败：${error.message}`);
     }
@@ -397,8 +413,15 @@ export class WorkflowView {
     const isStart = node.type === 'start';
     const isEnd = node.type === 'end';
     const isManual = node.execution_mode === 'manual';
+    const isRequiredReview = this.isDefaultManualReview(node.id);
     const requiresAutomaticResult = node.result_rule === 'verification' || node.result_rule === 'acceptance';
     const otherNodes = this.currentNodes.filter((n) => n.id !== node.id && n.type !== 'start');
+    let gateHint = '开启后，流程到此节点时等待人工通过或退回。';
+    if (isRequiredReview) {
+      gateHint = '默认开发交付流程必须经过此人工确认节点才能结束。';
+    } else if (requiresAutomaticResult) {
+      gateHint = '测试和验收节点自动执行，可在其后添加独立的人工门禁节点。';
+    }
 
     return `
       <div class="node-config-header">
@@ -428,11 +451,11 @@ export class WorkflowView {
             ? `
           <div class="form-group">
             <label for="workflow-node-manual-gate">
-              <input id="workflow-node-manual-gate" type="checkbox" ${isManual ? 'checked' : ''} ${isLocked || requiresAutomaticResult ? 'disabled' : ''}
+              <input id="workflow-node-manual-gate" type="checkbox" ${isManual ? 'checked' : ''} ${isLocked || requiresAutomaticResult || (isRequiredReview && isManual) ? 'disabled' : ''}
                 onchange="app.workflowView.updateCurrentNodeField('execution_mode', this.checked ? 'manual' : 'agent')">
               人工门禁
             </label>
-            <small class="form-hint">${requiresAutomaticResult ? '测试和验收节点自动执行，可在其后添加独立的人工门禁节点。' : '开启后，流程到此节点时等待人工通过或退回。'}</small>
+            <small class="form-hint">${gateHint}</small>
           </div>
           <div class="form-group">
             <label class="form-label">最大执行次数 (0 或留空为不限制)</label>
@@ -484,7 +507,7 @@ export class WorkflowView {
         }
 
         ${
-          !isStart && !isEnd && !isLocked
+          !isStart && !isEnd && !isLocked && !isRequiredReview
             ? `
           <div class="node-actions-footer">
             <button class="btn btn-sm btn-danger" onclick="app.workflowView.deleteCurrentNode('${node.id}')">🗑️ 删除该节点</button>
@@ -497,6 +520,10 @@ export class WorkflowView {
   }
 
   // --- Node Actions ---
+
+  isDefaultManualReview(id) {
+    return this.currentWorkflow?.id === 'default' && id === 'human_review';
+  }
 
   selectNode(id) {
     if (this.connectPending) {
@@ -543,6 +570,7 @@ export class WorkflowView {
   updateCurrentNodeField(field, value) {
     const node = this.currentNodes.find((n) => n.id === this.selectedNodeId);
     if (!node) return;
+    if (field === 'execution_mode' && value !== 'manual' && this.isDefaultManualReview(node.id)) return;
     node[field] = value;
     this.render();
   }
@@ -565,7 +593,8 @@ export class WorkflowView {
     const name = prompt('请输入新任务节点名称 (如: 压力测试 / 代码重构):');
     if (!name || !name.trim()) return;
 
-    const baseId = name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'task';
+    const suffix = name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 64);
+    const baseId = suffix ? `task_${suffix}` : 'task';
     let id = baseId;
     let count = 1;
     while (this.currentNodes.some((n) => n.id === id)) {
@@ -605,6 +634,8 @@ export class WorkflowView {
       alert('该工作流正被任务引用，处于锁定状态，禁止删除节点！');
       return;
     }
+
+    if (this.isDefaultManualReview(id)) return;
 
     const node = this.currentNodes.find((n) => n.id === id);
     if (!node || node.type === 'start' || node.type === 'end') {
@@ -653,7 +684,9 @@ export class WorkflowView {
         name: this.currentWorkflow.name,
         description: this.currentWorkflow.description,
         is_default: this.currentWorkflow.isDefault ? 1 : 0,
-        nodes: this.currentNodes,
+        nodes: this.currentNodes.map(({ id, name, description, type, execution_mode, result_rule, max_executions, on_success, on_failure }) => ({
+          id, name, description, type, execution_mode, result_rule, max_executions, on_success, on_failure,
+        })),
       });
 
       if (!res.success) {

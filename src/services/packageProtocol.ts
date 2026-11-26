@@ -451,7 +451,7 @@ export function buildPackageProtocolSpec(instanceInfo: {
       node_md: '# 节点工作文档：[节点名称] ([node_id])\n\n## 1. 节点目标与职责\n\n## 2. 具体工作项与执行清单\n- [ ] 步骤 1：...\n\n## 3. 交付物与完成条件\n',
       prompt_md: '你负责 [节点名称]。\n说明本节点的工作步骤、必需证据和完成条件，参考需求文档及已提供的补充材料。\n',
       submit_task: {
-        package_root: 'D:/CODE/PROJECT/.cb-flow/task-01',
+        package_root: path.join(instanceInfo.data_dir, 'task-drafts', 'example-task-a1b2c3', 'r0001'),
       },
     },
   };

@@ -122,11 +122,17 @@ db.createTask({
   status: TaskStatus.HUMAN_REVIEW,
   target_cwd: process.cwd(),
 });
-const badReview = await workflowEngine.submitHumanDecision(stopTaskId, 'approve', 'ok');
+const badReview = await workflowEngine.submitHumanDecision(stopTaskId, 'missing-run', 'approve', 'ok');
 assert.strictEqual(badReview.success, false);
-assert.ok(badReview.message.includes('not in human review'));
+assert.equal(badReview.code, 'STALE_MANUAL_REVIEW');
 
-const approveRes = await workflowEngine.submitHumanDecision(reviewTaskId, 'approve', 'Looks great, verified manually!');
+const reviewRunId = 'run-' + reviewTaskId;
+db.createNodeRun({
+  run_id: reviewRunId, task_id: reviewTaskId, revision: 1, node_id: 'human_review',
+  execution_index: 1, round_number: 1, code_generation: 0, status: 'waiting_manual',
+});
+db.updateTaskWorkflow(reviewTaskId, { current_node_id: 'human_review', current_run_id: reviewRunId });
+const approveRes = await workflowEngine.submitHumanDecision(reviewTaskId, reviewRunId, 'approve', 'Looks great, verified manually!');
 assert.strictEqual(approveRes.success, true);
 const approvedTask = db.getTask(reviewTaskId);
 assert.strictEqual(approvedTask?.status, TaskStatus.COMPLETED);
@@ -162,7 +168,7 @@ const devRound = db.getRounds(loopTaskId).find((r) => r.worker_id === 'developme
 assert.ok(devRound?.input_prompt?.includes('Execute development'), '使用冻结的 prompt.md');
 assert.ok(devRound?.input_prompt?.includes('# 开发实现'), '已提供的节点说明传入执行器');
 
-const reworkRes = await workflowEngine.submitHumanDecision(loopTaskId, 'reject', 'Need more polish');
+const reworkRes = await workflowEngine.submitHumanDecision(loopTaskId, db.getTaskWorkflow(loopTaskId)!.current_run_id!, 'reject', 'Need more polish');
 assert.strictEqual(reworkRes.success, true);
 assert.deepEqual(db.getPendingReworkDocuments(loopTaskId, 1, 'development').map(file => file.content), ['Need more polish']);
 

@@ -219,9 +219,15 @@ export class WorkflowEngine {
 
   async submitHumanDecision(
     taskId: string,
+    attemptId: string,
     action: 'approve' | 'reject',
     reason: string
-  ): Promise<{ success: boolean; message: string }> {
+  ): Promise<{ success: boolean; message: string; code?: string }> {
+    const staleDecision = {
+      success: false,
+      code: 'STALE_MANUAL_REVIEW',
+      message: '这次待审执行已变更，请刷新任务后重新审核。',
+    };
     const task = db.getTask(taskId);
     if (!task) return { success: false, message: 'Task not found' };
 
@@ -230,17 +236,15 @@ export class WorkflowEngine {
     }
 
     if (task.status !== TaskStatus.HUMAN_REVIEW) {
-      return { success: false, message: `Task is not in human review state (current: ${task.status})` };
+      return staleDecision;
     }
 
     if (action === 'reject' && this.isBusy()) {
       return { success: false, message: `Workbench is currently executing another task: ${this.activeTaskId}` };
     }
 
-    let taskWf = db.getTaskWorkflow(taskId);
-    if (!taskWf) {
-      taskWf = db.initTaskWorkflow(taskId, { revision: task.revision });
-    }
+    const taskWf = db.getTaskWorkflow(taskId);
+    if (!attemptId || taskWf?.current_run_id !== attemptId) return staleDecision;
 
     let nodes: WorkflowNode[] = [];
     try {
@@ -248,21 +252,16 @@ export class WorkflowEngine {
     } catch {}
 
     const currentNodeId = taskWf.current_node_id;
-    let currentNode = nodes.find((n) => n.id === currentNodeId);
-    if (!currentNode || currentNode.execution_mode !== 'manual') {
-      const manualNode = nodes.find((n) => n.execution_mode === 'manual');
-      if (manualNode) currentNode = manualNode;
-    }
-
-    const activeRun = taskWf.current_run_id ? db.getNodeRunByRunId(taskWf.current_run_id) : null;
-    const candidateRun = activeRun?.status === 'waiting_manual' ? activeRun : db.getLatestNodeRun(taskId, currentNode?.id || currentNodeId);
-    const latestRun = candidateRun?.revision === task.revision && candidateRun.status === 'waiting_manual' &&
-      candidateRun.node_id === currentNode?.id ? candidateRun : null;
+    const currentNode = nodes.find((n) => n.id === currentNodeId);
+    const latestRun = db.getNodeRunByRunId(attemptId);
+    if (currentNode?.execution_mode !== 'manual' || latestRun?.task_id !== taskId ||
+        latestRun.revision !== task.revision || latestRun.status !== 'waiting_manual' ||
+        latestRun.node_id !== currentNodeId) return staleDecision;
     const outcome = action === 'approve' ? 'passed' : 'failed';
     const summaryText = reason || (action === 'approve' ? '人工审核通过' : '人工审核退回');
-    const nextNodeId = action === 'approve' ? currentNode?.on_success : currentNode?.on_failure;
+    const nextNodeId = action === 'approve' ? currentNode.on_success : currentNode.on_failure;
     const nextNode = nodes.find(node => node.id === nextNodeId);
-    const reworkTarget = action === 'reject' && latestRun && currentNode ? resolveReworkTarget(latestRun, currentNode) : undefined;
+    const reworkTarget = action === 'reject' ? resolveReworkTarget(latestRun, currentNode) : undefined;
     if (reworkTarget && !reason.trim()) return { success: false, message: '请填写退回意见' };
     if (reworkTarget && Buffer.byteLength(reason, 'utf8') > PACKAGE_LIMITS.max_read_chunk_bytes) {
       return { success: false, message: '退回意见超过 256 KiB' };
@@ -275,30 +274,35 @@ export class WorkflowEngine {
       (node.result_rule === 'verification' && taskWf.tests_passed_generation !== taskWf.code_generation) ||
       (node.result_rule === 'acceptance' && taskWf.acceptance_passed_generation !== taskWf.code_generation));
     const pauseReason = !nextNode
-      ? `人工节点 [${currentNode?.name || currentNodeId}] ${action === 'approve' ? '通过' : '退回'}后未配置有效去向`
+      ? `人工节点 [${currentNode.name || currentNodeId}] ${action === 'approve' ? '通过' : '退回'}后未配置有效去向，任务已暂停。`
       : staleEvidence ? '流程到达结束节点，但测试或验收代次未对齐当前代码代次。' : null;
 
-    db.transaction(() => {
+    const applied = db.transaction(() => {
+      // 防止重复请求或其他进程已经处理了该次待审执行。
+      const freshTask = db.getTask(taskId);
+      const freshWorkflow = db.getTaskWorkflow(taskId);
+      if (freshTask?.status !== TaskStatus.HUMAN_REVIEW || freshTask.revision !== task.revision ||
+          freshWorkflow?.current_run_id !== attemptId || freshWorkflow.current_node_id !== currentNodeId ||
+          db.getNodeRunByRunId(attemptId)?.status !== 'waiting_manual') return false;
       db.saveHumanDecision({ task_id: taskId, action, reason });
-      if (latestRun) {
-        const attemptDir = latestRun.attempt_dir;
-        const result = attemptDir && fs.existsSync(attemptDir) ? this.recordNodeOutputs({
-          taskId, revision: task.revision, packageDigest: db.getRevision(taskId, task.revision)?.package_digest || '0'.repeat(64),
-          nodeId: latestRun.node_id, attemptId: latestRun.run_id, executionIndex: latestRun.execution_index,
-          codeGeneration: latestRun.code_generation, outcome, summary: summaryText,
-          issues: action === 'reject' && reason ? [{ id: 'HUMAN-REJECT', description: reason }] : [],
-          attemptDir, outputsDir: path.join(attemptDir, 'outputs'),
-        }) : null;
-        db.updateNodeRun(latestRun.run_id, {
-          status: outcome, result_summary: summaryText, result_json: result?.resultJson ?? null,
-          result_sha256: result?.resultSha256 ?? null, outputs_json: result ? JSON.stringify(result.outputsMap) : null, finished_at: Date.now(),
-        });
-        db.consumeReworkDocuments(taskId, task.revision, latestRun.node_id);
-        if (reworkTarget) {
-          db.appendReworkDocuments(latestRun, reworkTarget, [{
-            path: 'manual-decision.md', sha256: computeBufferSha256(Buffer.from(reason, 'utf8')), content: reason,
-          }]);
-        }
+      const attemptDir = latestRun.attempt_dir &&
+        taskFileStore.getNodeRunDir(taskId, latestRun.revision, latestRun.node_id, latestRun.run_id);
+      const result = attemptDir && fs.existsSync(attemptDir) ? this.recordNodeOutputs({
+        taskId, revision: task.revision, packageDigest: db.getRevision(taskId, task.revision)?.package_digest || '0'.repeat(64),
+        nodeId: latestRun.node_id, attemptId: latestRun.run_id, executionIndex: latestRun.execution_index,
+        codeGeneration: latestRun.code_generation, outcome, summary: summaryText,
+        issues: action === 'reject' && reason ? [{ id: 'HUMAN-REJECT', description: reason }] : [],
+        attemptDir, outputsDir: path.join(attemptDir, 'outputs'),
+      }) : null;
+      db.updateNodeRun(latestRun.run_id, {
+        status: outcome, result_summary: summaryText, result_json: result?.resultJson ?? null,
+        result_sha256: result?.resultSha256 ?? null, outputs_json: result ? JSON.stringify(result.outputsMap) : null, finished_at: Date.now(),
+      });
+      db.consumeReworkDocuments(taskId, task.revision, latestRun.node_id);
+      if (reworkTarget) {
+        db.appendReworkDocuments(latestRun, reworkTarget, [{
+          path: 'manual-decision.md', sha256: computeBufferSha256(Buffer.from(reason, 'utf8')), content: reason,
+        }]);
       }
       db.updateTaskWorkflow(taskId, { current_node_id: nextNode?.id, current_run_id: null });
       if (pauseReason) {
@@ -308,10 +312,12 @@ export class WorkflowEngine {
       } else {
         db.updateTaskStatus(taskId, TaskStatus.QUEUED, { blocked_reason: null, stop_requested: 0 });
       }
+      return true;
     });
 
-    if (pauseReason) return { success: false, message: pauseReason };
-    if (reachedEnd) return { success: true, message: 'Task approved and completed.' };
+    if (!applied) return staleDecision;
+    if (pauseReason) return { success: true, message: pauseReason };
+    if (reachedEnd) return { success: true, message: '审核通过，任务已完成。' };
 
     this.isProcessing = true;
     this.activeTaskId = taskId;
@@ -327,7 +333,7 @@ export class WorkflowEngine {
       });
     });
 
-    return { success: true, message: 'Manual decision recorded. Resuming workflow execution.' };
+    return { success: true, message: '审核已记录，工作流将按连线继续。' };
   }
 
   private resolveInputBindings(
@@ -858,26 +864,27 @@ export class WorkflowEngine {
 
           // Branch 1: Manual node
           if (currentNode.execution_mode === 'manual') {
-            db.createNodeRun({
-              run_id: runId,
-              task_id: taskId,
-              revision: revisionRecord.revision,
-              node_id: currentNode.id,
-              execution_index: currentExecIndex,
-              round_number: currentRound,
-              code_generation: taskWorkflow.code_generation,
-              status: 'waiting_manual',
-              completion_token: completionToken,
-              attempt_dir: materialized.paths.attemptDir,
-              inputs_json: inputsMetaJson,
+            db.transaction(() => {
+              db.createNodeRun({
+                run_id: runId,
+                task_id: taskId,
+                revision: revisionRecord.revision,
+                node_id: currentNode.id,
+                execution_index: currentExecIndex,
+                round_number: currentRound,
+                code_generation: taskWorkflow.code_generation,
+                status: 'waiting_manual',
+                completion_token: completionToken,
+                attempt_dir: materialized.paths.attemptDir,
+                inputs_json: inputsMetaJson,
+              });
+              db.updateTaskWorkflow(taskId, { current_run_id: runId });
+              db.updateTaskStatus(taskId, TaskStatus.HUMAN_REVIEW, {
+                current_stage: RoundStage.HUMAN_REVIEW,
+                active_worker_id: null,
+                current_round: currentRound,
+              });
             });
-
-            db.updateTaskStatus(taskId, TaskStatus.HUMAN_REVIEW, {
-              current_stage: RoundStage.HUMAN_REVIEW,
-              active_worker_id: null,
-              current_round: currentRound,
-            });
-            db.updateTaskWorkflow(taskId, { current_run_id: runId });
 
             logger.info(`[WorkflowEngine] Task ${taskId} reached manual node [${currentNode.name}]. Waiting for user decision.`);
             return;

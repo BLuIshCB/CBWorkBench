@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { db } from '../storage/db.ts';
-import { encodeNodeDirName } from '../utils/pathSecurity.ts';
+import { isWorkflowMaterialNodeId } from '../utils/pathSecurity.ts';
 import { PackageProtocolError } from './packageProtocol.ts';
 import { DEFAULT_WORKFLOW_NODES, validateWorkflowNodes, type WorkflowNode } from './workflowDefinition.ts';
 
@@ -25,7 +25,7 @@ export const createWorkflowSchema = z.object({
 }).strict();
 
 // 节点 ID 会进入页面绑定、材料目录和任务包校验，须能直接用作目录名。
-const nodeId = z.string().min(1).refine(id => encodeNodeDirName(id) === id, '节点 ID 必须是可直接用作材料目录的安全标识');
+const nodeId = z.string().refine(isWorkflowMaterialNodeId, '节点 ID 必须是可直接用作材料目录的安全标识');
 const nodeMetadata = { ...metadata, id: nodeId };
 const workflowFileSchema = z.object({
   ...workflowMetadata,
@@ -43,6 +43,7 @@ const workflowFileSchema = z.object({
 }).strict();
 
 type WorkflowFile = z.infer<typeof workflowFileSchema>;
+export const WORKFLOW_FILE_MAX_BYTES = 5 * 1024 * 1024;
 
 function invalid(field: string, reason: string): never {
   throw new PackageProtocolError('INVALID_WORKFLOW', `${field}：${reason}`, [{ field, reason }]);
@@ -78,6 +79,7 @@ function readWorkflowFile(input: unknown): WorkflowFile {
 
 /** 创建和导入始终生成独立模板。 */
 function insertTemplate(name: string, description: string | undefined, nodes: WorkflowNode[]): string {
+  buildWorkflowFile({ name, description, nodes });
   return db.transaction(() => {
     let id = `wf_${randomUUID()}`;
     while (db.getWorkflow(id)) id = `wf_${randomUUID()}`;
@@ -138,9 +140,19 @@ export function exportWorkflowTemplate(id: string): WorkflowFile {
   const validation = validateWorkflowNodes(nodes);
   if (!validation.valid) invalid('nodes', validation.errors.join('；'));
 
-  return readWorkflowFile({
-    name: workflow.name,
-    ...(workflow.description?.trim() && { description: workflow.description }),
+  return buildWorkflowFile({ name: workflow.name, description: workflow.description, nodes });
+}
+
+/** 保存时校验实际导出的文件，保证下载内容在页面导入限制内。 */
+export function buildWorkflowFile({ name, description, nodes }: {
+  name: string;
+  description?: string | null;
+  nodes: WorkflowNode[];
+}): WorkflowFile {
+  if (description != null && typeof description !== 'string') invalid('description', '工作流描述须为文本');
+  const file = readWorkflowFile({
+    name,
+    ...(description?.trim() && { description }),
     nodes: nodes.map(node => {
       const common = { id: node.id, type: node.type, name: node.name, description: node.description };
       if (node.type === 'end') return common;
@@ -155,4 +167,12 @@ export function exportWorkflowTemplate(id: string): WorkflowFile {
       };
     }),
   });
+  if (Buffer.byteLength(serializeWorkflowFile(file), 'utf8') > WORKFLOW_FILE_MAX_BYTES) {
+    invalid('workflow', '工作流 JSON 文件超过 5 MiB');
+  }
+  return file;
+}
+
+export function serializeWorkflowFile(file: WorkflowFile): string {
+  return JSON.stringify(file, null, 2) + '\n';
 }

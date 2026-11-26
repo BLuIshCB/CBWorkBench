@@ -456,15 +456,17 @@ export class App {
   }
 
   async handleHumanDecision(action) {
-    const { currentTaskId } = store.getState();
-    if (!currentTaskId) return;
+    const { currentTaskId, currentTaskDetail } = store.getState();
+    if (currentTaskDetail?.task?.id !== currentTaskId) return;
+    const review = TaskDetail.getPendingReview(currentTaskDetail);
+    if (!review) return;
 
     if (action === 'approve') {
-      if (!confirm('确认审核通过此任务？任务将被标记为已完成。')) return;
+      if (!confirm(`确认通过「${review.nodeName}」？`)) return;
       try {
-        const data = await api.submitHumanReview(currentTaskId, { action: 'approve', reason: '人工审核通过' });
+        const data = await api.submitHumanReview(currentTaskId, { attempt_id: review.runId, action: 'approve', reason: '人工审核通过' });
         alert(data.message);
-        await this.fetchTaskDetail(currentTaskId);
+        if (store.getState().currentTaskId === currentTaskId) await this.fetchTaskDetail(currentTaskId);
       } catch (e) {
         alert('审核失败：' + e.message);
       }
@@ -472,11 +474,22 @@ export class App {
   }
 
   showRejectModal() {
+    const { currentTaskId, currentTaskDetail } = store.getState();
     const modal = document.getElementById('modal-reject');
-    if (modal) modal.style.display = 'flex';
+    if (!modal || currentTaskDetail?.task?.id !== currentTaskId) return;
+    const review = TaskDetail.getPendingReview(currentTaskDetail);
+    if (!review) return;
+    this.pendingRejection = { taskId: currentTaskId, attemptId: review.runId };
+    const direction = document.getElementById('manual-reject-direction');
+    if (direction) {
+      direction.textContent = review.failureTarget
+        ? `「${review.nodeName}」退回后将进入「${review.failureTarget.name}」。` : '退回后任务将暂停。';
+    }
+    modal.style.display = 'flex';
   }
 
   closeRejectModal() {
+    this.pendingRejection = null;
     const modal = document.getElementById('modal-reject');
     if (modal) modal.style.display = 'none';
     const input = document.getElementById('reject-reason-input');
@@ -484,8 +497,8 @@ export class App {
   }
 
   async confirmReject() {
-    const { currentTaskId } = store.getState();
-    if (!currentTaskId) return;
+    const pending = this.pendingRejection;
+    if (!pending || store.getState().currentTaskId !== pending.taskId) return;
     const input = document.getElementById('reject-reason-input');
     const reason = input ? input.value.trim() : '';
     if (!reason) {
@@ -494,10 +507,12 @@ export class App {
     }
 
     try {
-      const data = await api.submitHumanReview(currentTaskId, { action: 'reject', reason });
-      this.closeRejectModal();
+      const data = await api.submitHumanReview(pending.taskId, { attempt_id: pending.attemptId, action: 'reject', reason });
+      if (this.pendingRejection === pending && (data.success || data.code === 'STALE_MANUAL_REVIEW')) {
+        this.closeRejectModal();
+      }
       alert(data.message);
-      await this.fetchTaskDetail(currentTaskId);
+      if (store.getState().currentTaskId === pending.taskId) await this.fetchTaskDetail(pending.taskId);
     } catch (e) {
       alert('操作失败：' + e.message);
     }
