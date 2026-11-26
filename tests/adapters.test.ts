@@ -7,6 +7,19 @@ assert.deepEqual(registry.listAdapters().map(a => a.id), ['workbuddy', 'codex', 
 assert.throws(() => registry.getAdapter('unknown'), /未找到指定的 CLI/);
 assert.throws(() => registry.register(registry.getAdapter('codex')), /重复注册/);
 assert.throws(() => registry.register({ id: 'bad', executionPolicy: { transport: 'desktop' } } as any), /未遵守/);
+
+// 声明与 adapter.id 必须一致，避免探测到别的 CLI 的入口
+for (const meta of registry.listAdapters()) {
+  const adapter = registry.getAdapter(meta.id);
+  assert.ok(adapter.cliDeclaration, `${meta.id} 必须声明 CLI`);
+  assert.equal(adapter.cliDeclaration.id, meta.id);
+  assert.ok(adapter.cliDeclaration.commands.length > 0);
+}
+assert.throws(() => registry.register({
+  id: 'mismatch',
+  executionPolicy: { transport: 'cli', interaction: 'headless', promptTransport: 'stdin-utf8' },
+  cliDeclaration: { id: 'other', commands: ['other'] },
+} as any), /声明 id 不一致/);
 const saved = { ...process.env };
 try {
   process.env.CB_MOCK_WORKBUDDY = 'true';

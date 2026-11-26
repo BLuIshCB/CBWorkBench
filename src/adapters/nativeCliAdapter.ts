@@ -1,9 +1,20 @@
 import { ExecutionService } from '../services/executionService.ts';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 import type { IAgentAdapter, AgentExecutionContext, AgentExecutionResult, AdapterExecutionPolicy } from './types.ts';
 import type { AgentCliConfig } from '../services/cliConfig.ts';
-import { CliRunner } from '../services/cliRunner.ts';
+import type { CliDeclaration } from '../services/cliDiscovery.ts';
+import { resolveDeclaredCliConfig } from '../services/cliConfig.ts';
+import { CliRunner, type CliRunResult } from '../services/cliRunner.ts';
+import { withCliRuntimeOnPath } from '../utils/executableKind.ts';
 import { ROOT_DIR, DEFAULT_EXECUTION_TIMEOUT_MS } from '../config/constants.ts';
+
+export interface Invocation {
+  executable: string;
+  args: string[];
+  env: Record<string, string | undefined>;
+  windowsVerbatimArguments?: boolean;
+}
 
 /** 共用进程执行和失败处理；参数与协议解析留给厂商实现。 */
 export abstract class NativeCliAdapter implements IAgentAdapter {
@@ -14,7 +25,8 @@ export abstract class NativeCliAdapter implements IAgentAdapter {
   abstract readonly supportedModels: readonly string[];
   abstract readonly connectionType: string;
   abstract readonly executionPolicy: AdapterExecutionPolicy;
-  protected abstract resolveConfig(): AgentCliConfig;
+  /** 只声明 CLI 名称与依赖，探测逻辑统一走 cliDiscovery */
+  abstract readonly cliDeclaration: CliDeclaration;
   protected abstract buildArgs(model: string): string[];
   protected abstract parseOutput(stdout: string): string;
   protected encodePrompt(prompt: string): string { return prompt; }
@@ -23,16 +35,24 @@ export abstract class NativeCliAdapter implements IAgentAdapter {
 
   abort(taskId: string) { return CliRunner.abort(taskId); }
 
-  async healthCheck(): Promise<{ healthy: boolean; message?: string }> {
+  protected resolveConfig(): AgentCliConfig {
+    return resolveDeclaredCliConfig(this.cliDeclaration);
+  }
+
+  async healthCheck(): Promise<{ healthy: boolean; message?: string; version?: string }> {
     if (this.isMockEnabled()) return { healthy: true, message: '显式测试模式，未验证真实 CLI。' };
     try {
       const config = this.resolveConfig();
+      const invocation = this.buildInvocation(config, ['--version']);
       const result = await CliRunner.run({
-        runId: randomUUID(), executable: config.executable,
-        args: [...(config.script ? [config.script] : []), ...(config.args || []), '--version'],
-        cwd: ROOT_DIR, env: config.env, timeoutMs: 10000,
+        runId: randomUUID(), executable: invocation.executable,
+        args: invocation.args, cwd: ROOT_DIR, env: invocation.env, timeoutMs: 10000,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       });
-      return { healthy: !result.errorCode && result.exitCode === 0,
+      const lookupFailure = this.describeLookupFailure(config, result);
+      if (lookupFailure) return { healthy: false, message: lookupFailure };
+      const version = result.stdout.trim().split(/\r?\n/)[0]?.trim() || undefined;
+      return { healthy: !result.errorCode && result.exitCode === 0, version,
         message: result.error || `${result.stdout.trim()}；入口可启动，对话请执行验证。` };
     } catch (error) { return { healthy: false, message: String(error) }; }
   }
@@ -47,13 +67,15 @@ export abstract class NativeCliAdapter implements IAgentAdapter {
       metadata: { ...base.metadata, backend: 'direct-cli-mock' } };
     try {
       const config = this.resolveConfig();
+      const invocation = this.buildInvocation(config, this.buildArgs(modelUsed));
       const runId=context.runId || randomUUID();
       let pending='';
       const result = await CliRunner.run({
-        runId, roundId:context.roundId, kind:context.kind, deferFinish:true, taskId: context.taskId, executable: config.executable,
-        args: [...(config.script ? [config.script] : []), ...(config.args || []), ...this.buildArgs(modelUsed)],
-        cwd: context.cwd, env: config.env, stdin: this.encodePrompt(context.prompt),
+        runId, roundId:context.roundId, kind:context.kind, deferFinish:true, taskId: context.taskId,
+        executable: invocation.executable, args: invocation.args,
+        cwd: context.cwd, env: invocation.env, stdin: this.encodePrompt(context.prompt),
         signal: context.signal,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         onChunk: chunk=>{
           try {context.onEvent?.({type:'output',...chunk});} catch {}
           if(chunk.stream!=='stdout') return;
@@ -87,7 +109,7 @@ export abstract class NativeCliAdapter implements IAgentAdapter {
       }
       if (result.errorCode || result.exitCode !== 0) {
         await ExecutionService.finish(runId,result.stopReason || "PROCESS_FAILED",result.exitCode,result.cleanupConfirmed ?? false);
-        let error = result.error || result.stderr || 'CLI 执行失败';
+        let error = this.describeLookupFailure(config, result) || result.error || result.stderr || 'CLI 执行失败';
         if (!result.timedOut && !result.cancelled && result.stdout.trim()) {
           try { this.parseOutput(result.stdout); } catch (failure) { error = String(failure); }
         }
@@ -114,8 +136,42 @@ export abstract class NativeCliAdapter implements IAgentAdapter {
     }
   }
 
+  /**
+   * 组装实际执行入口：脚本型 CLI 前插自身目录到 PATH，Windows 批处理包装器用 cmd 包裹。
+   */
+  protected buildInvocation(config: AgentCliConfig, args: string[]): Invocation {
+    const env = withCliRuntimeOnPath(config);
+    const fullArgs = [...(config.script ? [config.script] : []), ...(config.args || []), ...args];
+    if (config.needsShellWrap && process.platform === 'win32') {
+      return {
+        executable: process.env.ComSpec || 'cmd.exe',
+        args: ['/d', '/s', '/c', `"${[config.executable, ...fullArgs].map(quoteWindowsArg).join(' ')}"`],
+        env,
+        windowsVerbatimArguments: true,
+      };
+    }
+    return { executable: config.executable, args: fullArgs, env };
+  }
+
+  /** 把「没找到」和「找到但跑不起来」分开，用户才知道下一步做什么。 */
+  private describeLookupFailure(config: AgentCliConfig, result: CliRunResult): string | null {
+    if (!result.errorCode) return null;
+    if (!/ENOENT|EACCES|EPERM/i.test(`${result.error ?? ''}\n${result.stderr ?? ''}`)) return null;
+    if (path.isAbsolute(config.executable)) {
+      return `${this.name} 已找到但无法启动（${config.executable}），可能缺少 Node.js 运行时。`;
+    }
+    return `${this.name} 未安装：命令 '${config.executable}' 不在 PATH 中。`;
+  }
+
   private isMockEnabled(): boolean {
     return (this.id === 'workbuddy' && process.env.CB_MOCK_WORKBUDDY === 'true') ||
       (this.id === 'codex' && process.env.CB_MOCK_CODEX === 'true');
   }
+}
+
+function quoteWindowsArg(arg: string): string {
+  if (!arg) return '""';
+  if (!/[\s"&|<>^()%!]/.test(arg)) return arg;
+  // cmd 不认反斜杠转义，内嵌引号要写成 ""。
+  return `"${arg.replace(/"/g, '""')}"`;
 }

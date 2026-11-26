@@ -1,4 +1,5 @@
 import type { CliErrorCode } from '../services/cliRunner.ts';
+import type { CliDeclaration } from '../services/cliDiscovery.ts';
 
 export interface AdapterExecutionPolicy {
   transport: 'cli';
@@ -56,7 +57,9 @@ export interface IAgentAdapter {
   readonly progressCapability?: 'raw' | 'events';
   readonly connectionType: string;
   readonly executionPolicy: AdapterExecutionPolicy;
-  healthCheck(): Promise<{ healthy: boolean; message?: string }>;
+  /** CLI 名称与依赖的唯一声明，探测层据此工作 */
+  readonly cliDeclaration?: CliDeclaration;
+  healthCheck(): Promise<{ healthy: boolean; message?: string; version?: string }>;
   listModels?(): Promise<string[]>;
   execute(context: AgentExecutionContext): Promise<AgentExecutionResult>;
   abort(taskId: string): Promise<void>;

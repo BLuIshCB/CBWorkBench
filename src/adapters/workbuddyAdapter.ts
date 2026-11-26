@@ -1,6 +1,6 @@
 import { NativeCliAdapter } from './nativeCliAdapter.ts';
 import { MANDATORY_CLI_POLICY } from './types.ts';
-import { resolveWorkBuddyCliConfig } from '../services/cliConfig.ts';
+import { resolveWorkBuddyCliConfig, CLI_DECLARATIONS, type AgentCliConfig } from '../services/cliConfig.ts';
 import { WORKER_FIXED_MODEL } from '../config/constants.ts';
 
 export class WorkBuddyAdapter extends NativeCliAdapter {
@@ -11,7 +11,12 @@ export class WorkBuddyAdapter extends NativeCliAdapter {
   readonly supportedModels = [WORKER_FIXED_MODEL];
   readonly connectionType = 'codebuddy -p --dangerously-skip-permissions';
   readonly executionPolicy = MANDATORY_CLI_POLICY;
-  protected resolveConfig = resolveWorkBuddyCliConfig;
+  readonly cliDeclaration = CLI_DECLARATIONS.workbuddy;
+
+  /** lite-only 安装的产品形态判断只作用于 workbuddy，不进入通用探测层。 */
+  protected resolveConfig(): AgentCliConfig {
+    return resolveWorkBuddyCliConfig();
+  }
 
   protected buildArgs(model: string): string[] {
     return ['-p', '--no-session-persistence', '--output-format', 'json', '--dangerously-skip-permissions',

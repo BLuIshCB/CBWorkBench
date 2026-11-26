@@ -17,6 +17,9 @@ export class AdapterRegistry {
     if (policy?.transport !== 'cli' || policy.interaction !== 'headless' || policy.promptTransport !== 'stdin-utf8') {
       throw new Error(`适配器 '${adapter.id}' 未遵守统一 CLI 执行策略。`);
     }
+    if (adapter.cliDeclaration && adapter.cliDeclaration.id !== adapter.id) {
+      throw new Error(`适配器 '${adapter.id}' 的 CLI 声明 id 不一致: ${adapter.cliDeclaration.id}`);
+    }
     if (this.adapters.has(adapter.id)) throw new Error(`适配器重复注册: ${adapter.id}`);
     this.adapters.set(adapter.id, adapter);
   }

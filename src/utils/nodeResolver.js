@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { getInstallDirs } from '../services/cliDiscovery.ts';
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -78,6 +79,9 @@ export function resolveSupportedNode() {
     try {for(const name of fs.readdirSync(process.env.NVM_HOME)) if(/^v24\./.test(name))candidates.push(path.join(process.env.NVM_HOME,name,'node.exe'));} catch {}
   }
 
+  // 版本管理器与官方安装目录统一来自 cliDiscovery，避免与 CLI 探测两套逻辑分叉
+  for(const dir of getInstallDirs(home, process.platform)) candidates.push(path.join(dir, process.platform==='win32'?'node.exe':'node'));
+
   // Codex primary runtime node
   candidates.push(path.join(home, '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'node', 'bin', 'node.exe'));
 
@@ -96,13 +100,6 @@ export function resolveSupportedNode() {
       // Ignore directory read errors
     }
   }
-
-  // Common NVM / Program Files candidates
-  candidates.push(
-    'C:\\Program Files\\nodejs\\node.exe',
-    path.join(home, 'AppData', 'Local', 'nvm', 'v24.22.1', 'node.exe'),
-    path.join(home, 'AppData', 'Local', 'nvm', 'v22.22.2', 'node.exe')
-  );
 
   for (const candidate of candidates) {
     if (testNodeExecutable(candidate)) {

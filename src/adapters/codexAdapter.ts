@@ -1,5 +1,5 @@
 import { NativeCliAdapter } from './nativeCliAdapter.ts';
-import { resolveCodexCliConfig } from '../services/cliConfig.ts';
+import { CLI_DECLARATIONS } from '../services/cliConfig.ts';
 import { VERIFIER_DEFAULT_MODEL } from '../config/constants.ts';
 import { MANDATORY_CLI_POLICY } from './types.ts';
 import { CliRunner } from '../services/cliRunner.ts';
@@ -14,17 +14,18 @@ export class CodexAdapter extends NativeCliAdapter {
   readonly supportedModels = [VERIFIER_DEFAULT_MODEL];
   readonly connectionType = 'codex exec --dangerously-bypass-approvals-and-sandbox';
   readonly executionPolicy = MANDATORY_CLI_POLICY;
-  protected resolveConfig = resolveCodexCliConfig;
+  readonly cliDeclaration = CLI_DECLARATIONS.codex;
   private catalog?: { key: string; expiresAt: number; models: Promise<string[]> };
 
-  async healthCheck(): Promise<{healthy:boolean;message?:string}> {
+  async healthCheck(): Promise<{healthy:boolean;message?:string;version?:string}> {
     const version=await super.healthCheck();
     if(!version.healthy || process.env.CB_MOCK_CODEX==='true')return version;
     try {
       const config=this.resolveConfig();
-      const help=await CliRunner.run({runId:randomUUID(),executable:config.executable,args:[...(config.script?[config.script]:[]),...(config.args || []),'exec','--help'],cwd:ROOT_DIR,env:config.env,timeoutMs:10000});
-      const required=['--json','--ephemeral','--skip-git-repo-check','--dangerously-bypass-approvals-and-sandbox'];
-      if(help.errorCode || !required.every(flag=>help.stdout.includes(flag))) return {healthy:false,message:'Codex 版本或入口不兼容：exec --help 缺少所需参数。'+(help.error || '')};
+      const invocation=this.buildInvocation(config,['exec','--help']);
+      const help=await CliRunner.run({runId:randomUUID(),executable:invocation.executable,args:invocation.args,cwd:ROOT_DIR,env:invocation.env,timeoutMs:10000,windowsVerbatimArguments:invocation.windowsVerbatimArguments});
+      const required=this.cliDeclaration.requiredFlags ?? [];
+      if(help.errorCode || !required.every(flag=>help.stdout.includes(flag))) return {...version,healthy:false,message:'Codex 版本或入口不兼容：exec --help 缺少所需参数。'+(help.error || '')};
       return version;
     } catch(error) {return {healthy:false,message:String(error)};}
   }

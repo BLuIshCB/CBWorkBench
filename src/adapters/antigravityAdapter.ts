@@ -1,5 +1,5 @@
 import { NativeCliAdapter } from './nativeCliAdapter.ts';
-import { resolveAntigravityCliConfig } from '../services/cliConfig.ts';
+import { CLI_DECLARATIONS } from '../services/cliConfig.ts';
 import { MANDATORY_CLI_POLICY } from './types.ts';
 
 export class AntigravityAdapter extends NativeCliAdapter {
@@ -11,7 +11,7 @@ export class AntigravityAdapter extends NativeCliAdapter {
   readonly connectionType = 'agy --input-format stream-json --dangerously-skip-permissions';
   // agy 没有已核验的禁用历史参数，不能把独立进程误报为无持久化。
   readonly executionPolicy = { ...MANDATORY_CLI_POLICY, sessionPersistence: 'native' as const };
-  protected resolveConfig = resolveAntigravityCliConfig;
+  readonly cliDeclaration = CLI_DECLARATIONS.antigravity;
 
   protected buildArgs(model: string): string[] {
     return ['--input-format', 'stream-json', '--output-format', 'stream-json', '--dangerously-skip-permissions',

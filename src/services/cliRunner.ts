@@ -28,6 +28,8 @@ export interface CliRunOptions {
   deferFinish?: boolean;
   roundId?: number;
   shell?: boolean;
+  /** Windows 批处理包装器由调用方拼好整条命令行，交给 cmd 前不再让 Node 重新加引号 */
+  windowsVerbatimArguments?: boolean;
   signal?: AbortSignal;
   onChunk?: (chunk: {stream: 'stdout' | 'stderr'; text: string}) => void;
 }
@@ -257,6 +259,7 @@ export class CliRunner {
           env,
           shell: options.shell ?? false,
           windowsHide: true,
+          windowsVerbatimArguments: options.windowsVerbatimArguments ?? false,
           detached: process.platform !== 'win32',
           stdio: ['pipe', 'pipe', 'pipe'],
         });
