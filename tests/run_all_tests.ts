@@ -6,6 +6,12 @@ const __dirname = path.dirname(__filename);
 
 const testSuites = [
   'cliRunner.test.ts',
+  'cliDiscoveryPath.test.ts',
+  'cliDiscoveryChain.test.ts',
+  'cliDiscoveryInstallDirs.test.ts',
+  'cliDiscoveryExplicit.test.ts',
+  'shellPath.test.ts',
+  'executableKind.test.ts',
   'nodeResolver.test.ts',
   'db.test.ts',
   'gitService.test.ts',
