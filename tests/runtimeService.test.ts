@@ -9,6 +9,8 @@ process.env.CB_MOCK_CODEX = 'true';
 console.log('[Test] Running runtimeService.test.ts...');
 
 // 1. List configured adapters from AdapterRegistry
+// 清掉其他用例可能留下的版本缓存，保证断言的是「列表请求本身不产出版本结论」
+runtimeService.invalidate();
 const clis = await runtimeService.listConfiguredClis();
 assert.ok(Array.isArray(clis), 'clis should be an array');
 assert.strictEqual(clis.length, 3, 'should detect all 3 native CLI adapters');
@@ -20,6 +22,20 @@ assert.strictEqual(workbuddy.category, 'agent');
 const codex = clis.find(c => c.id === 'codex');
 assert.ok(codex, 'codex adapter should be in the list');
 assert.strictEqual(codex.role, 'CLI 对话');
+
+// 列表只做探测，不跑探活：候选与来源必须存在，版本结论在未请求时为空
+for (const cli of clis) {
+  assert.ok(cli.discovery, `${cli.id} must expose discovery info`);
+  assert.ok(Array.isArray(cli.discovery.candidates), `${cli.id} must expose candidates`);
+  assert.equal(typeof cli.discovery.scanned, 'number');
+  assert.equal(cli.discovery.compatible, null, '版本结论不能在列表请求里顺带产生');
+  assert.equal(cli.discovery.version, null);
+  assert.equal(
+    cli.available,
+    Boolean(cli.discovery.runnable || cli.discovery.source === 'fallback'),
+    `${cli.id} available 语义应为「入口可运行或待验证」`,
+  );
+}
 
 // Ensure system tools (node, git) are NOT in the adapter list
 assert.strictEqual(clis.some(c => c.id === 'node'), false, 'node should not be in the adapter list');

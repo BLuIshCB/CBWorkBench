@@ -1,4 +1,5 @@
 import { CliRunner } from '../services/cliRunner.ts';
+import { execFile } from 'node:child_process';
 import { ExecutionService } from '../services/executionService.ts';
 import { confirmStartSchema } from '../services/executionPolicy.ts';
 import http from 'node:http';
@@ -11,6 +12,14 @@ import { GitService } from '../services/gitService.ts';
 import { workflowEngine } from '../services/workflowEngine.ts';
 import { adapterRegistry } from '../adapters/registry.ts';
 import { runtimeService } from '../services/runtimeService.ts';
+import {
+  CLI_DECLARATIONS,
+  invalidateCliConfigCache,
+  resolveAgentCliConfigPath,
+  resolveDeclaredCliDiscovery,
+} from '../services/cliConfig.ts';
+import { ensurePathHydrated, hydrateShellPath, resolveProfileShell } from '../services/shellPath.ts';
+import { isRunnable } from '../services/cliDiscovery.ts';
 import { packageService } from '../services/packageService.ts';
 import { taskCleanupService } from '../services/taskCleanupService.ts';
 import { PackageProtocolError } from '../services/packageProtocol.ts';
@@ -26,7 +35,9 @@ import {
   TaskStatus,
 } from '../config/constants.ts';
 import {
+  isPidAlive,
   isStandaloneExe,
+  readServerInfoFile,
   removeServerInfoFile,
   resolveResidentServerForDataDir,
   writeServerInfoFile,
@@ -72,6 +83,49 @@ function decodeRouteParam(raw: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** 浏览器 input[type=file] 拿不到绝对路径，只能由服务端弹系统对话框。 */
+function pickFileWithDialog(): Promise<string | null> {
+  const script = [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    '$dialog = New-Object System.Windows.Forms.OpenFileDialog',
+    "$dialog.Title = '选择 CLI 入口'",
+    "$dialog.Filter = '可执行文件|*.exe;*.cmd;*.bat;*.js|所有文件|*.*'",
+    "if ($dialog.ShowDialog() -eq 'OK') { [Console]::Out.Write($dialog.FileName) }",
+  ].join('; ');
+  return new Promise((resolve) => {
+    execFile(
+      resolveProfileShell('win32')?.command ?? 'powershell.exe',
+      ['-NoLogo', '-NoProfile', '-STA', '-Command', script],
+      { timeout: 120000, windowsHide: false, maxBuffer: 1024 * 1024 },
+      (error, stdout) => resolve(error ? null : (stdout.trim() || null)),
+    );
+  });
+}
+
+/** 读 → 合并 → 原子写，避免整体覆盖丢其他 id；写入前保留一份 .bak。 */
+function writeCliEntry(cliId: string, executable: string, script?: string): void {
+  const configFile = resolveAgentCliConfigPath();
+  const current = fs.existsSync(configFile)
+    ? JSON.parse(fs.readFileSync(configFile, 'utf8') || '{}')
+    : {};
+  const next = { ...current };
+  const entry: Record<string, unknown> = { ...(current[cliId] ?? {}), executable: path.resolve(executable) };
+  // 包装器与 .js 由探测自己归一化；此时再留 script 会作为参数传给包装器，必须清掉。
+  const scriptApplies = Boolean(script) && !/\.(cmd|bat|ps1|js)$/i.test(executable);
+  if (scriptApplies) entry.script = path.resolve(script!);
+  else delete entry.script;
+  next[cliId] = entry;
+
+  if (fs.existsSync(configFile)) fs.copyFileSync(configFile, `${configFile}.bak`);
+  fs.mkdirSync(path.dirname(configFile), { recursive: true });
+  const tempFile = `${configFile}.tmp`;
+  fs.writeFileSync(tempFile, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  fs.renameSync(tempFile, configFile);
+
+  invalidateCliConfigCache();
+  runtimeService.invalidate(cliId);
 }
 
 export async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
@@ -144,6 +198,17 @@ export function sendFile(
   res.end('Not Found');
 }
 
+/** 浏览器同源写请求会带 Origin，非浏览器客户端（curl / MCP / 测试）不带。 */
+function isSameOriginRequest(req: http.IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
 export function createHttpServer(): http.Server {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
@@ -157,6 +222,12 @@ export function createHttpServer(): http.Server {
         'Access-Control-Allow-Headers': 'Content-Type',
       });
       res.end();
+      return;
+    }
+
+    // 写接口只接受同源请求：否则任意网页都能跨站改 CLI 配置，再借 probe 拉起本地可执行文件。
+    if (method !== 'GET' && method !== 'HEAD' && !isSameOriginRequest(req)) {
+      sendJson(res, 403, { success: false, code: 'CROSS_ORIGIN_BLOCKED', message: '拒绝跨站写入请求' });
       return;
     }
 
@@ -537,12 +608,78 @@ export function createHttpServer(): http.Server {
       }
 
       if (pathname === '/api/runtime/clis' && method === 'GET') {
-        const clis = await runtimeService.listConfiguredClis();
+        // 首次请求最多等一次水合（10s 上限），之后走进程内缓存
+        await ensurePathHydrated();
+        const withVersion = url.searchParams.get('version') === '1' || url.searchParams.get('refresh') === '1';
+        if (url.searchParams.get('refresh') === '1') {
+          invalidateCliConfigCache();
+          runtimeService.invalidate();
+        }
+        const clis = await runtimeService.listConfiguredClis({
+          withVersion,
+          // 模型目录同样要 spawn CLI，随「刷新状态」一起取
+          withCatalog: withVersion,
+          forceVersion: url.searchParams.get('refresh') === '1',
+        });
         sendJson(res, 200, { success: true, clis });
         return;
       }
 
+      if (pathname === '/api/runtime/refresh-path' && method === 'POST') {
+        const hydration = await hydrateShellPath(true);
+        invalidateCliConfigCache();
+        runtimeService.invalidate();
+        sendJson(res, 200, {
+          success: true,
+          hydration,
+          clis: await runtimeService.listConfiguredClis(),
+        });
+        return;
+      }
+
+      if (pathname === '/api/runtime/pick-file' && method === 'POST') {
+        if (process.platform !== 'win32') {
+          sendJson(res, 501, { success: false, message: '系统文件选择框仅支持 Windows，请直接粘贴绝对路径。' });
+          return;
+        }
+        const picked = await pickFileWithDialog();
+        sendJson(res, 200, { success: true, path: picked });
+        return;
+      }
+
+      if (pathname === '/api/runtime/cli-path' && method === 'POST') {
+        const body = await parseJsonBody(req);
+        const cliId = typeof body.cliId === 'string' ? body.cliId : '';
+        const executable = typeof body.executable === 'string' ? body.executable.trim() : '';
+        const script = typeof body.script === 'string' ? body.script.trim() : '';
+        if (!CLI_DECLARATIONS[cliId]) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: `未知 CLI: ${cliId}` });
+          return;
+        }
+        if (!executable || !path.isAbsolute(executable)) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: '请提供绝对路径的 CLI 入口' });
+          return;
+        }
+        const executableCheck = isRunnable(executable);
+        if (!executableCheck.runnable) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: `入口不可运行（${executableCheck.reason}）: ${executable}` });
+          return;
+        }
+        if (script && !isRunnable(script).runnable) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: `脚本不可运行: ${script}` });
+          return;
+        }
+        try {
+          writeCliEntry(cliId, executable, script || undefined);
+          sendJson(res, 200, { success: true, discovery: resolveDeclaredCliDiscovery(CLI_DECLARATIONS[cliId]) });
+        } catch (error: any) {
+          sendJson(res, 500, { success: false, message: `写入 CLI 配置失败: ${error?.message ?? error}` });
+        }
+        return;
+      }
+
       if (pathname === '/api/runtime/probe' && method === 'POST') {
+        await ensurePathHydrated();
         const body = await parseJsonBody(req);
         if (
           (body.verify !== undefined && typeof body.verify !== 'boolean') ||
@@ -964,7 +1101,8 @@ export function createHttpServer(): http.Server {
 
 export async function startServer(
   port: number = DEFAULT_PORT,
-  host: string = DEFAULT_HOST
+  host: string = DEFAULT_HOST,
+  allowFallbackPort: boolean = false
 ): Promise<http.Server> {
   process.on('uncaughtException', (err) => {
     logger.error('[App] Uncaught exception:', err);
@@ -974,8 +1112,9 @@ export async function startServer(
   });
 
   // Enforce single resident daemon per DATA_DIR
-  const existingServer = await resolveResidentServerForDataDir(DATA_DIR, INSTANCE_ID);
-  if (existingServer && existingServer.pid !== process.pid) {
+  await resolveResidentServerForDataDir(DATA_DIR, INSTANCE_ID);
+  const existingServer = readServerInfoFile(DATA_DIR);
+  if (existingServer && existingServer.pid !== process.pid && isPidAlive(existingServer.pid)) {
     throw new Error(
       `当前数据目录 (${DATA_DIR}) 已有常驻后台正在运行 (PID=${existingServer.pid}, URL=${existingServer.url})，禁止同一数据目录启动多个调度后台`
     );
@@ -997,15 +1136,32 @@ export async function startServer(
     logger.error('[HttpServer] Error during recovery check:', e);
   }
 
+  // 登录 shell PATH 水合预热：不阻塞启动，失败仍可继续走 PATH/安装目录/裸名降级。
+  void ensurePathHydrated().then(() => invalidateCliConfigCache()).catch(() => {});
+
   const server = createHttpServer();
 
   return new Promise((resolve, reject) => {
-    server.on('error', (err) => {
+    let canRetry = allowFallbackPort && port !== 0;
+    server.on('error', (err: NodeJS.ErrnoException) => {
+      // 同一数据目录在启动时可能刚发布服务地址，此时不能再开第二个调度后台。
+      if (canRetry && err.code === 'EADDRINUSE' && !readServerInfoFile(DATA_DIR)) {
+        canRetry = false;
+        logger.info(`[HttpServer] 默认端口 ${port} 已占用，正在选择可用端口。`);
+        server.listen(0, host);
+        return;
+      }
       logger.error(`[HttpServer] Failed to bind to ${host}:${port}:`, err);
       reject(err);
     });
 
-    server.listen(port, host, () => {
+    server.once('listening', () => {
+      const otherServer = readServerInfoFile(DATA_DIR);
+      if (otherServer && otherServer.pid !== process.pid && isPidAlive(otherServer.pid)) {
+        server.close();
+        reject(new Error(`当前数据目录已有常驻后台正在运行: ${otherServer.url}`));
+        return;
+      }
       const boundAddr = server.address() as any;
       const actualPort = boundAddr?.port || port;
       const serverUrl = `http://${host}:${actualPort}`;
@@ -1036,5 +1192,6 @@ export async function startServer(
       console.log(`============================================================\n`);
       resolve(server);
     });
+    server.listen(port, host);
   });
 }

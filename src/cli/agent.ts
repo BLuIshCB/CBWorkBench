@@ -1,8 +1,10 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { adapterRegistry } from '../adapters/registry.ts';
-import { resolveCliConfig } from '../services/cliConfig.ts';
+import { diagnoseCli, resolveAgentCliConfigPath, resolveCliConfig } from '../services/cliConfig.ts';
+import { ensurePathHydrated } from '../services/shellPath.ts';
 
 const [action = 'list', id, cwdArg, model] = process.argv.slice(2);
 try {
@@ -10,7 +12,38 @@ try {
   else {
     const adapter = adapterRegistry.getAdapter(id);
     const cwd = path.resolve(cwdArg || process.cwd());
-    if (action === 'login') {
+    if (action === 'doctor') {
+      const declaration = adapter.cliDeclaration;
+      if (!declaration) throw new Error(`适配器 ${id} 未声明 CLI`);
+      // 诊断结论必须建立在真实水合后的 PATH 上，否则与 exe 启动时的行为不一致。
+      const hydration = await ensurePathHydrated();
+      const discovery = diagnoseCli(declaration);
+      console.log(JSON.stringify({
+        cli: id,
+        platform: process.platform,
+        home: os.homedir(),
+        configFile: resolveAgentCliConfigPath(),
+        declaration: {
+          commands: declaration.commands,
+          requiredCommands: declaration.requiredCommands ?? [],
+          explicitEnv: declaration.explicitEnv ?? [],
+        },
+        pathHydrated: hydration.ok,
+        hydrationFailure: hydration.failureReason ?? null,
+        hydrationAdded: hydration.added,
+        entry: {
+          executable: discovery.executable,
+          script: discovery.script ?? null,
+          needsShellWrap: discovery.needsShellWrap ?? false,
+        },
+        runnable: discovery.runnable,
+        source: discovery.source,
+        reason: discovery.reason ?? null,
+        missingDependencies: discovery.missingDependencies ?? [],
+        scanned: discovery.scanned,
+        candidates: discovery.candidates,
+      }, null, 2));
+    } else if (action === 'login') {
       const config = resolveCliConfig(id);
       const args = [...(config.script ? [config.script] : []), ...(config.args || [])];
       if (id === 'codex') args.push('login');
@@ -32,6 +65,6 @@ try {
       const verified = action === 'verify' ? result.ok && result.output.trim() === marker : result.ok;
       console.log(JSON.stringify({ ...result, verified }, null, 2));
       process.exitCode = verified ? 0 : 1;
-    } else throw new Error('Usage: node bin/agent.js list | verify|chat|login <workbuddy|codex|antigravity> [cwd] [model]');
+    } else throw new Error('Usage: node bin/agent.js list | doctor <id> | verify|chat|login <workbuddy|codex|antigravity> [cwd] [model]');
   }
 } catch (error) { console.error(String(error)); process.exitCode = 1; }

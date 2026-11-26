@@ -21,13 +21,21 @@ try {
   for (const key of ['agents', 'workers', 'reviewers']) {
     assert.deepEqual(executors[key].find((a: any) => a.id === 'codex').supportedModels, ['model-alpha', 'model-beta']);
   }
-  const runtime = await (await fetch(origin + '/api/runtime/clis')).json();
+  // 冷启动列表不跑子进程：模型来自适配器静态声明
+  const fast = await (await fetch(origin + '/api/runtime/clis')).json();
+  const fastCodex = fast.clis.find((a: any) => a.id === 'codex');
+  assert.deepEqual(fastCodex.supportedModels, ['default'], '冷启动不应 spawn 模型目录');
+  assert.equal(fastCodex.discovery.version, null, '冷启动不应 spawn --version');
+
+  // 「刷新状态」才取动态模型目录与版本结论
+  const runtime = await (await fetch(origin + '/api/runtime/clis?version=1')).json();
   const codex = runtime.clis.find((a: any) => a.id === 'codex');
   assert.deepEqual(codex.supportedModels, ['model-alpha', 'model-beta']);
   assert.equal(codex.extraInfo.modelCatalogSource, 'cli');
+  assert.equal(codex.discovery.version, 'fixture-cli 1.0');
   fixture.env.CATALOG_SCENARIO = 'nonzero';
   fs.writeFileSync(config, JSON.stringify({ codex: fixture, antigravity: fixture }));
-  const failed = await (await fetch(origin + '/api/runtime/clis')).json();
+  const failed = await (await fetch(origin + '/api/runtime/clis?version=1')).json();
   const failedCodex = failed.clis.find((a: any) => a.id === 'codex');
   assert.deepEqual(failedCodex.supportedModels, []);
   assert.equal(failedCodex.extraInfo.modelCatalogSource, 'unavailable');
