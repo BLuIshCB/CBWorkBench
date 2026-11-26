@@ -134,6 +134,12 @@ try {
   const devNode = getWfData.workflow.nodes.find((n: any) => n.id === 'development');
   assert.ok(devNode.material_contract);
   assert.strictEqual(devNode.material_contract.node_dir, 'nodes/development');
+  assert.ok(devNode.name && devNode.description);
+  assert.equal(devNode.material_contract.purpose, devNode.description);
+  assert.equal(devNode.executor, undefined);
+  assert.equal(devNode.model, undefined);
+  assert.equal(devNode.prompt, undefined);
+  assert.equal(listWfData.workflows[0].definition_sha256, getWfData.workflow.definition_sha256);
 
   // 4. Submit minimal package via workbench_submit_task
   buildLocalPackage({
@@ -275,6 +281,11 @@ try {
 
   // Stop task before revising (running task cannot be revised)
   db.updateTaskStatus(taskId, TaskStatus.CANCELLED);
+  const previousNodes = JSON.parse(db.getTaskWorkflow(taskId)!.nodes_json);
+  const previousDevelopment = previousNodes.find((node: any) => node.id === 'development');
+  previousDevelopment.executor = 'codex';
+  previousDevelopment.model = 'task-selected-model';
+  db.updateTaskWorkflow(taskId, { nodes_json: JSON.stringify(previousNodes) });
 
   buildLocalPackage({
     dir: tmpPkgRoot2,
@@ -296,6 +307,10 @@ try {
   assert.strictEqual(submitRev2Data.ok, true);
   assert.strictEqual(submitRev2Data.revision, 2);
   assert.strictEqual(submitRev2Data.status, TaskStatus.PENDING_CONFIRM);
+  const revisedDevelop = JSON.parse(db.getTaskWorkflow(taskId)!.nodes_json).find((node: any) => node.id === 'development');
+  assert.equal(revisedDevelop.executor, 'codex');
+  assert.equal(revisedDevelop.model, 'task-selected-model');
+  assert.equal(revisedDevelop.prompt, undefined);
 
   // 7. Query artifacts via MCP
   const artifactsRes = await client.callTool({

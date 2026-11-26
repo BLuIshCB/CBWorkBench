@@ -358,7 +358,7 @@
 
   <!-- Modal for Creating New Workflow -->
   <div id="modal-new-workflow" class="modal-backdrop" style="display: none;">
-    <div class="modal-card" style="max-width: 520px;">
+    <div class="modal-card" style="max-width: 520px; max-height: 90vh; overflow: auto;">
       <div class="modal-header">
         <h3>➕ 新建工作流</h3>
         <button class="close-btn" onclick="app.workflowView.closeNewWorkflowModal()">×</button>
@@ -376,6 +376,15 @@
         <div class="form-group">
           <label class="form-label" style="display: block; font-weight: 600; margin-bottom: 6px;">流程描述 (选填)</label>
           <textarea id="new-wf-desc" class="form-control" rows="2" placeholder="简要说明此工作流的使用场景..." style="width: 100%; box-sizing: border-box;"></textarea>
+        </div>
+        <p class="form-hint">请仔细填写首个任务节点的名称和描述，AI 会参考它们生成任务包。具体执行器和提示词由任务决定。</p>
+        <div class="form-group" style="margin-bottom: 14px;">
+          <label class="form-label" for="new-wf-node-name">首个任务节点名称（必填）</label>
+          <input type="text" id="new-wf-node-name" class="form-control" placeholder="例如：开发实现" required />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="new-wf-node-description">首个任务节点描述（必填）</label>
+          <textarea id="new-wf-node-description" class="form-control" rows="3" placeholder="说明节点负责什么、需要交付什么，以及怎样算完成" required></textarea>
         </div>
       </div>
       <div class="modal-footer">

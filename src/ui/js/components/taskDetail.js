@@ -323,7 +323,7 @@ export const TaskDetail = {
         return `
           <g class="svg-node svg-node-start ${isSelected ? 'selected' : ''} ${isCurrent ? 'is-current' : ''}" onclick="app.selectTaskWorkflowNode('${node.id}')" cursor="pointer">
             <rect x="${pos.x}" y="${pos.y}" width="${pos.w}" height="${pos.h}" rx="${pos.h / 2}" fill="${isCurrent ? '#bfdbfe' : isSelected ? '#dbeafe' : '#eff6ff'}" stroke="${isCurrent ? '#1d4ed8' : isSelected ? '#2563eb' : '#3b82f6'}" stroke-width="${isCurrent ? '3' : isSelected ? '2.5' : '2'}" />
-            <text x="${pos.x + pos.w / 2}" y="${pos.y + pos.h / 2 + 5}" font-size="14" font-weight="bold" fill="#1e40af" text-anchor="middle">⚡ 开始</text>
+            <text x="${pos.x + pos.w / 2}" y="${pos.y + pos.h / 2 + 5}" font-size="14" font-weight="bold" fill="#1e40af" text-anchor="middle">⚡ ${escapeHtml(node.name || '开始')}</text>
           </g>
         `;
       }
@@ -333,7 +333,7 @@ export const TaskDetail = {
         return `
           <g class="svg-node svg-node-end ${isSelected ? 'selected' : ''} ${isCompleted ? 'is-current' : ''}" onclick="app.selectTaskWorkflowNode('${node.id}')" cursor="pointer">
             <rect x="${pos.x}" y="${pos.y}" width="${pos.w}" height="${pos.h}" rx="${pos.h / 2}" fill="${isCompleted ? '#dcfce7' : isSelected ? '#e2e8f0' : '#f1f5f9'}" stroke="${isCompleted ? '#16a34a' : isSelected ? '#475569' : '#64748b'}" stroke-width="${isCompleted || isSelected ? '3' : '2'}" />
-            <text x="${pos.x + pos.w / 2}" y="${pos.y + pos.h / 2 + 5}" font-size="14" font-weight="bold" fill="${isCompleted ? '#166534' : '#334155'}" text-anchor="middle">${isCompleted ? '✓ 已完成' : '🏁 结束'}</text>
+            <text x="${pos.x + pos.w / 2}" y="${pos.y + pos.h / 2 + 5}" font-size="14" font-weight="bold" fill="${isCompleted ? '#166534' : '#334155'}" text-anchor="middle">${isCompleted ? '✓ 已完成' : `🏁 ${escapeHtml(node.name || '结束')}`}</text>
           </g>
         `;
       }

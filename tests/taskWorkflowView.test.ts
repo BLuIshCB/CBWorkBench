@@ -44,18 +44,30 @@ try {
   const acceptanceNode = nodes.find((n: any) => n.id === 'acceptance');
   assert.ok(devNode, 'development node must exist');
   assert.ok(acceptanceNode, 'acceptance node must exist');
-  assert.ok(devNode.prompt, 'development node prompt must be inspectable');
+  assert.ok(devNode.description);
+  assert.equal(devNode.prompt, undefined);
+  assert.equal(devNode.executor, 'workbuddy');
+  assert.equal(acceptanceNode.executor, 'codex');
+
+  const updatePromptRes = await fetch(`${baseUrl}/api/tasks/${taskId}/workflow/nodes/development`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: '不能覆盖任务包提示词' }),
+  });
+  assert.equal(updatePromptRes.status, 400);
+  assert.match((await updatePromptRes.json()).message, /prompt\.md/);
 
   // 3. Switch node model before starting (development & acceptance nodes)
   const updateDevRes = await fetch(`${baseUrl}/api/tasks/${taskId}/workflow/nodes/development`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'deepseek-v4-flash', executor: 'workbuddy' }),
+    body: JSON.stringify({ model: 'custom-dev-model', executor: 'codex' }),
   });
   assert.strictEqual(updateDevRes.status, 200);
   const devResult = await updateDevRes.json();
   assert.strictEqual(devResult.success, true);
-  assert.strictEqual(devResult.node.model, 'deepseek-v4-flash');
+  assert.strictEqual(devResult.node.model, 'custom-dev-model');
+  assert.strictEqual(devResult.node.executor, 'codex');
 
   const updateAcceptRes = await fetch(`${baseUrl}/api/tasks/${taskId}/workflow/nodes/acceptance`, {
     method: 'PUT',
@@ -70,7 +82,7 @@ try {
   // 4. Verify nodes in database have been updated
   const reloadedWf = db.getTaskWorkflow(taskId);
   const reloadedNodes = JSON.parse(reloadedWf!.nodes_json);
-  assert.strictEqual(reloadedNodes.find((n: any) => n.id === 'development')?.model, 'deepseek-v4-flash');
+  assert.strictEqual(reloadedNodes.find((n: any) => n.id === 'development')?.model, 'custom-dev-model');
   assert.strictEqual(reloadedNodes.find((n: any) => n.id === 'acceptance')?.model, 'custom-acceptance-model');
 
   // 5. Freeze check: Start task (simulated via status update to running)
@@ -90,7 +102,7 @@ try {
   // 7. Verify model was NOT changed while frozen
   const afterFreezeWf = db.getTaskWorkflow(taskId);
   const afterFreezeNodes = JSON.parse(afterFreezeWf!.nodes_json);
-  assert.strictEqual(afterFreezeNodes.find((n: any) => n.id === 'development')?.model, 'deepseek-v4-flash');
+  assert.strictEqual(afterFreezeNodes.find((n: any) => n.id === 'development')?.model, 'custom-dev-model');
 
   // Cleanup
   db.deleteTask(taskId);

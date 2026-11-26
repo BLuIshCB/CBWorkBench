@@ -32,7 +32,7 @@ try {
   // 3. Save new workflow definition and direct modification (no V versions)
   const customNodes = [
     { id: 'start', name: '开始', type: 'start', on_success: 'step1' },
-    { id: 'step1', name: '步骤1', type: 'task', execution_mode: 'agent', prompt: '执行步骤1', on_success: 'end' },
+    { id: 'step1', name: '步骤1', type: 'task', execution_mode: 'agent', executor: 'codex', model: 'legacy-model', prompt: '执行步骤1', on_success: 'end' },
     { id: 'end', name: '结束', type: 'end' },
   ];
   const createdWf = testDb.saveWorkflowDefinition({
@@ -53,6 +53,12 @@ try {
   assert.strictEqual(updatedWf.name, '自定义流程修改版');
   const fetchedWf = testDb.getWorkflow('custom_wf');
   assert.strictEqual(fetchedWf?.name, '自定义流程修改版');
+  const readLegacyNodes = JSON.parse(fetchedWf!.nodes_json);
+  assert.equal(readLegacyNodes[1].description, '执行步骤1');
+  assert.equal(readLegacyNodes[1].prompt, undefined);
+  assert.equal(readLegacyNodes[1].executor, undefined);
+  assert.equal(readLegacyNodes[1].model, undefined);
+  assert.ok(readLegacyNodes[0].description && readLegacyNodes[2].description);
   console.log('  ✓ Workflow definition modified directly in place (no V versions)');
 
   // 3.1 If workflow is referenced by a task, modification is strictly prohibited

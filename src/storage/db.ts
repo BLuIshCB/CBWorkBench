@@ -10,6 +10,8 @@ import {
   DEFAULT_WORKFLOW_ID,
   DEFAULT_WORKFLOW_NODES,
   computeWorkflowDefinitionSha256,
+  resolveTaskNodeExecutor,
+  toWorkflowDesignNodes,
 } from '../services/workflowDefinition.ts';
 
 export interface WorkflowDefinitionRecord {
@@ -20,6 +22,15 @@ export interface WorkflowDefinitionRecord {
   created_at: number;
   updated_at: number;
   is_default: number;
+}
+
+function readWorkflowDesign(record: WorkflowDefinitionRecord): WorkflowDefinitionRecord {
+  try {
+    const nodes = toWorkflowDesignNodes(JSON.parse(record.nodes_json), true);
+    return { ...record, nodes_json: JSON.stringify(nodes) };
+  } catch {
+    return record;
+  }
 }
 
 export interface TaskWorkflowRecord {
@@ -986,14 +997,15 @@ export class WorkbenchDatabase {
     const row = this.db
       .prepare('SELECT * FROM workflow_definitions WHERE id = ?')
       .get(id) as unknown as WorkflowDefinitionRecord | undefined;
-    return row ?? null;
+    return row ? readWorkflowDesign(row) : null;
   }
 
   listWorkflows(): WorkflowDefinitionRecord[] {
-    return this.db.prepare(`
+    const rows = this.db.prepare(`
       SELECT * FROM workflow_definitions
       ORDER BY is_default DESC, id ASC
     `).all() as unknown as WorkflowDefinitionRecord[];
+    return rows.map(readWorkflowDesign);
   }
 
   saveWorkflowDefinition(data: {
@@ -1112,10 +1124,32 @@ export class WorkbenchDatabase {
       }
     }
 
+    const revision = options?.revision ?? 1;
+    const previous = revision > 1 ? this.getTaskWorkflow(taskId) : null;
+    const previousAgentNodes = new Map<string, WorkflowNode>();
+    if (previous?.workflow_id === wfId && previous.revision < revision) {
+      try {
+        const previousNodes = JSON.parse(previous.nodes_json) as WorkflowNode[];
+        for (const node of previousNodes) {
+          if (node.type === 'task' && node.execution_mode === 'agent') previousAgentNodes.set(node.id, node);
+        }
+      } catch {
+        previousAgentNodes.clear();
+      }
+    }
+    nodes = nodes.map((node) => {
+      if (node.type !== 'task' || node.execution_mode !== 'agent') return node;
+      const prior = previousAgentNodes.get(node.id);
+      const matchingPrior = (prior?.result_rule || 'default') === (node.result_rule || 'default') ? prior : undefined;
+      return {
+        ...node,
+        executor: matchingPrior?.executor || resolveTaskNodeExecutor(node),
+        model: matchingPrior?.model ?? node.model,
+      };
+    });
     const startNode = nodes.find((n) => n.type === 'start') || nodes[0];
     const initialNodeId = startNode ? startNode.id : 'start';
     const now = Date.now();
-    const revision = options?.revision ?? 1;
 
     this.db.prepare(`
       INSERT OR REPLACE INTO task_workflows (

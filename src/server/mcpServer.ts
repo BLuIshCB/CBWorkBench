@@ -209,7 +209,7 @@ export function createWorkbenchMcpServer(advanceOnly = false): McpServer {
   // 3. workbench_get_workflow
   server.tool(
     'workbench_get_workflow',
-    '获取指定工作流的完整节点图定义、definition_sha256、安全目录名及各任务节点的统一材料契约 (material_contract)。',
+    '获取指定工作流的节点图、definition_sha256、节点名称和描述及材料契约 (material_contract)。根据名称和描述编写本次任务的节点提示词；执行器在任务中配置。',
     {
       workflow_id: z.string().describe('工作流唯一标识（如 "default"）'),
       node_ids: z.array(z.string()).optional().describe('可选：仅返回指定节点列表的详情'),

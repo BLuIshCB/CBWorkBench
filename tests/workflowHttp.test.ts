@@ -51,10 +51,35 @@ try {
 
   // 4. POST /api/workflows valid custom workflow
   const validGraph = [
-    { id: 'start', name: '开始', type: 'start', on_success: 'task1' },
-    { id: 'task1', name: '任务1', type: 'task', execution_mode: 'agent', prompt: '自行检查项目并执行任务', on_success: 'end' },
-    { id: 'end', name: '结束', type: 'end' },
+    { id: 'start', name: '开始', description: '进入任务。', type: 'start', on_success: 'task1' },
+    { id: 'task1', name: ' 任务1 ', description: ' 自行检查项目并执行任务 ', type: 'task', execution_mode: 'agent', on_success: 'end' },
+    { id: 'end', name: '结束', description: '完成流程。', type: 'end' },
   ];
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { location: { origin: baseUrl } } });
+  const { WorkflowView } = await import('../src/ui/js/components/workflowView.js').finally(() => {
+    if (originalWindow) Object.defineProperty(globalThis, 'window', originalWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  });
+  const view = new WorkflowView({});
+  view.currentNodes = validGraph;
+  const panel = view.buildNodeConfigHtml(validGraph[1]);
+  assert.match(panel, /节点名称（必填）/);
+  assert.match(panel, /节点描述（必填）/);
+  assert.match(panel, /AI 会参考它们生成任务包/);
+  assert.doesNotMatch(panel, /updateCurrentNodeField\('(executor|model|prompt)'/);
+
+  const missingMetadata = await fetch(`${baseUrl}/api/workflows`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: 'missing-node-metadata',
+      name: 'Missing Metadata',
+      nodes: [validGraph[0], { ...validGraph[1], name: '  ', description: '\t', prompt: '不能替代描述' }, validGraph[2]],
+    }),
+  });
+  assert.equal(missingMetadata.status, 400);
+  assert.deepEqual((await missingMetadata.json()).errors, ['节点 [task1] 的名称为必填项', '节点 [task1] 的描述为必填项']);
   const validRes = await fetch(`${baseUrl}/api/workflows`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -69,6 +94,9 @@ try {
   const validData = await validRes.json();
   assert.strictEqual(validData.success, true);
   assert.strictEqual(validData.workflow.id, 'good-wf');
+  const savedNode = JSON.parse(validData.workflow.nodes_json)[1];
+  assert.equal(savedNode.name, '任务1');
+  assert.equal(savedNode.description, '自行检查项目并执行任务');
   console.log('  ✓ POST /api/workflows saves valid workflow');
 
   // Direct modification in place (no V versions)
@@ -79,13 +107,14 @@ try {
       id: 'good-wf',
       name: 'Good Workflow Modified',
       description: 'Modified in place',
-      nodes: validGraph,
+      nodes: [validGraph[0], { ...validGraph[1], executor: 'codex', model: 'custom', prompt: '忽略旧字段' }, validGraph[2]],
     }),
   });
   assert.strictEqual(modifyRes.status, 200);
   const modifyData = await modifyRes.json();
   assert.strictEqual(modifyData.success, true);
   assert.strictEqual(modifyData.workflow.name, 'Good Workflow Modified');
+  assert.deepEqual(JSON.parse(modifyData.workflow.nodes_json)[1], savedNode);
   console.log('  ✓ POST /api/workflows modifies existing workflow directly in place');
 
   // 5. GET /api/tasks/:id/workflow

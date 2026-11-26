@@ -190,6 +190,7 @@ assert.strictEqual(acceptanceCallCount, 2);
 const wfRecord2 = db.getTaskWorkflow(task2);
 assert.deepEqual(db.listReworkDocuments(task2, 1).map(file => file.sequence), [1, 2]);
 assert.ok(developmentPrompts.at(-1)?.includes('rework-prompt-01.md'));
+assert.ok(developmentPrompts.at(-1)?.includes('## 节点执行指令'));
 assert.ok(developmentPrompts.at(-1)?.includes('复验条件 1'));
 assert.equal(db.getPendingReworkDocuments(task2, 1, 'development').length, 0);
 const materialsServer = createHttpServer();

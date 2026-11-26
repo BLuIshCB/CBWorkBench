@@ -46,6 +46,7 @@ import { logger } from '../utils/logger.ts';
 import { resolveSupportedNode } from '../utils/nodeResolver.js';
 import {
   validateWorkflowNodes,
+  toWorkflowDesignNodes,
   DEFAULT_WORKFLOW_ID,
   DEFAULT_WORKFLOW_NODES,
   buildUniformNodeMaterialContract,
@@ -892,7 +893,7 @@ export function createHttpServer(): http.Server {
             id: trimmedId,
             name: body.name.trim(),
             description: body.description || null,
-            nodes_json: JSON.stringify(body.nodes),
+            nodes_json: JSON.stringify(toWorkflowDesignNodes(body.nodes)),
             is_default: body.is_default ? 1 : 0,
           });
 
@@ -1017,6 +1018,7 @@ export function createHttpServer(): http.Server {
       if (taskNodeUpdateMatch && (method === 'PUT' || method === 'PATCH')) {
         const taskId = taskNodeUpdateMatch[1];
         const nodeId = taskNodeUpdateMatch[2];
+        const body = await parseJsonBody(req);
         const task = db.getTask(taskId);
         if (!task) {
           sendJson(res, 404, { success: false, message: 'Task not found' });
@@ -1045,7 +1047,14 @@ export function createHttpServer(): http.Server {
           sendJson(res, 404, { success: false, message: `未找到节点: ${nodeId}` });
           return;
         }
-        const body = await parseJsonBody(req);
+        if (body.prompt !== undefined) {
+          sendJson(res, 400, { success: false, message: '节点提示词来自任务包中的 prompt.md；请提交新修订更新提示词。' });
+          return;
+        }
+        if (targetNode.type !== 'task' || targetNode.execution_mode !== 'agent') {
+          sendJson(res, 400, { success: false, message: '只有自动任务节点可配置执行器和模型。' });
+          return;
+        }
         if (body.executor !== undefined) {
           try {
             adapterRegistry.getAdapter(body.executor);
@@ -1057,9 +1066,6 @@ export function createHttpServer(): http.Server {
         }
         if (body.model !== undefined) {
           targetNode.model = String(body.model).trim();
-        }
-        if (body.prompt !== undefined) {
-          targetNode.prompt = String(body.prompt);
         }
         db.updateTaskWorkflow(taskId, { nodes_json: JSON.stringify(nodes) });
         sendJson(res, 200, { success: true, node: targetNode, nodes });

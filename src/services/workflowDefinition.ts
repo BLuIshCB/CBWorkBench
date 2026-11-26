@@ -52,6 +52,7 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
   {
     id: 'start',
     name: '开始',
+    description: '进入首个任务节点。',
     type: 'start',
     on_success: 'development',
   },
@@ -61,9 +62,6 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
     description: '按需求与开发清单实现功能变更，并在返工时依据上游反馈完成修复。',
     type: 'task',
     execution_mode: 'agent',
-    executor: 'workbuddy',
-    model: 'default',
-    prompt: '实现本次需求，并根据上游反馈完成修复。',
     max_executions: DEFAULT_MAX_EXECUTIONS,
     on_success: 'test',
     on_failure: null,
@@ -75,9 +73,6 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
     type: 'task',
     execution_mode: 'agent',
     result_rule: 'verification',
-    executor: 'workbuddy',
-    model: 'default',
-    prompt: '阅读项目测试入口与本节点材料，自行选择并运行必要的测试命令，不修改业务代码。记录实际命令、工作目录、退出码及输出到 outputs/test_report.json；测试失败或无法执行时如实报告，不得声称通过。',
     max_executions: DEFAULT_MAX_EXECUTIONS,
     on_success: 'acceptance',
     on_failure: 'development',
@@ -89,9 +84,6 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
     type: 'task',
     execution_mode: 'agent',
     result_rule: 'acceptance',
-    executor: 'codex',
-    model: 'default',
-    prompt: '依据本节点材料和上游证据进行严格只读验收。',
     max_executions: DEFAULT_MAX_EXECUTIONS,
     on_success: 'human_review',
     on_failure: 'development',
@@ -102,7 +94,6 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
     description: '人类工程师复核最终交付结果、运行产物与待办人工核验项，决定通过或退回。',
     type: 'task',
     execution_mode: 'manual',
-    prompt: '请人工审核代码变更、运行产物与核验清单，确认是否通过。',
     max_executions: DEFAULT_MAX_EXECUTIONS,
     on_success: 'end',
     on_failure: 'development',
@@ -110,9 +101,31 @@ export const DEFAULT_WORKFLOW_NODES: WorkflowNode[] = [
   {
     id: 'end',
     name: '结束',
+    description: '完成工作流。',
     type: 'end',
   },
 ];
+
+export function toWorkflowDesignNodes(
+  nodes: (WorkflowNode & { dir_name?: string; material_contract?: UniformNodeMaterialContract })[],
+  useLegacyDescription = false,
+): WorkflowNode[] {
+  return nodes.map(({ executor, model, prompt, dir_name, material_contract, ...node }) => {
+    const description = typeof node.description === 'string' ? node.description.trim() : '';
+    const legacyDescription = node.type === 'task'
+      ? (typeof prompt === 'string' ? prompt.trim() : '')
+      : DEFAULT_WORKFLOW_NODES.find((control) => control.type === node.type)?.description;
+    return {
+      ...node,
+      name: typeof node.name === 'string' ? node.name.trim() : '',
+      description: description || (useLegacyDescription ? legacyDescription : undefined) || '',
+    };
+  });
+}
+
+export function resolveTaskNodeExecutor(node: WorkflowNode): string {
+  return node.executor || (node.result_rule === 'acceptance' ? 'codex' : 'workbuddy');
+}
 
 export interface ValidationResult {
   valid: boolean;
@@ -154,7 +167,7 @@ export function computeWorkflowDefinitionSha256(wf: {
 export function buildUniformNodeMaterialContract(node: WorkflowNode): UniformNodeMaterialContract | null {
   if (node.type !== 'task') return null;
   const dirName = encodeNodeDirName(node.id);
-  const purpose = (node.prompt?.trim() || node.description || '').trim();
+  const purpose = node.description?.trim() || '';
   const instructionUsage: UniformNodeMaterialContract['instruction_usage'] =
     node.execution_mode === 'manual' ? 'manual_guide' : 'agent_prompt';
 
@@ -186,12 +199,20 @@ export function buildUniformNodeMaterialContract(node: WorkflowNode): UniformNod
  * 8. All nodes must be reachable from 'start'.
  * 9. Every node must have at least one path to 'end' (no dead-end loops without exit).
  * 10. For default delivery workflow (id === 'default'): cannot bypass required testing/acceptance/manual confirmation.
+ * 11. New workflow definitions require names and descriptions; existing task snapshots are exempt.
  */
-export function validateWorkflowNodes(nodes: WorkflowNode[], workflowId?: string): ValidationResult {
+export function validateWorkflowNodes(
+  nodes: WorkflowNode[],
+  workflowId?: string,
+  { requireMetadata = true } = {},
+): ValidationResult {
   const errors: string[] = [];
 
   if (!Array.isArray(nodes) || nodes.length < 3) {
     return { valid: false, errors: ['工作流必须至少包含 3 个节点（开始、任务、结束）'] };
+  }
+  if (nodes.some((node) => !node || typeof node !== 'object' || Array.isArray(node))) {
+    return { valid: false, errors: ['每个节点必须是有效的对象'] };
   }
 
   const nodeMap = new Map<string, WorkflowNode>();
@@ -206,6 +227,14 @@ export function validateWorkflowNodes(nodes: WorkflowNode[], workflowId?: string
       continue;
     }
     const id = node.id.trim();
+    if (requireMetadata) {
+      if (typeof node.name !== 'string' || !node.name.trim()) {
+        errors.push(`节点 [${id}] 的名称为必填项`);
+      }
+      if (typeof node.description !== 'string' || !node.description.trim()) {
+        errors.push(`节点 [${id}] 的描述为必填项`);
+      }
+    }
     if (id.toLowerCase() === 'shared') {
       errors.push('节点 ID 不得使用保留名称 shared');
     }

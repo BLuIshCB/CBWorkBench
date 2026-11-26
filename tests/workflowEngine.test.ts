@@ -94,6 +94,7 @@ assert.ok(invalidStateResult.message.includes('Cannot start task'));
 const wfInfo = createCustomWorkflow(`wf-eng-${Date.now()}`);
 const unknownCliTaskId = submitV2Package({ taskKey: 'unknown-cli-task', wfId: wfInfo.wfId, wfSha: wfInfo.sha, nodes: wfInfo.nodes });
 const unknownCliResult = await workflowEngine.confirmAndStartTask(unknownCliTaskId, undefined, { workerExecutor: 'unknown-cli' });
+assert.equal(JSON.parse(db.getTaskWorkflow(unknownCliTaskId)!.nodes_json).find((node: WorkflowNode) => node.id === 'development').executor, 'workbuddy');
 assert.equal(unknownCliResult.success, false);
 assert.equal(db.getTask(unknownCliTaskId)?.status, TaskStatus.PENDING_CONFIRM);
 

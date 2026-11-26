@@ -16,7 +16,7 @@ import {
 } from './nodeCompletion.ts';
 import { TaskStatus, RoundStage, DEFAULT_BUDGET_MAX_ROUNDS } from '../config/constants.ts';
 import { logger } from '../utils/logger.ts';
-import { type WorkflowNode, DEFAULT_MAX_EXECUTIONS, validateWorkflowNodes } from './workflowDefinition.ts';
+import { type WorkflowNode, DEFAULT_MAX_EXECUTIONS, resolveTaskNodeExecutor, validateWorkflowNodes } from './workflowDefinition.ts';
 import {
   NODE_RESULT_SCHEMA_VERSION,
   PACKAGE_LIMITS,
@@ -111,8 +111,8 @@ export class WorkflowEngine {
     }
 
     // Apply any test/runtime overrides to agent nodes
+    let modified = false;
     if (options?.workerExecutor || options?.workerModel || options?.reviewerExecutor || options?.reviewerModel) {
-      let modified = false;
       for (const node of nodes) {
         if (node.execution_mode === 'agent') {
           if (node.result_rule === 'acceptance') {
@@ -124,16 +124,13 @@ export class WorkflowEngine {
           }
         }
       }
-      if (modified) {
-        db.updateTaskWorkflow(taskId, { nodes_json: JSON.stringify(nodes) });
-      }
     }
 
     // Validate that every agent node has a registered adapter
     for (const node of nodes) {
-      if (node.execution_mode === 'agent' && node.executor) {
+      if (node.execution_mode === 'agent') {
         try {
-          adapterRegistry.getAdapter(node.executor);
+          adapterRegistry.getAdapter(resolveTaskNodeExecutor(node));
         } catch (error) {
           return { success: false, message: String(error) };
         }
@@ -150,6 +147,7 @@ export class WorkflowEngine {
     this.activeTaskId = taskId;
 
     try {
+      if (modified) db.updateTaskWorkflow(taskId, { nodes_json: JSON.stringify(nodes) });
       db.updateTaskStatus(taskId, TaskStatus.QUEUED, {
         execution_timeout_ms: executionTimeoutMs,
         stop_requested: 0,
@@ -471,8 +469,8 @@ export class WorkflowEngine {
     const developmentDoc = readOptional('shared/development.md');
     const complete = completionCommand(paths.contextPath);
     const sections = [
-      reworkInputs.length ? `## 本次返工指令\n${reworkInputs.join('\n\n')}` : `## 节点执行指令\n${basePrompt}`,
-      reworkInputs.length ? `完成本次返工时遵守 material/prompt.md 中的节点职责与执行约束。\n${node.prompt || ''}` : '',
+      `## 节点执行指令\n${basePrompt}`,
+      reworkInputs.length ? `## 本次返工指令\n${reworkInputs.join('\n\n')}` : '',
       nodeDoc ? `## 本节点具体工作 (${node.id}.md)\n${nodeDoc}` : '',
       `## 需求文档 (requirements.md)\n${readRegularFileSafely(paths.attemptDir, 'shared/requirements.md').toString('utf8')}`,
       developmentDoc ? `## 开发文档 (development.md)\n${developmentDoc}` : '',
@@ -530,7 +528,7 @@ export class WorkflowEngine {
     const isAcceptance = node.result_rule === 'acceptance';
     const roundStage = isAcceptance ? RoundStage.CODEX_ACCEPTANCE
       : node.result_rule === 'verification' ? RoundStage.RUNNING_TESTS : RoundStage.WORKER_DEV;
-    const adapter = adapterRegistry.getAdapter(node.executor || (isAcceptance ? 'codex' : 'workbuddy'));
+    const adapter = adapterRegistry.getAdapter(resolveTaskNodeExecutor(node));
     const model = node.model && node.model !== 'default' ? node.model : adapter.defaultModel;
     const prompt = this.buildNodePrompt(node, run, paths, confirmedCwd, params.packageDigest, params.reworkDocuments, params.reworkTarget);
     const roundId = db.createExecutionRound({
@@ -686,7 +684,7 @@ export class WorkflowEngine {
       }
 
       const confirmedCwd = task.confirmed_cwd || task.target_cwd;
-      const workflowValidation = validateWorkflowNodes(nodes, taskWorkflow.workflow_id);
+      const workflowValidation = validateWorkflowNodes(nodes, taskWorkflow.workflow_id, { requireMetadata: false });
       if (!workflowValidation.valid) {
         db.updateTaskStatus(taskId, TaskStatus.BLOCKED, {
           blocked_reason: `工作流定义无效，请重新编排后提交任务: ${workflowValidation.errors.join('; ')}`,

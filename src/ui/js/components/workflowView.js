@@ -6,7 +6,7 @@
  */
 
 import { api } from '../api.js';
-import { escapeHtml, formatExecutor } from '../utils.js';
+import { escapeHtml } from '../utils.js';
 
 export class WorkflowView {
   constructor(app) {
@@ -16,16 +16,9 @@ export class WorkflowView {
     this.currentNodes = [];
     this.selectedNodeId = null;
     this.connectPending = null; // { sourceId, edgeType: 'on_success' | 'on_failure' }
-    this.executors = [];
   }
 
   async init() {
-    try {
-      const execRes = await api.getExecutors();
-      if (execRes && execRes.agents) {
-        this.executors = execRes.agents;
-      }
-    } catch {}
     await this.loadWorkflows();
   }
 
@@ -306,7 +299,7 @@ export class WorkflowView {
         return `
           <g class="svg-node svg-node-start ${isSelected ? 'selected' : ''}" onclick="app.workflowView.selectNode('${node.id}')" cursor="pointer">
             <rect x="${pos.x}" y="${pos.y}" width="${pos.w}" height="${pos.h}" rx="${pos.h / 2}" fill="${isSelected ? '#dbeafe' : '#eff6ff'}" stroke="${isSelected ? '#2563eb' : '#3b82f6'}" stroke-width="${isSelected ? '3' : '2'}" />
-            <text x="${pos.x + pos.w / 2}" y="${pos.y + pos.h / 2 + 5}" font-size="14" font-weight="bold" fill="#1e40af" text-anchor="middle">⚡ 开始</text>
+            <text x="${pos.x + pos.w / 2}" y="${pos.y + pos.h / 2 + 5}" font-size="14" font-weight="bold" fill="#1e40af" text-anchor="middle">⚡ ${escapeHtml(node.name || node.id)}</text>
           </g>
         `;
       }
@@ -315,7 +308,7 @@ export class WorkflowView {
         return `
           <g class="svg-node svg-node-end ${isSelected ? 'selected' : ''}" onclick="app.workflowView.selectNode('${node.id}')" cursor="pointer">
             <rect x="${pos.x}" y="${pos.y}" width="${pos.w}" height="${pos.h}" rx="${pos.h / 2}" fill="${isSelected ? '#e2e8f0' : '#f1f5f9'}" stroke="${isSelected ? '#475569' : '#64748b'}" stroke-width="${isSelected ? '3' : '2'}" />
-            <text x="${pos.x + pos.w / 2}" y="${pos.y + pos.h / 2 + 5}" font-size="14" font-weight="bold" fill="#334155" text-anchor="middle">🏁 结束</text>
+            <text x="${pos.x + pos.w / 2}" y="${pos.y + pos.h / 2 + 5}" font-size="14" font-weight="bold" fill="#334155" text-anchor="middle">🏁 ${escapeHtml(node.name || node.id)}</text>
           </g>
         `;
       }
@@ -341,7 +334,7 @@ export class WorkflowView {
           <text x="${pos.x + 10}" y="${pos.y + 46}" font-size="13" font-weight="bold" fill="#1e293b">${escapeHtml(node.name || node.id)}</text>
           
           <!-- Detail subtext -->
-          <text x="${pos.x + 10}" y="${pos.y + 66}" font-size="11" fill="#64748b">${escapeHtml(node.execution_mode === 'manual' ? '人工审核' : formatExecutor(node.executor))}</text>
+          <text x="${pos.x + 10}" y="${pos.y + 66}" font-size="11" fill="#64748b">${node.execution_mode === 'manual' ? '人工审核' : '执行器由任务决定'}</text>
         </g>
       `;
     });
@@ -387,38 +380,25 @@ export class WorkflowView {
       }
 
       <div class="node-config-form">
+        <p class="form-hint">请仔细填写节点名称和描述，AI 会参考它们生成任务包。具体执行器和提示词由任务决定。</p>
         <div class="form-group">
-          <label class="form-label">节点名称</label>
-          <input type="text" class="input-text" value="${escapeHtml(node.name || '')}" onchange="app.workflowView.updateCurrentNodeField('name', this.value)" ${isStart || isEnd || isLocked ? 'disabled' : ''} />
+          <label class="form-label" for="workflow-node-name">节点名称（必填）</label>
+          <input id="workflow-node-name" type="text" class="input-text" required value="${escapeHtml(node.name || '')}" oninput="app.workflowView.updateCurrentNodeText('name', this.value)" ${isLocked ? 'disabled' : ''} />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="workflow-node-description">节点描述（必填）</label>
+          <textarea id="workflow-node-description" class="input-textarea" rows="5" required placeholder="${isStart || isEnd ? '说明该节点如何开始或结束流程' : '说明节点负责什么、需要交付什么，以及怎样算完成'}" oninput="app.workflowView.updateCurrentNodeText('description', this.value)" ${isLocked ? 'disabled' : ''}>${escapeHtml(node.description || '')}</textarea>
         </div>
 
         ${
           !isStart && !isEnd
             ? `
           <div class="form-group">
-            <label class="form-label">${node.execution_mode === 'manual' ? '人工核验提示词' : '节点提示词'}</label>
-            <textarea class="input-textarea" rows="6" placeholder="填写本节点的职责、执行要求和完成条件" onchange="app.workflowView.updateCurrentNodeField('prompt', this.value)" ${isLocked ? 'disabled' : ''}>${escapeHtml(node.prompt || node.description || '')}</textarea>
-            <small class="form-hint">生成任务材料时以此为基础，执行时保留这些要求。</small>
-          </div>
-
-          <div class="form-group">
             <label class="form-label">最大执行次数 (0 或留空为不限制)</label>
             <input type="number" min="0" max="100" class="input-text" value="${node.max_executions || 0}" onchange="app.workflowView.updateCurrentNodeField('max_executions', parseInt(this.value, 10))" ${isLocked ? 'disabled' : ''} />
             <small class="form-hint">设置为 0 或留空表示节点不做次数限制。</small>
           </div>
 
-          ${
-            node.execution_mode !== 'manual' ? `
-            <div class="form-group">
-              <label class="form-label">执行器 (Executor)</label>
-              <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('executor', this.value)" ${isLocked ? 'disabled' : ''}>
-                <option value="workbuddy" ${node.executor === 'workbuddy' ? 'selected' : ''}>CodeBuddy CLI</option>
-                <option value="codex" ${node.executor === 'codex' ? 'selected' : ''}>Codex</option>
-                <option value="antigravity" ${node.executor === 'antigravity' ? 'selected' : ''}>Antigravity</option>
-              </select>
-            </div>
-          ` : ''
-          }
         `
             : ''
         }
@@ -526,6 +506,15 @@ export class WorkflowView {
     this.render();
   }
 
+  updateCurrentNodeText(field, value) {
+    const node = this.currentNodes.find((n) => n.id === this.selectedNodeId);
+    if (node && !this.currentWorkflow?.isReferenced) {
+      node[field] = value;
+      const viewport = field === 'name' ? document.getElementById('wf-svg-viewport') : null;
+      if (viewport) viewport.innerHTML = this.buildSvgDiagram();
+    }
+  }
+
   addNodePrompt() {
     if (this.currentWorkflow?.isReferenced) {
       alert('该工作流正被任务引用，处于锁定状态，禁止添加节点！');
@@ -549,11 +538,9 @@ export class WorkflowView {
     const newNode = {
       id,
       name: name.trim(),
+      description: '',
       type: 'task',
       execution_mode: 'agent',
-      executor: 'workbuddy',
-      model: 'default',
-      prompt: `执行节点任务: ${name.trim()}`,
       max_executions: 0,
       on_success: endNode ? endNode.id : null,
       on_failure: devNode ? devNode.id : null,
@@ -569,6 +556,7 @@ export class WorkflowView {
 
     this.selectedNodeId = id;
     this.render();
+    document.getElementById('workflow-node-description')?.focus();
   }
 
   deleteCurrentNode(id) {
@@ -605,6 +593,16 @@ export class WorkflowView {
 
     if (this.currentWorkflow.isReferenced) {
       alert('该工作流正被任务引用，禁止修改！若需修改，请先清理相关任务或新建独立工作流。');
+      return;
+    }
+
+    const incomplete = this.currentNodes.find((node) => !node.name?.trim() || !node.description?.trim());
+    if (incomplete) {
+      this.connectPending = null;
+      this.selectNode(incomplete.id);
+      const field = !incomplete.name?.trim() ? 'name' : 'description';
+      alert(`请填写节点「${incomplete.name?.trim() || incomplete.id}」的${field === 'name' ? '名称' : '描述'}，供 AI 生成任务包时参考。`);
+      document.getElementById(`workflow-node-${field}`)?.focus();
       return;
     }
 
@@ -660,6 +658,8 @@ export class WorkflowView {
     if (nameInput) nameInput.value = '';
     if (idInput) idInput.value = '';
     if (descInput) descInput.value = '';
+    document.getElementById('new-wf-node-name').value = '';
+    document.getElementById('new-wf-node-description').value = '';
     modal.style.display = 'flex';
     if (nameInput) setTimeout(() => nameInput.focus(), 50);
   }
@@ -673,11 +673,20 @@ export class WorkflowView {
     const nameInput = document.getElementById('new-wf-name');
     const idInput = document.getElementById('new-wf-id');
     const descInput = document.getElementById('new-wf-desc');
+    const nodeNameInput = document.getElementById('new-wf-node-name');
+    const nodeDescriptionInput = document.getElementById('new-wf-node-description');
 
     const name = nameInput ? nameInput.value.trim() : '';
     if (!name) {
       alert('请输入工作流名称');
       if (nameInput) nameInput.focus();
+      return;
+    }
+    const nodeName = nodeNameInput.value.trim();
+    const nodeDescription = nodeDescriptionInput.value.trim();
+    if (!nodeName || !nodeDescription) {
+      alert(`请填写首个任务节点的${!nodeName ? '名称' : '描述'}，供 AI 生成任务包时参考。`);
+      (!nodeName ? nodeNameInput : nodeDescriptionInput).focus();
       return;
     }
 
@@ -693,20 +702,18 @@ export class WorkflowView {
     const desc = descInput ? descInput.value.trim() : '';
 
     const nodes = [
-      { id: 'start', name: '开始', type: 'start', on_success: 'development' },
+      { id: 'start', name: '开始', description: '进入首个任务节点。', type: 'start', on_success: 'development' },
       {
         id: 'development',
-        name: '开发实现',
+        name: nodeName,
+        description: nodeDescription,
         type: 'task',
         execution_mode: 'agent',
-        executor: 'workbuddy',
-        model: 'default',
-        prompt: '实现本次开发需求并完成交付。',
         max_executions: 0,
         on_success: 'end',
         on_failure: null,
       },
-      { id: 'end', name: '结束', type: 'end' },
+      { id: 'end', name: '结束', description: '完成工作流。', type: 'end' },
     ];
 
     try {

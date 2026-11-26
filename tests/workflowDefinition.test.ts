@@ -83,6 +83,7 @@ const unreachableNodes: WorkflowNode[] = [
   {
     id: 'orphan',
     name: '孤立任务',
+    description: '孤立节点用于验证连通性。',
     type: 'task',
     execution_mode: 'agent',
     on_success: 'end',
@@ -95,10 +96,10 @@ console.log('  ✓ Rejects unreachable orphan nodes');
 
 // 8. Reject infinite cycle with no path to end
 const cycleNodes: WorkflowNode[] = [
-  { id: 'start', name: '开始', type: 'start', on_success: 'taskA' },
-  { id: 'taskA', name: 'A', type: 'task', execution_mode: 'agent', on_success: 'taskB', on_failure: 'taskB' },
-  { id: 'taskB', name: 'B', type: 'task', execution_mode: 'agent', on_success: 'taskA', on_failure: 'taskA' },
-  { id: 'end', name: '结束', type: 'end' },
+  { id: 'start', name: '开始', description: '进入环路。', type: 'start', on_success: 'taskA' },
+  { id: 'taskA', name: 'A', description: '执行 A。', type: 'task', execution_mode: 'agent', on_success: 'taskB', on_failure: 'taskB' },
+  { id: 'taskB', name: 'B', description: '执行 B。', type: 'task', execution_mode: 'agent', on_success: 'taskA', on_failure: 'taskA' },
+  { id: 'end', name: '结束', description: '完成流程。', type: 'end' },
 ];
 const cycleRes = validateWorkflowNodes(cycleNodes);
 assert.strictEqual(cycleRes.valid, false);
