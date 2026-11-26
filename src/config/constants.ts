@@ -2,6 +2,9 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
+  isStandaloneExe,
+  isPidAlive,
+  readServerInfoFile,
   resolveDataDirConfig,
   parseCliRuntimeArgs,
   type InstanceMetadata,
@@ -23,6 +26,7 @@ export const DEFAULT_BUDGET_MAX_ROUNDS = 10;
 
 function resolveRootDir(): string {
   if (process.env.CB_ROOT_DIR) return path.resolve(process.env.CB_ROOT_DIR);
+  if (isStandaloneExe()) return path.dirname(process.execPath);
   if (fs.existsSync(path.join(process.cwd(), 'src')) || fs.existsSync(path.join(process.cwd(), 'data'))) {
     return process.cwd();
   }
@@ -49,6 +53,14 @@ export const LEGACY_DATA_PATH = resolvedData.legacyDataPath;
 export const TASKS_DATA_DIR = path.join(DATA_DIR, 'tasks');
 export const MAINTENANCE_DELETIONS_DIR = path.join(DATA_DIR, 'maintenance', 'deletions');
 export const DB_PATH = path.join(DATA_DIR, 'workbench.db');
+
+export function getWorkbenchWebUrl(): string {
+  const active = readServerInfoFile(DATA_DIR);
+  if (active?.instance_id === INSTANCE_ID && active.data_dir === DATA_DIR && isPidAlive(active.pid)) {
+    return active.url;
+  }
+  return `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
+}
 
 export const TaskStatus = {
   PENDING_CONFIRM: 'pending_confirm', // 待启动确认 (Gate 2)

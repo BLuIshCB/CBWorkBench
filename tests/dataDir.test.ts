@@ -71,6 +71,22 @@ try {
   });
   assert.equal(portableRes.dataDir, path.join(fakeExeDir, 'data'));
   assert.equal(portableRes.source, 'portable');
+  const defaultExeRes = resolveDataDirConfig({
+    argv: [],
+    env: { LOCALAPPDATA: tmpBase },
+    isExe: true,
+    execPath: path.join(fakeExeDir, 'cb-workbench.exe'),
+    rootDir: path.join(tmpBase, 'another-working-directory'),
+  });
+  assert.equal(defaultExeRes.dataDir, portableRes.dataDir);
+  assert.equal(defaultExeRes.instance.instance_id, portableRes.instance.instance_id);
+  const overriddenExeRes = resolveDataDirConfig({
+    argv: ['--data-dir', cliDir],
+    env: { CB_DATA_DIR: envDir },
+    isExe: true,
+    execPath: path.join(fakeExeDir, 'cb-workbench.exe'),
+  });
+  assert.equal(overriddenExeRes.dataDir, cliDir);
   console.log('  ✓ --portable EXE rules & conflict detection verified');
 
   // 4. Default resolution uses LOCALAPPDATA on Windows (never process.cwd()), fails cleanly if missing

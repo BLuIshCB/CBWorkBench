@@ -3,8 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {
   DATA_DIR,
-  DEFAULT_HOST,
-  DEFAULT_PORT,
+  getWorkbenchWebUrl,
   INSTANCE_ID,
   LEGACY_DATA_PATH,
   TaskStatus,
@@ -202,7 +201,7 @@ export class PackageService {
       files: saved.files,
     });
 
-    const webUrl = `http://${DEFAULT_HOST}:${DEFAULT_PORT}/#task-${taskId}`;
+    const webUrl = `${getWorkbenchWebUrl()}/#task-${taskId}`;
     logger.info(`[PackageService] Submitted task package ${taskId} r${targetRevision} (${manifest.title})`);
 
     return {
@@ -279,7 +278,7 @@ export class PackageService {
         ...f,
         resource_ref: `pkg://${task.id}/r${revNum}/${f.path}`,
       })),
-      web_url: `http://${DEFAULT_HOST}:${DEFAULT_PORT}/#task-${task.id}`,
+      web_url: `${getWorkbenchWebUrl()}/#task-${task.id}`,
     };
   }
 
@@ -303,11 +302,13 @@ export class PackageService {
     if (!run.completion_token || run.completion_token !== query.completion_token) {
       throw new PackageProtocolError('ACCESS_DENIED', '执行凭据 (completion_token) 无效');
     }
-    if (!run.attempt_dir || !fs.existsSync(run.attempt_dir)) {
+    // 任务资料随 data 搬迁，已保存的绝对路径可能仍指向旧目录。
+    const attemptDir = run.attempt_dir && taskFileStore.getNodeRunDir(run.task_id, run.revision, run.node_id, run.run_id);
+    if (!attemptDir || !fs.existsSync(attemptDir)) {
       throw new PackageProtocolError('MISSING_FILE', '节点运行上下文目录不存在');
     }
 
-    const contextBuf = readRegularFileSafely(run.attempt_dir, 'context.json');
+    const contextBuf = readRegularFileSafely(attemptDir, 'context.json');
     const context = JSON.parse(contextBuf.toString('utf8'));
 
     if (!query.resource_path) {
@@ -335,12 +336,12 @@ export class PackageService {
     } else if ((context.allowed_shared_files as string[]).includes(reqPath)) {
       mappedAttemptRel = reqPath.startsWith('shared/') ? reqPath : `shared/${reqPath}`;
     } else if (reqPath.startsWith('material/') || reqPath.startsWith('shared/') || reqPath.startsWith('inputs/')) {
-      const fullCandidate = path.join(run.attempt_dir, ...reqPath.split('/'));
+      const fullCandidate = path.join(attemptDir, ...reqPath.split('/'));
       if (fs.existsSync(fullCandidate)) {
         mappedAttemptRel = reqPath;
       }
     } else if (reqPath.startsWith('outputs/')) {
-      const fullCandidate = path.join(run.attempt_dir, ...reqPath.split('/'));
+      const fullCandidate = path.join(attemptDir, ...reqPath.split('/'));
       if (fs.existsSync(fullCandidate)) {
         mappedAttemptRel = reqPath;
       }
@@ -360,7 +361,7 @@ export class PackageService {
       node_id: query.node_id,
       attempt_id: query.attempt_id,
       resource: taskFileStore.readSliceFromDir(
-        run.attempt_dir,
+        attemptDir,
         mappedAttemptRel,
         '',
         query.offset_bytes ?? 0,

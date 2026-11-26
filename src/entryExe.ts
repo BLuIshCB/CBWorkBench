@@ -34,11 +34,11 @@ async function main() {
     await completeNode(process.argv.slice(3));
     return;
   }
-  if (process.argv[2] === '--mcp-advance') {
+  if (process.argv[2] === '--mcp' || process.argv[2] === '--mcp-advance') {
     process.env.MCP_MODE = 'true';
     console.log = (...args) => console.error(...args);
     const { startMcpServer } = await import('./server/mcpServer.ts');
-    await startMcpServer(true);
+    await startMcpServer(process.argv[2] === '--mcp-advance');
     return;
   }
   let cliArgs;
@@ -62,7 +62,8 @@ async function main() {
   --port <port>              指定服务监听端口 (默认: 3721)
   --host <host>              指定服务绑定主机 (默认: 127.0.0.1)
   --data-dir <absolute_path> 显式指定绝对数据目录 (优先于 CB_DATA_DIR)
-  --portable                 启用便携模式，使用 EXE 所在目录/data
+  --portable                 显式使用默认的 EXE 同级 data 目录
+  --mcp                      启动 MCP 服务，供客户端导入工作台任务
   --no-open                  启动后不自动在默认浏览器中打开页面
   --help, -h                 显示此帮助信息
   complete-node              通过 MCP 提交当前节点执行结果
@@ -91,8 +92,9 @@ async function main() {
     const { startServer } = await import('./server/httpServer.ts');
     const port = cliArgs.port || Number(process.env.CB_PORT) || DEFAULT_PORT;
     const host = cliArgs.host || process.env.CB_HOST || DEFAULT_HOST;
-    const server = await startServer(port, host);
-    const url = `http://${host}:${port}/`;
+    const server = await startServer(port, host, !cliArgs.port && !process.env.CB_PORT);
+    const address = server.address();
+    const url = `http://${host}:${typeof address === 'object' && address ? address.port : port}/`;
 
     const { uiActivityTracker } = await import('./services/uiActivityTracker.ts');
     if (!cliArgs.noOpen) {

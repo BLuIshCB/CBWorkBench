@@ -48,6 +48,8 @@ WorkBuddy、Codex 和 Antigravity 都实现同一个 IAgentAdapter.execute()。�
 
 ## 🚀 快速启动
 
+Windows 便携版可直接双击 `cb-workbench.exe`。首次运行会在 EXE 旁创建 `data`，其中保存数据库、任务材料及本地文件。换目录或换电脑时，关闭工作台后一起复制 EXE 和整个 `data`。打包、旧版数据迁移和 MCP 配置见 [EXE 打包指南](docs/EXE打包指南.md)。
+
 ### 1. 环境准备
 CBWorkBench 内置跨运行时自检测引擎（`nodeResolver.js`）：
 - 源码运行需要 Node 24+ 和 `npm install` 安装的工作台依赖；本次验证版本为 Node 24.22.1。只有 Codex CLI 并不足以运行工作台。

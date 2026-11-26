@@ -192,13 +192,14 @@ export function resolveDataDirConfig(options?: {
   let dataDir: string;
   let source: ResolvedDataDir['source'];
 
-  if (args.portable) {
-    if (!isExe) {
-      throw new DataDirConfigError(
-        'PORTABLE_NOT_ALLOWED_IN_SOURCE',
-        '源码运行模式不支持 --portable，请仅在独立 EXE 中使用或改用 --data-dir'
-      );
-    }
+  if (args.portable && !isExe) {
+    throw new DataDirConfigError(
+      'PORTABLE_NOT_ALLOWED_IN_SOURCE',
+      '源码运行模式不支持 --portable，请仅在独立 EXE 中使用或改用 --data-dir'
+    );
+  }
+
+  if (isExe && !cliDataDir && !envDataDir) {
     dataDir = path.resolve(path.dirname(execPath), 'data');
     source = 'portable';
   } else if (cliDataDir) {

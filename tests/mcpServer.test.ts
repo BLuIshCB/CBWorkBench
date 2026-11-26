@@ -271,10 +271,10 @@ try {
     code_generation: 1,
     status: 'running',
     completion_token: mockToken,
-    attempt_dir: runDir,
+    attempt_dir: path.join(tmpPkgRoot1, 'previous-workbench-location', mockAttempt),
   });
 
-  // Query node context via MCP
+  // A moved data directory must still resolve node resources from the current task store.
   const ctxRes = await client.callTool({
     name: 'workbench_get_node_context',
     arguments: {
@@ -290,6 +290,7 @@ try {
   assert.ok(ctxData.resource.content.includes('Work for development'));
 
   // Simulate worker creating outputs and calling advance
+  db.updateNodeRun(mockAttempt, { attempt_dir: runDir });
   db.updateTaskWorkflow(taskId, { current_node_id: 'development', current_run_id: mockAttempt });
   const outPath = path.join(runDir, 'outputs');
   fs.writeFileSync(path.join(outPath, 'dev_notes.md'), 'Dev done', 'utf8');

@@ -6,8 +6,7 @@ import { db } from '../storage/db.ts';
 import { GitService } from '../services/gitService.ts';
 import {
   DATA_DIR,
-  DEFAULT_HOST,
-  DEFAULT_PORT,
+  getWorkbenchWebUrl,
   INSTANCE_ID,
 } from '../config/constants.ts';
 import {
@@ -414,7 +413,7 @@ export function createWorkbenchMcpServer(advanceOnly = false): McpServer {
           } catch {}
         }
 
-        const webUrl = `http://${DEFAULT_HOST}:${DEFAULT_PORT}/tasks/${args.task_id}`;
+        const webUrl = `${getWorkbenchWebUrl()}/tasks/${args.task_id}`;
         return okJson({
           taskId: task.id,
           taskKey: task.task_key,
