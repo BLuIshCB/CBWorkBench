@@ -24,7 +24,7 @@ export interface WorkflowDefinitionRecord {
   is_default: number;
 }
 
-function readWorkflowDesign(record: WorkflowDefinitionRecord): WorkflowDefinitionRecord {
+function readWorkflowDesign({ version, ...record }: WorkflowDefinitionRecord & { version?: number }): WorkflowDefinitionRecord {
   try {
     const nodes = toWorkflowDesignNodes(JSON.parse(record.nodes_json), true);
     return { ...record, nodes_json: JSON.stringify(nodes) };
@@ -208,6 +208,8 @@ export interface HumanDecisionRecord {
 
 export class WorkbenchDatabase {
   private db: DatabaseSync;
+  private hasLegacyWorkflowDefinitions = false;
+  private hasLegacyTaskWorkflows = false;
 
   constructor(dbPath: string = DB_PATH) {
     const dir = path.dirname(dbPath);
@@ -485,6 +487,8 @@ export class WorkbenchDatabase {
       );
     `);
 
+    this.migrateWorkflowTables();
+
     try {
       const defRow = this.db.prepare('SELECT id FROM workflow_definitions WHERE id = ?').get('default');
       if (!defRow) {
@@ -508,6 +512,64 @@ export class WorkbenchDatabase {
       CREATE TABLE IF NOT EXISTS execution_events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, at INTEGER NOT NULL, type TEXT NOT NULL, data_json TEXT NOT NULL, PRIMARY KEY(run_id,seq));
       CREATE INDEX IF NOT EXISTS idx_runs_task ON execution_runs(task_id);
     `);
+  }
+
+  private migrateWorkflowTables(): void {
+    this.transaction(() => {
+      const definitionColumns = this.tableColumns('workflow_definitions');
+      const taskColumns = this.tableColumns('task_workflows');
+      const runColumns = this.tableColumns('workflow_node_runs');
+      this.hasLegacyWorkflowDefinitions = definitionColumns.has('version');
+      this.hasLegacyTaskWorkflows = taskColumns.has('workflow_version');
+
+      if (!taskColumns.has('revision')) {
+        this.db.exec(`
+          ALTER TABLE task_workflows ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+          UPDATE task_workflows SET revision = COALESCE((
+            SELECT revision FROM tasks WHERE id = task_workflows.task_id
+          ), 1);
+        `);
+      }
+      if (!taskColumns.has('workflow_sha256')) {
+        this.db.exec(`
+          ALTER TABLE task_workflows ADD COLUMN workflow_sha256 TEXT NOT NULL DEFAULT '';
+          UPDATE task_workflows SET workflow_sha256 = COALESCE((
+            SELECT workflow_sha256 FROM task_revisions
+            WHERE task_id = task_workflows.task_id AND revision = task_workflows.revision
+              AND workflow_id = task_workflows.workflow_id
+          ), '');
+        `);
+      }
+
+      const nextRunColumns = {
+        revision: 'INTEGER NOT NULL DEFAULT 1',
+        round_number: 'INTEGER NOT NULL DEFAULT 1',
+        code_generation: 'INTEGER NOT NULL DEFAULT 0',
+        reported_outcome: 'TEXT',
+        attempt_dir: 'TEXT',
+        result_json: 'TEXT',
+        result_sha256: 'TEXT',
+        inputs_json: 'TEXT',
+        outputs_json: 'TEXT',
+      };
+      for (const [column, definition] of Object.entries(nextRunColumns)) {
+        if (!runColumns.has(column)) this.db.exec(`ALTER TABLE workflow_node_runs ADD COLUMN ${column} ${definition}`);
+      }
+      if (!runColumns.has('revision')) {
+        this.db.exec(`
+          UPDATE workflow_node_runs SET revision = COALESCE((
+            SELECT revision FROM task_revisions
+            WHERE task_id = workflow_node_runs.task_id AND created_at <= workflow_node_runs.created_at
+            ORDER BY created_at DESC, revision DESC LIMIT 1
+          ), 1);
+        `);
+      }
+    });
+  }
+
+  private tableColumns(table: string): Set<string> {
+    const columns = this.db.prepare('SELECT name FROM pragma_table_info(?)').all(table) as { name: string }[];
+    return new Set(columns.map(({ name }) => name));
   }
 
   taskOutputBytes(taskId: string): number {
@@ -995,7 +1057,7 @@ export class WorkbenchDatabase {
 
   getWorkflow(id: string): WorkflowDefinitionRecord | null {
     const row = this.db
-      .prepare('SELECT * FROM workflow_definitions WHERE id = ?')
+      .prepare(`SELECT * FROM workflow_definitions WHERE id = ?${this.hasLegacyWorkflowDefinitions ? ' ORDER BY version DESC LIMIT 1' : ''}`)
       .get(id) as unknown as WorkflowDefinitionRecord | undefined;
     return row ? readWorkflowDesign(row) : null;
   }
@@ -1003,6 +1065,9 @@ export class WorkbenchDatabase {
   listWorkflows(): WorkflowDefinitionRecord[] {
     const rows = this.db.prepare(`
       SELECT * FROM workflow_definitions
+      ${this.hasLegacyWorkflowDefinitions ? `WHERE version = (
+        SELECT MAX(history.version) FROM workflow_definitions history WHERE history.id = workflow_definitions.id
+      )` : ''}
       ORDER BY is_default DESC, id ASC
     `).all() as unknown as WorkflowDefinitionRecord[];
     return rows.map(readWorkflowDesign);
@@ -1024,14 +1089,15 @@ export class WorkbenchDatabase {
       this.db.prepare(`
         UPDATE workflow_definitions
         SET name = ?, description = ?, nodes_json = ?, updated_at = ?, is_default = ?
-        WHERE id = ?
+        WHERE id = ?${this.hasLegacyWorkflowDefinitions ? ' AND version = (SELECT MAX(version) FROM workflow_definitions WHERE id = ?)' : ''}
       `).run(
         data.name,
         data.description || null,
         data.nodes_json,
         now,
         data.is_default ?? existing.is_default,
-        data.id
+        data.id,
+        ...(this.hasLegacyWorkflowDefinitions ? [data.id] : []),
       );
       return this.getWorkflow(data.id)!;
     }
@@ -1151,13 +1217,17 @@ export class WorkbenchDatabase {
     const initialNodeId = startNode ? startNode.id : 'start';
     const now = Date.now();
 
+    const legacyVersion = this.hasLegacyTaskWorkflows && this.hasLegacyWorkflowDefinitions
+      ? (this.db.prepare('SELECT MAX(version) AS version FROM workflow_definitions WHERE id = ?').get(wfId)?.version as number | null)
+      : null;
     this.db.prepare(`
       INSERT OR REPLACE INTO task_workflows (
         task_id, workflow_id, workflow_sha256, revision, nodes_json,
         current_node_id, current_run_id, code_generation,
-        tests_passed_generation, acceptance_passed_generation, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, 0, 0, ?)
-    `).run(taskId, wfId, wfSha, revision, JSON.stringify(nodes), initialNodeId, now);
+        tests_passed_generation, acceptance_passed_generation, updated_at${this.hasLegacyTaskWorkflows ? ', workflow_version' : ''}
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, 0, 0, ?${this.hasLegacyTaskWorkflows ? ', ?' : ''})
+    `).run(taskId, wfId, wfSha, revision, JSON.stringify(nodes), initialNodeId, now,
+      ...(this.hasLegacyTaskWorkflows ? [legacyVersion ?? 1] : []));
 
     return this.getTaskWorkflow(taskId)!;
   }

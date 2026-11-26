@@ -2,6 +2,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { WorkbenchDatabase } from '../src/storage/db.ts';
 import { TaskStatus } from '../src/config/constants.ts';
 import { DEFAULT_WORKFLOW_ID } from '../src/services/workflowDefinition.ts';
@@ -237,6 +238,72 @@ try {
   // 10.4 Deleting non-existent workflow returns false
   assert.strictEqual(testDb.deleteWorkflow('non_existent_wf'), false);
   console.log('  ✓ Deleting non-existent workflow returns false');
+
+  const legacyPath = path.join(tmpDir, 'legacy.db');
+  const legacySeed = new WorkbenchDatabase(legacyPath);
+  legacySeed.createTask({ id: 'old-task', task_key: 'legacy', title: '旧任务', target_cwd: tmpDir, revision: 2 });
+  legacySeed.saveRevision({
+    task_id: 'old-task', revision: 2, manifest_json: '{}', manifest_sha256: 'manifest',
+    package_digest: 'package', workflow_id: 'old-flow', workflow_sha256: 'saved-workflow-hash',
+  });
+  const oldDb = new DatabaseSync(legacyPath);
+  oldDb.exec(`
+    DROP TABLE workflow_definitions;
+    DROP TABLE task_workflows;
+    DROP TABLE workflow_node_runs;
+    CREATE TABLE workflow_definitions (
+      id TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, name TEXT NOT NULL, description TEXT,
+      nodes_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      is_default INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (id, version)
+    );
+    CREATE TABLE task_workflows (
+      task_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, workflow_version INTEGER NOT NULL,
+      nodes_json TEXT NOT NULL, current_node_id TEXT NOT NULL, current_run_id TEXT,
+      code_generation INTEGER NOT NULL DEFAULT 0, tests_passed_generation INTEGER NOT NULL DEFAULT 0,
+      acceptance_passed_generation INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE workflow_node_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL UNIQUE, task_id TEXT NOT NULL,
+      node_id TEXT NOT NULL, execution_index INTEGER NOT NULL, status TEXT NOT NULL, result_summary TEXT,
+      completion_token TEXT, request_id TEXT, execution_run_id TEXT, created_at INTEGER NOT NULL,
+      finished_at INTEGER, UNIQUE (task_id, node_id, execution_index)
+    );
+    INSERT INTO workflow_definitions VALUES ('old-flow', 1, '第一版', NULL, '[]', 1, 1, 0);
+    INSERT INTO workflow_definitions VALUES ('old-flow', 2, '第二版', NULL, '[]', 2, 2, 0);
+    INSERT INTO workflow_definitions VALUES ('editable-flow', 1, '保留的旧版', NULL, '[]', 1, 1, 0);
+    INSERT INTO workflow_definitions VALUES ('editable-flow', 2, '可编辑新版', NULL, '[]', 2, 2, 0);
+  `);
+  oldDb.prepare(`INSERT INTO task_workflows (task_id, workflow_id, workflow_version, nodes_json, current_node_id,
+    current_run_id, code_generation, updated_at) VALUES ('old-task', 'old-flow', 2, ?, 'step1', 'old-run', 3, 3)`)
+    .run(JSON.stringify(customNodes));
+  oldDb.prepare(`INSERT INTO workflow_node_runs (run_id, task_id, node_id, execution_index, status, result_summary,
+    created_at) VALUES ('old-run', 'old-task', 'step1', 1, 'passed', '旧记录', ?)`)
+    .run(legacySeed.getRevision('old-task', 2)!.created_at + 1);
+  oldDb.close();
+
+  const upgraded = new WorkbenchDatabase(legacyPath);
+  assert.equal(upgraded.listTasks()[0].workflow_sha256, 'saved-workflow-hash');
+  assert.equal(upgraded.getTask('old-task')?.current_node_id, 'step1');
+  assert.equal(upgraded.getTaskWorkflow('old-task')?.revision, 2);
+  assert.equal(upgraded.getTaskWorkflow('old-task')?.code_generation, 3);
+  assert.equal(upgraded.getNodeRuns('old-task', 'step1', 2)[0].result_summary, '旧记录');
+  assert.equal(upgraded.getNodeRunByRunId('old-run')?.attempt_dir, null);
+  assert.equal(upgraded.getWorkflow('old-flow')?.name, '第二版');
+  assert.equal(upgraded.listWorkflows().filter((workflow) => workflow.id === 'old-flow').length, 1);
+  assert.equal('version' in upgraded.getWorkflow('old-flow')!, false);
+  upgraded.saveWorkflowDefinition({ id: 'editable-flow', name: '改名后的新版', nodes_json: '[]' });
+  const history = new DatabaseSync(legacyPath, { readOnly: true });
+  assert.deepEqual(history.prepare('SELECT name FROM workflow_definitions WHERE id = ? ORDER BY version')
+    .all('editable-flow').map(({ name }) => name), ['保留的旧版', '改名后的新版']);
+  history.close();
+  upgraded.createTask({ id: 'new-task', task_key: 'new', title: '新任务', target_cwd: tmpDir });
+  assert.equal(upgraded.getTaskWorkflow('new-task')?.current_node_id, 'start');
+  upgraded.createNodeRun({ run_id: 'new-run', task_id: 'new-task', node_id: 'development', execution_index: 1 });
+  assert.equal(upgraded.getNodeRunByRunId('new-run')?.revision, 1);
+  const reopened = new WorkbenchDatabase(legacyPath);
+  assert.equal(reopened.getTaskWorkflow('old-task')?.code_generation, 3);
+  assert.equal(reopened.getTask('old-task')?.workflow_sha256, 'saved-workflow-hash');
+  console.log('  ✓ Legacy workflow databases are upgraded without losing tasks, progress or run history');
 
   console.log('✅ workflowDb.test.ts passed successfully!');
 } finally {
