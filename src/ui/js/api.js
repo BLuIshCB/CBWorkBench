@@ -85,6 +85,11 @@ export const api = {
   // Workflow APIs
   getWorkflows: () => request('/api/workflows'),
   getWorkflow: (id) => request(`/api/workflows/${encodeURIComponent(id)}`),
+  importWorkflow: (workflow) => request('/api/workflows/import', {
+    method: 'POST',
+    body: JSON.stringify(workflow),
+  }),
+  exportWorkflow: (id) => request(`/api/workflows/${encodeURIComponent(id)}/export`),
   saveWorkflow: (body) => request('/api/workflows', {
     method: 'POST',
     body: JSON.stringify(body),

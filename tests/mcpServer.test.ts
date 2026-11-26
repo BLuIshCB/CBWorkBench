@@ -82,10 +82,11 @@ try {
   const toolsResult = await client.listTools();
   const toolNames = toolsResult.tools.map((t) => t.name);
 
-  assert.strictEqual(toolNames.length, 11);
+  assert.strictEqual(toolNames.length, 12);
   assert.ok(toolNames.includes('workbench_get_package_protocol'));
   assert.ok(toolNames.includes('workbench_list_workflows'));
   assert.ok(toolNames.includes('workbench_get_workflow'));
+  assert.ok(toolNames.includes('workbench_create_workflow'));
   assert.ok(toolNames.includes('workbench_delete_workflow'));
   assert.ok(toolNames.includes('workbench_submit_task'));
   assert.ok(toolNames.includes('workbench_get_package'));
@@ -104,6 +105,52 @@ try {
   // Strict Gate check: MCP MUST NOT have start, confirm, approve, or review tools
   assert.strictEqual(toolNames.some((n) => n.includes('start') || n.includes('confirm')), false);
   assert.strictEqual(toolNames.some((n) => n.includes('approve') || n.includes('review')), false);
+
+  const [advanceClientTransport, advanceServerTransport] = InMemoryTransport.createLinkedPair();
+  const advanceOnly = createWorkbenchMcpServer(true);
+  const advanceClient = new Client({ name: 'advance-only', version: '1.0' }, { capabilities: {} });
+  try {
+    await advanceOnly.connect(advanceServerTransport);
+    await advanceClient.connect(advanceClientTransport);
+    assert.deepEqual((await advanceClient.listTools()).tools.map(tool => tool.name), ['workbench_advance_workflow']);
+  } finally {
+    await advanceClient.close();
+    await advanceOnly.close();
+  }
+
+  const createResult = await client.callTool({
+    name: 'workbench_create_workflow',
+    arguments: {
+      name: '含人工门禁',
+      steps: [
+        { name: '开发', description: '完成修改。' },
+        { name: '复核', description: '核对修改。', execution_mode: 'manual', on_failure: '开发' },
+      ],
+    },
+  });
+  const created = JSON.parse((createResult.content as any)[0].text);
+  assert.equal(created.success, true);
+  assert.match(created.workflow_id, /^wf_[0-9a-f-]{36}$/);
+  const createdNodes = JSON.parse(db.getWorkflow(created.workflow_id)!.nodes_json);
+  assert.deepEqual(createdNodes.map(({ id, execution_mode, on_success, on_failure }: any) =>
+    [id, execution_mode, on_success, on_failure]), [
+    ['start', undefined, 'step_1', undefined],
+    ['step_1', 'agent', 'step_2', undefined],
+    ['step_2', 'manual', 'end', 'step_1'],
+    ['end', undefined, undefined, undefined],
+  ]);
+  db.deleteWorkflow(created.workflow_id);
+
+  const workflowCount = db.listWorkflows().length;
+  const invalidCreate = await client.callTool({
+    name: 'workbench_create_workflow',
+    arguments: { name: '无效流程', steps: [{ name: '开发', description: '完成修改。', on_failure: '不存在' }] },
+  });
+  const invalidWorkflow = JSON.parse((invalidCreate.content as any)[0].text);
+  assert.equal(invalidCreate.isError, true);
+  assert.equal(invalidWorkflow.error.code, 'INVALID_WORKFLOW');
+  assert.equal(invalidWorkflow.error.details[0].field, 'steps[0].on_failure');
+  assert.equal(db.listWorkflows().length, workflowCount);
 
   // 2. Query protocol capabilities
   const protoRes = await client.callTool({ name: 'workbench_get_package_protocol', arguments: {} });

@@ -56,6 +56,7 @@ import {
 import { encodeNodeDirName } from '../utils/pathSecurity.ts';
 import { EMBEDDED_ASSETS } from '../ui/embeddedAssets.ts';
 import { uiActivityTracker } from '../services/uiActivityTracker.ts';
+import { exportWorkflowTemplate, importWorkflowTemplate } from '../services/workflowTemplateService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -131,14 +132,22 @@ function writeCliEntry(cliId: string, executable: string, script?: string): void
 
 export async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk.toString();
-      if (body.length > 5 * 1024 * 1024) {
+    const chunks: Buffer[] = [];
+    const limit = 5 * 1024 * 1024;
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      if (size > limit) return;
+      size += chunk.length;
+      if (size > limit) {
+        chunks.length = 0;
         reject(new Error('Payload too large'));
+        return;
       }
+      chunks.push(chunk);
     });
     req.on('end', () => {
+      if (size > limit) return;
+      const body = Buffer.concat(chunks, size).toString('utf8');
       if (!body.trim()) {
         resolve({});
         return;
@@ -150,6 +159,12 @@ export async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
       }
     });
     req.on('error', reject);
+  });
+}
+
+function sendWorkflowTemplateError(res: http.ServerResponse, error: PackageProtocolError): void {
+  sendJson(res, error.code === 'WORKFLOW_NOT_FOUND' ? 404 : 400, {
+    success: false, code: error.code, message: error.message, details: error.details,
   });
 }
 
@@ -777,6 +792,48 @@ export function createHttpServer(): http.Server {
           };
         });
         sendJson(res, 200, { success: true, workflows });
+        return;
+      }
+
+      if (pathname === '/api/workflows/import' && method === 'POST') {
+        let input: unknown;
+        try {
+          input = await parseJsonBody(req);
+        } catch (error) {
+          sendWorkflowTemplateError(res, new PackageProtocolError(
+            'INVALID_WORKFLOW', error instanceof Error ? error.message : '工作流文件不是有效的 JSON',
+          ));
+          return;
+        }
+
+        try {
+          sendJson(res, 201, { success: true, workflow_id: importWorkflowTemplate(input) });
+        } catch (error) {
+          if (!(error instanceof PackageProtocolError)) throw error;
+          sendWorkflowTemplateError(res, error);
+        }
+        return;
+      }
+
+      const workflowExportMatch = pathname.match(/^\/api\/workflows\/([^/]+)\/export$/);
+      if (workflowExportMatch && method === 'GET') {
+        const id = decodeRouteParam(workflowExportMatch[1]);
+        if (id === null) {
+          sendJson(res, 400, { success: false, code: 'INVALID_INPUT', message: '无效的工作流 ID 编码' });
+          return;
+        }
+        try {
+          const body = JSON.stringify(exportWorkflowTemplate(id), null, 2) + '\n';
+          res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Disposition': 'attachment; filename="workflow.json"',
+            'Content-Length': Buffer.byteLength(body),
+          });
+          res.end(body);
+        } catch (error) {
+          if (!(error instanceof PackageProtocolError)) throw error;
+          sendWorkflowTemplateError(res, error);
+        }
         return;
       }
 

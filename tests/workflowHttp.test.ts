@@ -68,6 +68,50 @@ try {
   assert.match(panel, /节点描述（必填）/);
   assert.match(panel, /AI 会参考它们生成任务包/);
   assert.doesNotMatch(panel, /updateCurrentNodeField\('(executor|model|prompt)'/);
+  assert.match(panel, /id="workflow-node-manual-gate"[^>]+onchange=/);
+  assert.doesNotMatch(view.buildNodeConfigHtml(validGraph[0]), /workflow-node-manual-gate/);
+  assert.match(view.buildNodeConfigHtml({ ...validGraph[1], execution_mode: 'manual' }), /id="workflow-node-manual-gate"[^>]+checked/);
+  assert.match(view.buildNodeConfigHtml({ ...validGraph[1], result_rule: 'verification' }), /id="workflow-node-manual-gate"[^>]+disabled/);
+  view.currentWorkflow = { isReferenced: true };
+  assert.match(view.buildNodeConfigHtml(validGraph[1]), /id="workflow-node-manual-gate"[^>]+disabled/);
+
+  const exported = await fetch(`${baseUrl}/api/workflows/default/export`);
+  assert.equal(exported.status, 200);
+  assert.match(exported.headers.get('content-disposition')!, /attachment; filename="workflow\.json"/);
+  const workflowFile = await exported.json();
+  assert.deepEqual(Object.keys(workflowFile).sort(), ['description', 'name', 'nodes']);
+  assert.equal(workflowFile.nodes.find((node: any) => node.id === 'development').execution_mode, undefined);
+  const gate = workflowFile.nodes.find((node: any) => node.id === 'human_review');
+  assert.equal(gate.execution_mode, 'manual');
+  assert.equal(gate.on_failure, 'development');
+  const importFile = (file: unknown) => fetch(`${baseUrl}/api/workflows/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(file),
+  });
+  const imported = await importFile(workflowFile);
+  assert.equal(imported.status, 201);
+  const importedId = (await imported.json()).workflow_id;
+  assert.match(importedId, /^wf_[0-9a-f-]{36}$/);
+  const importedDetail = await fetch(`${baseUrl}/api/workflows/${importedId}`).then(r => r.json());
+  assert.equal(importedDetail.workflow.isDefault, false);
+  assert.equal(importedDetail.workflow.nodes.find((node: any) => node.id === 'development').execution_mode, 'agent');
+  assert.deepEqual(await fetch(`${baseUrl}/api/workflows/${importedId}/export`).then(r => r.json()), workflowFile);
+  db.deleteWorkflow(importedId);
+
+  const countBeforeInvalidImport = db.listWorkflows().length;
+  const invalidImport = await importFile({
+    ...workflowFile,
+    nodes: workflowFile.nodes.map((node: any) => node.id === 'test' ? { ...node, execution_mode: 'manual' } : node),
+  });
+  assert.equal(invalidImport.status, 400);
+  const invalidImportError = await invalidImport.json();
+  assert.equal(invalidImportError.code, 'INVALID_WORKFLOW');
+  assert.equal(invalidImportError.details[0].field, 'nodes[2].result_rule');
+  assert.equal(db.listWorkflows().length, countBeforeInvalidImport);
+  const missingExport = await fetch(`${baseUrl}/api/workflows/${importedId}/export`);
+  assert.equal(missingExport.status, 404);
+  assert.equal((await missingExport.json()).code, 'WORKFLOW_NOT_FOUND');
 
   const missingMetadata = await fetch(`${baseUrl}/api/workflows`, {
     method: 'POST',

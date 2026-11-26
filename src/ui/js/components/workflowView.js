@@ -22,19 +22,15 @@ export class WorkflowView {
     await this.loadWorkflows();
   }
 
-  async loadWorkflows() {
+  async loadWorkflows(preferredId = this.currentWorkflow?.id) {
     try {
       const res = await api.getWorkflows();
       if (res && res.success) {
         this.workflows = res.workflows || [];
-        if (!this.currentWorkflow && this.workflows.length > 0) {
-          const defaultWf = this.workflows.find((w) => w.id === 'default') || this.workflows[0];
-          await this.selectWorkflow(defaultWf.id);
-        } else if (this.currentWorkflow) {
-          const currentId = this.currentWorkflow.id;
-          const exists = this.workflows.find((w) => w.id === currentId);
-          await this.selectWorkflow(exists ? currentId : (this.workflows[0]?.id || 'default'));
-        }
+        const workflow = this.workflows.find(w => w.id === preferredId)
+          || this.workflows.find(w => w.id === 'default')
+          || this.workflows[0];
+        if (workflow) await this.selectWorkflow(workflow.id);
       }
     } catch (e) {
       console.error('Failed to load workflows:', e);
@@ -98,6 +94,9 @@ export class WorkflowView {
           </div>
           <div class="action-group">
             <button class="btn btn-secondary" onclick="app.workflowView.showNewWorkflowModal()">➕ 新建工作流</button>
+            <input id="workflow-import-file" type="file" accept=".json" hidden onchange="app.workflowView.importWorkflowFile(this)">
+            <button class="btn btn-secondary" onclick="document.getElementById('workflow-import-file').click()">导入 JSON</button>
+            <button class="btn btn-secondary" title="下载当前已保存的工作流" onclick="app.workflowView.exportCurrentWorkflow()">导出 JSON</button>
             <button class="btn btn-secondary" ${wf.id === 'default' && isLocked ? 'disabled title="默认工作流正被任务引用，禁止重置"' : ''} onclick="app.workflowView.resetDefaultWorkflow()">🔄 恢复默认流程</button>
             <button class="btn btn-primary" ${isLocked ? 'disabled title="该工作流正被任务引用，禁止修改"' : ''} onclick="app.workflowView.saveWorkflow()">💾 保存工作流</button>
             ${
@@ -149,6 +148,38 @@ export class WorkflowView {
 
   onWorkflowSelectChange(val) {
     this.selectWorkflow(val);
+  }
+
+  async importWorkflowFile(input) {
+    const file = input.files[0];
+    input.value = '';
+    if (!file) return;
+    try {
+      const workflow = JSON.parse(await file.text());
+      const result = await api.importWorkflow(workflow);
+      if (!result.success) throw new Error(result.message || '无法导入工作流');
+      await this.loadWorkflows(result.workflow_id);
+    } catch (error) {
+      alert(`导入工作流失败：${error.message}`);
+    }
+  }
+
+  async exportCurrentWorkflow() {
+    const workflowId = this.currentWorkflow?.id;
+    if (!workflowId) return;
+    try {
+      const workflow = await api.exportWorkflow(workflowId);
+      if (workflow.success === false) throw new Error(workflow.message || '无法导出工作流');
+      const data = new Blob([JSON.stringify(workflow, null, 2) + '\n'], { type: 'application/json' });
+      const url = URL.createObjectURL(data);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'workflow.json';
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      alert(`导出工作流失败：${error.message}`);
+    }
   }
 
   // --- SVG Diagram Rendering ---
@@ -365,6 +396,8 @@ export class WorkflowView {
     const isLocked = Boolean(this.currentWorkflow?.isReferenced);
     const isStart = node.type === 'start';
     const isEnd = node.type === 'end';
+    const isManual = node.execution_mode === 'manual';
+    const requiresAutomaticResult = node.result_rule === 'verification' || node.result_rule === 'acceptance';
     const otherNodes = this.currentNodes.filter((n) => n.id !== node.id && n.type !== 'start');
 
     return `
@@ -394,6 +427,14 @@ export class WorkflowView {
           !isStart && !isEnd
             ? `
           <div class="form-group">
+            <label for="workflow-node-manual-gate">
+              <input id="workflow-node-manual-gate" type="checkbox" ${isManual ? 'checked' : ''} ${isLocked || requiresAutomaticResult ? 'disabled' : ''}
+                onchange="app.workflowView.updateCurrentNodeField('execution_mode', this.checked ? 'manual' : 'agent')">
+              人工门禁
+            </label>
+            <small class="form-hint">${requiresAutomaticResult ? '测试和验收节点自动执行，可在其后添加独立的人工门禁节点。' : '开启后，流程到此节点时等待人工通过或退回。'}</small>
+          </div>
+          <div class="form-group">
             <label class="form-label">最大执行次数 (0 或留空为不限制)</label>
             <input type="number" min="0" max="100" class="input-text" value="${node.max_executions || 0}" onchange="app.workflowView.updateCurrentNodeField('max_executions', parseInt(this.value, 10))" ${isLocked ? 'disabled' : ''} />
             <small class="form-hint">设置为 0 或留空表示节点不做次数限制。</small>
@@ -408,7 +449,7 @@ export class WorkflowView {
           !isEnd
             ? `
           <div class="form-group routing-group">
-            <label class="form-label"><strong>成功后去向 (on_success)</strong></label>
+            <label class="form-label"><strong>${isManual ? '通过后去向' : '成功后去向'} (on_success)</strong></label>
             <div class="routing-row">
               <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('on_success', this.value)" ${isLocked ? 'disabled' : ''}>
                 ${otherNodes
@@ -426,10 +467,10 @@ export class WorkflowView {
           !isStart && !isEnd
             ? `
           <div class="form-group routing-group">
-            <label class="form-label"><strong>失败后去向 (on_failure)</strong></label>
+            <label class="form-label"><strong>${isManual ? '退回后去向' : '失败后去向'} (on_failure)</strong></label>
             <div class="routing-row">
               <select class="input-select" onchange="app.workflowView.updateCurrentNodeField('on_failure', this.value || null)" ${isLocked ? 'disabled' : ''}>
-                <option value="" ${!node.on_failure ? 'selected' : ''}>-- 无（失败后暂停任务）--</option>
+                <option value="" ${!node.on_failure ? 'selected' : ''}>-- 无（${isManual ? '退回' : '失败'}后暂停任务）--</option>
                 ${otherNodes
                   .filter((n) => n.type !== 'end')
                   .map((n) => `<option value="${n.id}" ${node.on_failure === n.id ? 'selected' : ''}>${escapeHtml(n.name)} (${n.id})</option>`)

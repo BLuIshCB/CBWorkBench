@@ -28,6 +28,7 @@ import { taskCleanupService } from '../services/taskCleanupService.ts';
 import { executionTimeoutSchema } from '../services/executionPolicy.ts';
 import { encodeNodeDirName, PathSecurityError } from '../utils/pathSecurity.ts';
 import { advanceInputShape, reportNodeCompletion } from '../services/nodeCompletion.ts';
+import { createWorkflowSchema, createWorkflowTemplate } from '../services/workflowTemplateService.ts';
 
 function okJson(payload: Record<string, unknown>) {
   return {
@@ -154,6 +155,18 @@ export function createWorkbenchMcpServer(advanceOnly = false): McpServer {
       }
     });
   if (advanceOnly) return server;
+
+  server.registerTool('workbench_create_workflow', {
+    description: '按步骤顺序创建工作流模板并返回工作流 ID。每步填写名称和描述；按需指定执行方式、结果规则及按步骤名称引用的成功或失败去向。',
+    inputSchema: createWorkflowSchema,
+  }, async (args) => {
+    try {
+      await verifyInstanceBindingIfConfigured();
+      return okJson({ success: true, workflow_id: createWorkflowTemplate(args) });
+    } catch (error) {
+      return errJson(error);
+    }
+  });
 
   // 1. workbench_get_package_protocol
   server.tool(
